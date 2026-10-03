@@ -4053,12 +4053,189 @@ def _decide_read(ti, cwd):
     return ("defer", "", "")
 
 
+# ══ ОБЁРТКА git_serial_pc.py СУДИТСЯ КАК ТА git-КОМАНДА, КОТОРУЮ ОНА ИСПОЛНЯЕТ (03.10.2026) ════
+# Живой класс: `python git_serial_pc.py -- git -C <клон> add -- … bridge_client.py …` разбирался
+# как ЗАПУСК PYTHON, и `_scan_python` брал целью каждый токен на `.py` — то есть ПУТИ ДЛЯ git.
+# Неотслеживаемый `bridge_client.py` клона читался (относительно cwd хука, а не `-C`), тело
+# упоминало секрет → `env` без объекта → отказ (03.10 22:03:38, задача #31; 15:41:39 тот же
+# разбор дал `py_write` «скрипт не прочитан»). Та же голая `git -C <клон> add -- …` не краснеет.
+# Обратная сторона того же разбора: `python git_serial_pc.py -- git reset --hard` шёл `defer`
+# (аргументы скрипта вырезаны из скан-текста, `git_force` подкоманды не видел), а голая
+# `git reset --hard` спрашивает. Обёртка была разом ложным красным и обходом.
+#
+# ПРАВИЛО. Сегмент, где python запускает ИМЕННО отслеживаемый `D:\turbobaby-bot\git_serial_pc.py`
+# с явным `--`, для разбора переписывается в ту git-команду,
+# которую исполнит `git_serial_pc.main`: каждый отдельный `--` выброшен (обёртка выбрасывает их
+# ВСЕ, не только разделитель), `git` дописан, если его нет. Дальше судит ОБЫЧНЫЙ разбор, поэтому
+# разрешений сверх голой git-команды не появляется ни одного. Исполняется по-прежнему исходная
+# команда: правится только текст, по которому судим.
+#
+# ГРАНИЦЫ — каждая fail-closed: обёртку не узнали → сегмент судится как до 03.10:
+#   • копия обёртки в другом месте (клон, worktree, tmp) или неотслеживаемая — обычный скрипт;
+#   • относительный путь обёртки после смены каталога в той же строке (cd/pushd/Set-Location) —
+#     неизвестно, ЧЕЙ файл запустится; абсолютный путь годится всегда;
+#   • env-префикс, ключи интерпретатора, ключи обёртки кроме `--owner`/`--timeout`, нет `--`;
+#   • в git-части подстановка (`$` или обратная кавычка вне одинарных кавычек) либо `--`,
+#     собранный кавычками или экранированием: обёртка выбросит его уже ПОСЛЕ шелла, а текст
+#     команды этого не показывает — судить такую форму по тексту нечем.
+GIT_SERIAL_WRAPPER = os.path.join(PROJECT, "git_serial_pc.py")
+_GIT_SERIAL_OPTS = ("--owner", "--timeout")          # ключи обёртки ДО `--`; у обоих есть значение
+_RE_CHDIR_WORD = re.compile(
+    r"(?i)(^|[\s;&|({])(cd|pushd|popd|chdir|set-location|sl|push-location|pop-location)(?=[\s;)}]|$)")
+_GIT_SERIAL_TRUST = {}
+
+
+def _shell_words(text):
+    """Слова сегмента С ПОЗИЦИЯМИ в сыром тексте → [(значение, начало, конец, подстановка)] |
+    None (незакрытая кавычка). Кавычки снимаются, обратный слэш вне кавычек остаётся (Windows-
+    путь), внутри двойных экранирует следующий знак — как в `_split_segments`. `подстановка` —
+    `$` или обратная кавычка вне одинарных кавычек: значение слова решит шелл, а не текст."""
+    out, i, n = [], 0, len(text or "")
+    while i < n:
+        if text[i].isspace():
+            i += 1
+            continue
+        start, val, q, sub = i, [], None, False
+        while i < n and (q or not text[i].isspace()):
+            ch = text[i]
+            if q == "'":
+                if ch == q:
+                    q = None
+                else:
+                    val.append(ch)
+            elif q == '"':
+                if ch == "\\" and i + 1 < n:
+                    val.append(text[i + 1])
+                    i += 2
+                    continue
+                if ch == q:
+                    q = None
+                else:
+                    sub = sub or ch in "$`"
+                    val.append(ch)
+            elif ch in "'\"":
+                q = ch
+            else:
+                sub = sub or ch in "$`"
+                val.append(ch)
+            i += 1
+        if q:
+            return None
+        out.append(("".join(val), start, i, sub))
+    return out
+
+
+def _git_serial_trusted(path):
+    """True ⇔ путь — ЭТА обёртка: `D:\\turbobaby-bot\\git_serial_pc.py`, и она под git.
+    Сбой git → False (`_is_repo_tracked`): не узнали — судим как обычный скрипт.
+
+    Правки рабочего дерева доверие НЕ снимают — граница та же, что у тела любого отслеживаемого
+    .py (`_scan_python` его не читает). Требование «без правок относительно HEAD» роняло бы гейт
+    на том самом коммите, который правит обёртку."""
+    try:
+        p = os.path.normcase(os.path.normpath(path))
+    except Exception:
+        return False
+    if p != os.path.normcase(os.path.normpath(GIT_SERIAL_WRAPPER)):
+        return False
+    if p not in _GIT_SERIAL_TRUST:
+        _GIT_SERIAL_TRUST[p] = _is_repo_tracked(GIT_SERIAL_WRAPPER, PROJECT)
+    return _GIT_SERIAL_TRUST[p]
+
+
+def _git_serial_dropped(raw):
+    """Слово git-части, которое обёртка выбросит (`[c for c in cmd if c != "--"]`)."""
+    return raw == "--"
+
+
+def _git_serial_segment(seg, cwd, cd_before):
+    """Сегмент → текст git-команды, которую исполнит обёртка, | None: это не наша обёртка либо
+    форма, которую по тексту не решить (тогда сегмент судится как до 03.10)."""
+    words = _shell_words(seg)
+    if not words or len(words) < 4:
+        return None
+    if words[0][3] or words[1][3] or _base(words[0][0]) not in ("python", "python3"):
+        return None
+    path = words[1][0]
+    m = re.match(r"^/([A-Za-z])/(.*)$", path)            # MSYS: /d/turbobaby-bot/x.py
+    if m:
+        path = m.group(1) + ":\\" + m.group(2)
+    if not os.path.isabs(path):
+        if cd_before:
+            return None
+        path = os.path.join(cwd or PROJECT, path)
+    if not _git_serial_trusted(path):
+        return None
+    i = 2
+    while i < len(words) and seg[words[i][1]:words[i][2]] != "--":
+        val, _s, _e, sub = words[i]
+        name = val.split("=", 1)[0]
+        if sub or name not in _GIT_SERIAL_OPTS:
+            return None
+        if "=" in val:
+            i += 1
+        elif i + 1 < len(words) and not words[i + 1][3]:
+            i += 2
+        else:
+            return None
+    git_words = words[i + 1:]
+    if not git_words:
+        return None
+    keep, cut = [], []
+    for val, s, e, sub in git_words:
+        raw = seg[s:e]
+        if sub:
+            return None
+        if _git_serial_dropped(raw):
+            cut.append((s, e))
+            continue
+        if val.replace("\\", "") == "--" and raw != "--":
+            return None
+        keep.append(val)
+    if not keep:
+        return None
+    first = keep[0].lower()
+    if first not in ("git", "git.exe") and _base(keep[0]) == "git":
+        return None                                       # чужой бинарь с именем git — не судим
+    body, pos = [], git_words[0][1]
+    for s, e in cut:
+        body.append(seg[pos:s])
+        pos = e
+    body.append(seg[pos:])
+    head = "" if first in ("git", "git.exe") else "git "
+    return seg[:words[0][1]] + head + "".join(body)
+
+
+def _git_serial_unwrap(cmd, cwd=None):
+    """Команда → тот же текст, где каждый сегмент-запуск обёртки заменён git-командой, которую она
+    исполнит. Обёртки нет или её не узнали → команда КАК ЕСТЬ, байт в байт."""
+    if not cmd or "git_serial_pc" not in cmd.lower():
+        return cmd
+    try:
+        parts = _split_segments(cmd)
+        changed, cd_seen = False, False
+        for i in range(0, len(parts), 2):
+            seg = parts[i]
+            if not seg.strip():
+                continue
+            new = _git_serial_segment(seg, cwd, cd_seen)
+            if new is not None:
+                parts[i] = new
+                changed = True
+            if _RE_CHDIR_WORD.search(seg):
+                cd_seen = True
+        return "".join(parts) if changed else cmd
+    except Exception:
+        return cmd
+
+
 def _decide_bash(cmd, cwd):
     """Разбор Bash/PowerShell. Тонкая обёртка над `_decide_bash_body`: вычисляет ОДИН РАЗ
     скан-текст и признак «секрет упомянут только пробой наличия», а по итогу проставляет вид
     `env_probe` там, где иначе в логе стояло бы безликое `unknown`. Само решение — в body."""
     if not cmd:
         return ("defer", "", "")
+    cmd = _git_serial_unwrap(cmd, cwd)        # обёртка git — как её git-команда (блок выше)
     scan = _scan_text(cmd)
     reach = _env_reach(cmd) if _RE_ENV.search(scan) else None
     probe = reach is not None
@@ -4310,6 +4487,7 @@ _RED_KINDS_MAX = 3
 
 def red_kinds_bash(cmd, cwd, env_probe=False):
     """Красные виды команды Bash/PowerShell → кортеж (kind, obj) в порядке нахождения."""
+    cmd = _git_serial_unwrap(cmd, cwd)        # тем же текстом, что и `_decide_bash`
     found, skip = [], set()
     for _ in range(_RED_KINDS_MAX):
         action, kind, obj = _decide_bash_body(cmd, cwd, _scan_text(cmd), env_probe,
@@ -5177,7 +5355,9 @@ def decide_for_role(data, headless, env=None):
     cmd = ""
     if (data.get("tool_name") or "") in ("Bash", "PowerShell"):
         cmd = (data.get("tool_input") or {}).get("command") or ""
-    if _stays_red(kind, obj, cmd):
+    # Доктрину судим ТЕМ ЖЕ текстом, что и вид (`_decide_bash`): у `delete`/`schtasks` она
+    # перечитывает команду, и сырая обёртка там не равна голой git. Объект карточки — по сырой.
+    if _stays_red(kind, obj, _git_serial_unwrap(cmd, data.get("cwd") or PROJECT)):
         # Сверяем «да» владельца с объектом, КОТОРЫЙ ОН ПРОЧИТАЛ В КАРТОЧКЕ (`card_object`), а
         # не с внутренним значением разбора: у `py_write` они разошлись — разбор называет
         # операцию, карточка называет цель.

@@ -5713,3 +5713,121 @@ class TestPromptFlood2309(unittest.TestCase):
         for c in ("cd D:/turbobaby-bike-bot && cargo run --release", "cargo install ripgrep",
                   "cargo publish", "cargo test && cargo run", "cargo login"):
             self.assertEqual(g.decide(bash(c))[:2], ("ask", "unknown"), c)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# ОБЁРТКА git_serial_pc.py СУДИТСЯ КАК ЕЁ git-КОМАНДА (03.10.2026)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+class TestGitSerialWrapperJudgedAsGit(unittest.TestCase):
+    """Обёртка исполняет argv после `--` как git (`git_serial_pc.main`), и `.py` в этих аргументах —
+    ПУТИ для git, а не скрипты. Живой отказ 03.10 22:03:38 (задача #31):
+    `python git_serial_pc.py -- git -C <клон> add -- … bridge_client.py …` → `env` без объекта,
+    хотя голая `git -C <клон> add -- …` зелёная. Контрфакты по буквам задания: (а) обёртка + `.py`,
+    чьё тело упоминает секрет, → решение голой git; (б) тот же `.py` под интерпретатором — красный;
+    (в) push/reset через обёртку — как голые; (г) копия обёртки вне корня — обычный скрипт.
+    Разбор: `docs/artifacts/2026-10-03-GUARDGITWRAP0310.md`."""
+
+    PY = "D:/turbobaby-bot/venv/Scripts/python.exe"
+    WR = "D:/turbobaby-bot/git_serial_pc.py"
+
+    @classmethod
+    def setUpClass(cls):
+        cls._td = tempfile.TemporaryDirectory(prefix="guard_gitwrap_")
+        cls.clone = cls._td.name.replace("\\", "/")
+        cls.secret_py = cls.clone + "/bridge_client.py"
+        with open(cls.secret_py, "w", encoding="utf-8") as f:
+            f.write("import os\nENV_FILE = os.path.join(os.path.dirname(__file__), '" + _DOTENV
+                    + "')\n\n\ndef load():\n    return open(ENV_FILE).read()\n")
+        cls.copy = cls.clone + "/git_serial_pc.py"
+        with open(os.path.join(PROJ, "git_serial_pc.py"), encoding="utf-8") as src, \
+                open(cls.copy, "w", encoding="utf-8") as dst:
+            dst.write(src.read())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    def _d(self, cmd, cwd=PROJ):
+        return g.decide_for_role({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": cwd},
+                                 True, {})
+
+    def test_wrapper_recognised(self):
+        self.assertTrue(g._git_serial_trusted(os.path.join(PROJ, "git_serial_pc.py")))
+        self.assertFalse(g._git_serial_trusted(self.copy))
+
+    # ── (а) обёртка + .py-пути с секретом в теле → как голая git ─────────────────────────────
+    def test_a_live_form_cwd_in_clone(self):
+        tail = f"-C {self.clone} add -- bridge_client.py README.md"
+        got = self._d(f"{self.PY} {self.WR} -- git {tail}", self.clone)
+        self.assertEqual(got, self._d("git " + tail, self.clone))
+        self.assertEqual(got[0], "defer")
+
+    def test_a_wrapper_forms_equal_bare(self):
+        tail = f"-C {self.clone} add -- {self.secret_py}"
+        bare = self._d("git " + tail)
+        self.assertEqual(bare[0], "defer")
+        for c in (f"{self.PY} {self.WR} -- git {tail}",
+                  f"venv/Scripts/python.exe git_serial_pc.py -- git {tail}",
+                  "venv\\Scripts\\python.exe D:\\turbobaby-bot\\git_serial_pc.py -- git " + tail,
+                  f"/d/turbobaby-bot/venv/Scripts/python.exe /d/turbobaby-bot/git_serial_pc.py -- git {tail}",
+                  f"venv/Scripts/python.exe git_serial_pc.py --owner t34 --timeout=60 -- git {tail}"):
+            self.assertEqual(self._d(c), bare, c)
+        c = f"venv/Scripts/python.exe git_serial_pc.py -- git {tail} 2>&1 | tail -1"
+        self.assertEqual(self._d(c), self._d(f"git {tail} 2>&1 | tail -1"), c)
+
+    # ── (б) тот же .py, запущенный интерпретатором, — по-прежнему красный ───────────────────
+    def test_b_secret_py_run_by_interpreter_stays_red(self):
+        # `-C`, а не голое `git add`: слова `git add` где угодно в строке (даже в аргументах
+        # скрипта) зеленят её шорткатом `_RE_GIT_SAFE` (посылка П4, этим правилом не чинится)
+        for c in (f"{self.PY} {self.secret_py}",
+                  f"{self.PY} {self.secret_py} -- git -C {self.clone} add README.md",
+                  f"{self.PY} {self.WR} -- git -C {self.clone} add -- README.md && "
+                  f"{self.PY} {self.secret_py}",
+                  # рядом с НАСТОЯЩЕЙ обёрткой: чужой скрипт с той же формой `-- git …` обёрткой
+                  # не становится (без имени обёртки в строке правило не смотрит её вовсе)
+                  f"{self.PY} {self.WR} -- git -C {self.clone} status && "
+                  f"{self.PY} {self.secret_py} -- git -C {self.clone} add README.md"):
+            a, k, o = self._d(c)
+            self.assertEqual((a, k), ("ask", "env"), c)
+
+    # ── (в) push / reset / clean через обёртку — как голые ───────────────────────────────────
+    def test_v_push_reset_equal_bare(self):
+        for sub in ("reset --hard", "reset --hard HEAD~1", "push --force origin main",
+                    "push -f origin main", "clean -fdx", "push origin main", "reset --soft HEAD~1"):
+            self.assertEqual(self._d(f"{self.PY} {self.WR} -- git {sub}"), self._d("git " + sub), sub)
+        self.assertEqual(self._d(f"{self.PY} {self.WR} -- git reset --hard")[:2], ("ask", "git_force"))
+
+    def test_v_dropped_separators_as_executed(self):
+        # обёртка выбрасывает КАЖДЫЙ `--` и дописывает `git`: исполнится `git reset --hard`
+        for c in (f"{self.PY} {self.WR} -- git -- reset --hard",
+                  f"{self.PY} {self.WR} -- git reset -- --hard",
+                  f"{self.PY} {self.WR} --owner x -- reset --hard"):
+            self.assertEqual(self._d(c)[:2], ("ask", "git_force"), c)
+
+    # ── (г) копия обёртки вне корня — обычный скрипт, разбор как до правки ───────────────────
+    def test_g_copy_outside_root_is_plain_script(self):
+        tail = f"-C {self.clone} add -- {self.secret_py}"
+        for c, cwd in ((f"{self.PY} {self.copy} -- git {tail}", PROJ),
+                       (f"venv/Scripts/python.exe git_serial_pc.py -- git {tail}", self.clone),
+                       (f"cd {self.clone} && venv/Scripts/python.exe git_serial_pc.py -- git {tail}",
+                        PROJ)):
+            self.assertEqual(g._git_serial_unwrap(c, cwd), c, c)
+            self.assertEqual(self._d(c, cwd)[:2], ("ask", "env"), c)
+
+    # ── формы, которые по тексту не решить, — как до правки (байт в байт) ────────────────────
+    def test_unreadable_forms_untouched(self):
+        for c in (f"{self.PY} {self.WR} -- git $X reset --hard",
+                  f'{self.PY} {self.WR} -- git "--" reset --hard',
+                  f"{self.PY} {self.WR} -- git `echo x` add",
+                  f"{self.PY} {self.WR} --status",
+                  f"{self.PY} {self.WR} git status",
+                  f"{self.PY} -X utf8 {self.WR} -- git add x",
+                  f"X=1 {self.PY} {self.WR} -- git add x",
+                  f"{self.PY} {self.WR} --hold 5 -- git add x",
+                  f"{self.PY} {self.WR} -- C:/tools/git.exe add x",
+                  "git status && echo git_serial_pc.py"):
+            self.assertEqual(g._git_serial_unwrap(c, PROJ), c, c)
+
+    def test_red_kinds_see_unwrapped_git(self):
+        kinds = [k for k, _o in g.red_kinds_bash(f"{self.PY} {self.WR} -- git reset --hard", PROJ)]
+        self.assertIn("git_force", kinds)
