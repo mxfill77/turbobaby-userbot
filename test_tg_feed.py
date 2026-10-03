@@ -16,6 +16,9 @@ id и тексты выдуманы; лента пишется во времен
   • ряд по контракту на входящее и исходящее ЛИЧНОЕ сообщение клиента (поля, ключ, время UTC, вид);
   • бот, свой аккаунт, команда и партнёр — ряда НЕТ; фильтр команды/партнёров — функции suggest;
   • фильтр не решил / собеседник неизвестен → ряда нет, пропуск посчитан и назван в журнале;
+  • реестр команды НЕ загружен (нет файла, кривой JSON, не словарь, ошибка чтения) → ряда нет,
+    undecided +1, громкая строка с причиной одна на смену состояния; починка и reload — ряды снова;
+    значения `suggest._load_team_registry` — прежние (голден снят с 01086276, TGFEEDREG0310);
   • медиа без подписи → текст пустой; reply → reply_to;
   • сбой записи не роняет обработчик, suggest зовётся как прежде;
   • вызовы suggest и клиента в обработчике входящих — те же, что до правки (голден);
@@ -61,6 +64,8 @@ OWN = T.User(id=5005, username="turbophuket1", first_name="Turbo 2", access_hash
 REGISTRY = {"usernames": {"office_test"}, "user_ids": {2002}, "group_ids": set(),
             "nonclient_usernames": set(), "nonclient_user_ids": {3003},
             "nonclient_titles": {"партнерка"}}
+LOADED_STATE = {"loaded": True, "reason": "loaded", "why": "загружен", "detail": "",
+                "path": "синтетика"}
 
 
 # ───────────────────────────── двойники ─────────────────────────────
@@ -186,16 +191,19 @@ class _Base(unittest.TestCase):
             "log": ub.log, "me": ub._ME_ID, "feed": tg_feed.FEED_FILE,
             "reg": suggest.TEAM_REGISTRY, "appr": suggest.APPROVER_USERNAMES,
             "intake": suggest.INTAKE_APPROVERS, "off": os.environ.pop(tg_feed.OFF_ENV, None),
+            "state": suggest.TEAM_REGISTRY_STATE,
         }
         ub.log = self.rec
         ub._ME_ID = ME.id
         tg_feed.FEED_FILE = self.feed
         suggest.TEAM_REGISTRY = {k: set(v) for k, v in REGISTRY.items()}
+        suggest.TEAM_REGISTRY_STATE = dict(LOADED_STATE)   # реестр выше — «загружен», не файл дерева
         suggest.APPROVER_USERNAMES = set()
         suggest.INTAKE_APPROVERS = set()
         ub._FEED_PEERS.clear()
         for k in ub._FEED_COUNTS:
             ub._FEED_COUNTS[k] = 0
+        ub._FEED_REG.update(key=None, skipped=0)
         self.suggest_calls = []
         self._enabled = mock.patch.object(suggest, "is_enabled", return_value=False)
         self._enabled.start()
@@ -204,7 +212,7 @@ class _Base(unittest.TestCase):
         self._enabled.stop()
         s = self._save
         ub.log, ub._ME_ID, tg_feed.FEED_FILE = s["log"], s["me"], s["feed"]
-        suggest.TEAM_REGISTRY = s["reg"]
+        suggest.TEAM_REGISTRY, suggest.TEAM_REGISTRY_STATE = s["reg"], s["state"]
         suggest.APPROVER_USERNAMES, suggest.INTAKE_APPROVERS = s["appr"], s["intake"]
         if s["off"] is None:
             os.environ.pop(tg_feed.OFF_ENV, None)
@@ -323,6 +331,239 @@ class TestNotClients(_Base):
         suggest.TEAM_REGISTRY = {"usernames": set(), "user_ids": set(), "group_ids": set()}
         run(ub.on_incoming(incoming(self.client, TEAM, mid=1, text="я теперь клиент")))
         self.assertEqual([r["chat_id"] for r in self.rows()], [TEAM.id])
+
+
+# ──────────── 2б. реестр команды не загружен → «не решено» (TGFEEDREG0310) ────────────
+
+EMPTY_REG = {"usernames": set(), "user_ids": set(), "group_ids": set(),
+             "nonclient_usernames": set(), "nonclient_user_ids": set(), "nonclient_titles": set()}
+GOOD_REG_JSON = {"usernames": ["@Office_Test"], "user_ids": [2002], "nonclient_user_ids": ["3003"],
+                 "nonclient_titles": ["Партнёрка"]}
+# Синтетические файлы реестра: (имя, байты | None — файла нет | "DIR" — каталог вместо файла,
+# причина, слова причины). Четыре причины задания; BOM, пустой файл и чужая кодировка — их же случаи.
+BROKEN = [
+    ("missing", None, "missing", "нет файла"),
+    ("bad_json", b"{oops", "bad_json", "кривой JSON"),
+    ("empty_file", b"", "bad_json", "кривой JSON"),
+    ("bom", '﻿{"user_ids": [2002]}'.encode("utf-8"), "bad_json", "кривой JSON"),
+    ("not_dict", b"[2002]", "not_dict", "не словарь"),
+    ("null", b"null", "not_dict", "не словарь"),
+    ("dir_as_file", "DIR", "read_error", "ошибка чтения"),
+    ("bad_encoding", b'{"usernames": ["\xff\xfe"]}', "read_error", "ошибка чтения"),
+]
+
+
+class _RegBase(_Base):
+    def setUp(self):
+        super().setUp()
+        self.dir = os.path.join(FEED_TMP_DIR, "reg_" + self.id().rsplit(".", 1)[-1])
+        os.makedirs(self.dir, exist_ok=True)
+
+    def reg_file(self, name, data):
+        p = os.path.join(self.dir, name + ".json")
+        if data is None:
+            return os.path.join(self.dir, "нет_такого_" + name + ".json")
+        if data == "DIR":
+            os.makedirs(p, exist_ok=True)
+            return p
+        with io.open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    def good(self, obj=None):
+        data = json.dumps(GOOD_REG_JSON if obj is None else obj, ensure_ascii=False)
+        return self.reg_file("good", data.encode("utf-8"))
+
+    def fresh(self):
+        with io.open(self.feed, "w", encoding="utf-8"):
+            pass
+        self.rec.lines.clear()
+        for k in ub._FEED_COUNTS:
+            ub._FEED_COUNTS[k] = 0
+        ub._FEED_REG.update(key=None, skipped=0)
+
+    def errors(self):
+        return [t for lv, t in self.rec.lines if lv == "ERROR"]
+
+
+class TestRegistryState(_RegBase):
+    def test_good_registry_team_and_partner_zero_rows_client_one(self):
+        suggest.reload_team_registry(self.good())
+        self.assertIs(suggest.team_registry_state()["loaded"], True)
+        for i, who in enumerate((TEAM, TEAM_BY_NICK, PARTNER, PARTNER_BY_TITLE), start=1):
+            run(ub.on_incoming(incoming(self.client, who, mid=i, text="свои")))
+        self.assertEqual(self.rows(), [])
+        run(ub.on_incoming(incoming(self.client, CLIENT, mid=9, text="байк?")))
+        self.assertEqual([r["chat_id"] for r in self.rows()], [CLIENT.id])
+        c = ub._FEED_COUNTS
+        self.assertEqual((c["team"], c["partner"], c["undecided"], c["written"]), (2, 2, 0, 1))
+        self.assertEqual(self.errors(), [])
+        self.no_telegram()
+
+    def test_broken_registry_writes_nothing_counts_and_says_why(self):
+        """Повод — проба Codex 03.10 15:27: нет файла / кривой файл давали ряд «клиента» молча."""
+        for name, data, reason, words in BROKEN:
+            with self.subTest(name):
+                self.fresh()
+                path = self.reg_file(name, data)
+                self.assertEqual(suggest.reload_team_registry(path), EMPTY_REG)  # suggest прежний
+                st = suggest.team_registry_state()
+                self.assertEqual((st["loaded"], st["reason"], st["why"], st["path"]),
+                                 (False, reason, words, path))
+                run(ub.on_incoming(incoming(self.client, CLIENT, mid=1, text="байк?")))
+                run(ub.on_outgoing(outgoing(self.client, CLIENT, mid=2, text="есть")))
+                run(ub.on_incoming(incoming(self.client, TEAM, mid=3, text="задача на завтра")))
+                self.assertEqual(self.rows(), [], "ряд ушёл при незагруженном реестре")
+                c = ub._FEED_COUNTS
+                self.assertEqual((c["undecided"], c["written"], c["team"], c["partner"]),
+                                 (3, 0, 0, 0))
+                errs = self.errors()
+                self.assertEqual(len(errs), 1, "громкая строка — одна на смену состояния")
+                self.assertIn(f"реестр команды НЕ ЗАГРУЖЕН ({words}", errs[0])
+                self.assertIn(path, errs[0])
+                self.assertEqual(self.rec.text("INFO").count("реестр команды не загружен"), 3)
+                self.no_telegram()
+
+    def test_repair_and_reload_client_row_again(self):
+        bad = self.reg_file("bad", b"{oops")
+        suggest.reload_team_registry(bad)
+        run(ub.on_incoming(incoming(self.client, CLIENT, mid=1, text="байк?")))
+        self.assertEqual(self.rows(), [])
+        suggest.reload_team_registry(self.good())                 # починили и перечитали
+        run(ub.on_incoming(incoming(self.client, CLIENT, mid=2, text="байк?")))
+        run(ub.on_incoming(incoming(self.client, TEAM, mid=3, text="задача")))
+        self.assertEqual([(r["chat_id"], r["msg_id"]) for r in self.rows()], [(CLIENT.id, 2)])
+        warn = self.rec.text("WARNING")
+        self.assertIn("реестр команды снова загружен", warn)
+        self.assertIn("пропущено рядов без реестра: 1", warn)
+        suggest.reload_team_registry(bad)                         # сломался снова — новая смена
+        run(ub.on_incoming(incoming(self.client, CLIENT, mid=4, text="а?")))
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(len(self.errors()), 2)
+        self.assertEqual(ub._FEED_COUNTS["undecided"], 2)
+
+    def test_reason_change_is_a_new_loud_line_same_state_is_not(self):
+        suggest.reload_team_registry(self.reg_file("missing", None))
+        for i in range(3):
+            run(ub.on_incoming(incoming(self.client, CLIENT, mid=i, text="?")))
+        self.assertEqual(len(self.errors()), 1)
+        bad = self.reg_file("bad", b"[1]")
+        suggest.reload_team_registry(bad)
+        run(ub.on_incoming(incoming(self.client, CLIENT, mid=5, text="?")))
+        suggest.reload_team_registry(bad)                         # тот же файл и причина
+        run(ub.on_incoming(incoming(self.client, CLIENT, mid=6, text="?")))
+        errs = self.errors()
+        self.assertEqual(len(errs), 2)
+        self.assertIn("нет файла", errs[0])
+        self.assertIn("не словарь", errs[1])
+        self.assertEqual(ub._FEED_COUNTS["undecided"], 5)
+
+    def test_valid_empty_registry_is_loaded(self):
+        """Исправный пустой реестр — ответ, а не незнание: «в команде никого» — решение владельца."""
+        suggest.reload_team_registry(self.reg_file("empty", b"{}"))
+        self.assertEqual(suggest.TEAM_REGISTRY, EMPTY_REG)
+        self.assertIs(suggest.team_registry_state()["loaded"], True)
+        run(ub.on_incoming(incoming(self.client, CLIENT, mid=1, text="байк?")))
+        run(ub.on_incoming(incoming(self.client, TEAM, mid=2, text="я")))
+        self.assertEqual([r["chat_id"] for r in self.rows()], [CLIENT.id, TEAM.id])
+        self.assertEqual((ub._FEED_COUNTS["undecided"], self.errors()), (0, []))
+
+    def test_state_unreadable_or_not_strictly_true_is_not_loaded(self):
+        cases = [("raises", dict(side_effect=RuntimeError("нет признака"))),
+                 ("loaded_yes", dict(return_value={"loaded": "yes", "reason": "loaded"})),
+                 ("empty", dict(return_value={})),
+                 ("not_callable", dict(new=None))]
+        for name, how in cases:
+            with self.subTest(name):
+                self.fresh()
+                with mock.patch.object(suggest, "team_registry_state", **how):
+                    run(ub.on_incoming(incoming(self.client, CLIENT, mid=1, text="байк?")))
+                self.assertEqual(self.rows(), [])
+                self.assertEqual(ub._FEED_COUNTS["undecided"], 1)
+                self.assertEqual(len(self.errors()), 1)
+
+    def test_suggest_calls_unchanged_when_registry_missing(self):
+        suggest.reload_team_registry(self.reg_file("missing", None))
+        self.assertEqual(suggest_trace(ub, StrictClient), GOLDEN_SUGGEST_TRACE)
+        self.assertEqual(self.rows(), [])
+
+    def test_feed_off_ignores_registry(self):
+        os.environ[tg_feed.OFF_ENV] = "1"
+        suggest.reload_team_registry(self.reg_file("missing", None))
+        run(ub.on_incoming(incoming(self.client, CLIENT, text="привет")))
+        self.assertEqual(sum(ub._FEED_COUNTS.values()), 0)
+        self.assertNotIn("TG-ЛЕНТА", self.rec.text())
+
+
+# Значения suggest._load_team_registry, снятые прогоном tmp/tg_feed_reg_0310/golden_reg_probe.py по
+# дереву 01086276 (до признака). Тот же вход — те же значения; `{"usernames": 5}` — TypeError, как было.
+GOLDEN_FULL_IN = {
+    "usernames": ["@Staff_Test", " office_test ", "", None],
+    "user_ids": [2002, "3", "-1001234", "x", 4.5, None],
+    "group_ids": ["-1009", 7],
+    "nonclient_usernames": ["@Partner_Test"],
+    "nonclient_user_ids": [3003, "3004"],
+    "nonclient_titles": ["Партнёрка STM", " ", "ПРОКАТ"],
+}
+GOLDEN_FULL_OUT = {"usernames": {"none", "office_test", "staff_test"},
+                   "user_ids": {-1001234, 3, 2002}, "group_ids": {-1009, 7},
+                   "nonclient_usernames": {"partner_test"}, "nonclient_user_ids": {3003, 3004},
+                   "nonclient_titles": {"партнерка stm", "прокат"}}
+
+
+class TestLoaderGolden(_RegBase):
+    def test_values_are_the_same_as_before(self):
+        cases = [(n, d, EMPTY_REG) for n, d, _, _ in BROKEN] + [
+            ("empty_dict", b"{}", EMPTY_REG),
+            ("garbage_keys", b'{"foo": 1, "bar": [1, 2]}', EMPTY_REG),
+            ("full", json.dumps(GOLDEN_FULL_IN, ensure_ascii=False).encode("utf-8"),
+             GOLDEN_FULL_OUT)]
+        for name, data, want in cases:
+            with self.subTest(name):
+                path = self.reg_file(name, data)
+                self.assertEqual(suggest._load_team_registry(path), want)
+                reg, st = suggest._team_registry_with_state(path)
+                self.assertEqual(reg, want)
+                back = suggest.reload_team_registry(path)
+                self.assertIs(back, suggest.TEAM_REGISTRY)
+                self.assertEqual(back, want)
+                self.assertEqual(suggest.team_registry_state(), st)
+                self.assertEqual(set(st), {"loaded", "reason", "why", "detail", "path"})
+
+    def test_type_error_still_raises_and_keeps_registry_with_its_state(self):
+        suggest.reload_team_registry(self.good())
+        reg, st = suggest.TEAM_REGISTRY, suggest.team_registry_state()
+        path = self.reg_file("uint", b'{"usernames": 5}')
+        with self.assertRaises(TypeError):
+            suggest._load_team_registry(path)
+        with self.assertRaises(TypeError):
+            suggest.reload_team_registry(path)
+        self.assertIs(suggest.TEAM_REGISTRY, reg)
+        self.assertEqual(suggest.team_registry_state(), st)
+
+    def test_state_is_a_copy(self):
+        suggest.reload_team_registry(self.reg_file("missing", None))
+        suggest.team_registry_state()["loaded"] = True
+        self.assertIs(suggest.team_registry_state()["loaded"], False)
+
+    def test_state_is_set_with_registry_at_import(self):
+        """Признак ставится ТЕМ ЖЕ присваиванием, что TEAM_REGISTRY при импорте, и нигде отдельно."""
+        with io.open(suggest.__file__, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        pairs, alone = [], []
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            for t in node.targets:
+                if isinstance(t, ast.Tuple) and [getattr(e, "id", None) for e in t.elts] == \
+                        ["TEAM_REGISTRY", "TEAM_REGISTRY_STATE"]:
+                    pairs.append(node)
+                elif isinstance(t, ast.Name) and t.id in ("TEAM_REGISTRY", "TEAM_REGISTRY_STATE"):
+                    alone.append(t.id)
+        self.assertEqual((len(pairs), alone), (1, []))
+        call = pairs[0].value
+        self.assertEqual((getattr(call.func, "id", None), call.args, call.keywords),
+                         ("_team_registry_with_state", [], []))
 
 
 # ─────────────────────── 3. вид и медиа ───────────────────────

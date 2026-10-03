@@ -180,9 +180,14 @@ async def on_incoming(event):
 #     уже получил. Исходящему — собеседника из САМОГО апдейта (`event.chat`) или из памяти о
 #     последнем ряде этого чата. `get_chat()`/`get_entity()` здесь нет: они вправе спросить сервер;
 #   • сбой ленты не роняет обработчик: любое исключение — строка журнала, suggest идёт дальше.
+# Четвёртый (03.10.2026, TGFEEDREG0310): реестр команды НЕ ЗАГРУЖЕН (нет файла, кривой JSON, не
+# словарь, ошибка чтения) → ряд не пишется ВОВСЕ. suggest в этом случае молча берёт пустой реестр, а
+# на пустом реестре оба фильтра говорят «не команда» про любого — это незнание, а не ответ. Признак
+# даёт suggest (`team_registry_state`); не читается — значит не загружен.
 _FEED_PEER_MAX = 5000
 _FEED_PEERS = {}    # chat_id → User собеседника из последнего ряда (только память процесса)
 _FEED_COUNTS = {"written": 0, "team": 0, "partner": 0, "undecided": 0, "failed": 0}
+_FEED_REG = {"key": None, "skipped": 0}   # последнее увиденное состояние реестра; пропуски без него
 
 
 def _feed_chat_id(event):
@@ -211,6 +216,41 @@ def _feed_undecided(event, direction, why):
                 f"{_FEED_COUNTS['undecided']}.")
 
 
+def _feed_registry_ok(event, direction):
+    """Реестр команды загружен? Да → True. Нет → False, undecided +1 и строка журнала на ряд (INFO,
+    с чатом — для дозаливки). ГРОМКАЯ строка (ERROR, с причиной) — одна на СМЕНУ состояния: реестр
+    пропал, сменилась причина; починка и reload — строка WARNING с числом пропущенных рядов.
+    Исправный ПУСТОЙ реестр — загружен. Признак не читается или не строго True — не загружен."""
+    try:
+        st = suggest.team_registry_state()
+        loaded = st.get("loaded") is True
+        reason, path = str(st.get("reason") or "?"), st.get("path")
+        why = f"{st.get('why') or reason}" + (f": {st.get('detail')}" if st.get("detail") else "")
+    except Exception as e:                               # noqa: BLE001 — признака нет ≠ «загружен»
+        loaded, reason, path = False, "state_unreadable", None
+        why = f"признак реестра не читается: {type(e).__name__}: {e}"
+    key = (loaded, reason, path)
+    prev = _FEED_REG["key"]
+    _FEED_REG["key"] = key
+    if loaded:
+        if prev is not None and prev[0] is False:
+            log.warning(f"{_now()} | TG-ЛЕНТА: реестр команды снова загружен ({path}) — ряды "
+                        f"пишутся; пропущено рядов без реестра: {_FEED_REG['skipped']}.")
+        _FEED_REG["skipped"] = 0
+        return True
+    _FEED_COUNTS["undecided"] += 1
+    _FEED_REG["skipped"] += 1
+    if key != prev:
+        log.error(f"{_now()} | TG-ЛЕНТА: реестр команды НЕ ЗАГРУЖЕН ({why}; файл {path}) — ряды "
+                  f"ленты НЕ пишутся: на пустом реестре любой собеседник «не команда», и переписка "
+                  f"команды ушла бы в «Агенты» как клиентская. Починить файл и перечитать "
+                  f"(suggest.reload_team_registry) или перезапустить userbot.")
+    log.info(f"{_now()} | TG-ЛЕНТА: ряд не записан — реестр команды не загружен ({reason}); "
+             f"chat={_feed_chat_id(event)} dir={direction}; пропущено без реестра: "
+             f"{_FEED_REG['skipped']}, не решено за жизнь процесса: {_FEED_COUNTS['undecided']}.")
+    return False
+
+
 def _feed(event, peer, direction):
     """Ряд ленты для личного сообщения, если собеседник — клиент. Ничего не возвращает и НИКОГДА
     не бросает: обработчик обязан дойти до suggest при любой беде с лентой."""
@@ -218,6 +258,8 @@ def _feed(event, peer, direction):
         if not tg_feed.enabled():
             return
         _feed_remember(peer)
+        if not _feed_registry_ok(event, direction):
+            return                                       # реестра нет — фильтрам нечем решать
         try:
             if suggest.is_internal_sender(peer):
                 _FEED_COUNTS["team"] += 1
