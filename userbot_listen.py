@@ -19,6 +19,10 @@ turbobaby_session.session — те же ключи и та же сессия, ч
 
 Зависимости: telethon, python-dotenv (уже стоят, как у fetch_*.py).
 
+ЛЕНТА ДЛЯ «АГЕНТОВ» (03.10.2026, `tg_feed.py`): каждое входящее и исходящее ЛИЧНОЕ сообщение
+клиента — ряд в локальный файл вне git. Команда и партнёры отсеиваются до записи функциями suggest.
+Telegram ради ленты не зовётся ни разу, второго клиента нет; сбой записи — строка журнала.
+
 ЭТАП C (по умолчанию) — userbot только слушает и логирует, ноль исходящих.
 Ступень ① SUGGEST — ОПЦИОНАЛЬНА и по умолчанию ВЫКЛЮЧЕНА (SUGGEST_MODE=off в .env):
 при выключенной SUGGEST поведение идентично Stage C. При включении черновики ответов
@@ -45,6 +49,7 @@ import trainer_log  # noqa: E402  ЛОГ ТРЕНАЖЁРА в мозг (KB_trai
 import trainer_photo  # noqa: E402  СНИМОК В ТРЕНАЖЁРЕ: загрузка в папку входящих + чтение головой
 import booking_draft  # noqa: E402  (текст-команда «до crm» в тренажёре — мост 2.1, read-only)
 import proc_identity  # noqa: E402  ЛИЧНОСТЬ ПРОЦЕССА: номер + имя запуска + момент старта
+import tg_feed  # noqa: E402  ЛЕНТА ЛС для «Агентов»: только дозапись файла, ноль вызовов Telegram
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
@@ -151,12 +156,119 @@ async def on_incoming(event):
 
     log.info(f"{date_iso} | {who} | {name} | {text}")
 
+    # --- ЛЕНТА для «Агентов» (03.10.2026): ряд в файл ДО suggest, сбой не роняет обработчик ---
+    _feed(event, sender, tg_feed.DIR_IN)
+
     # --- ступень ① SUGGEST (opt-in; при SUGGEST_MODE=off блок не выполняется) ---
     if suggest.is_enabled():
         try:
             await suggest.on_client_message(event.client, sender, _ME_ID)
         except Exception as e:
             log.warning(f"{_now()} | SUGGEST: сбой генерации черновика: {e}")
+
+
+# ═══════════════ ЛЕНТА ЛИЧНЫХ СООБЩЕНИЙ ДЛЯ «АГЕНТОВ» (03.10.2026) ═══════════════════════════
+# Слово владельца 03.10 13:19 «всё как с ватсапом» и его «да» 13:59 на эту правку; разведка
+# TGAGENTMAP0310, путь (б). Ряд и файл — `tg_feed.py`, здесь решается только, КОМУ ряд положен.
+#
+# Три замка, каждый держит своё:
+#   • команда и партнёры отсеиваются ДО записи функциями suggest (`is_internal_sender`,
+#     `non_client_window_ref`) — реестр не копируется, правка `team_registry.json` действует на
+#     ленту так же, как на черновики. Решить не удалось → ряд НЕ пишется, пропуск считается и
+#     уходит в журнал: переписка команды не уедет в «Агенты» из-за нашего сбоя;
+#   • Telegram ради ленты не зовётся ни разу. Входящему хватает отправителя, которого on_incoming
+#     уже получил. Исходящему — собеседника из САМОГО апдейта (`event.chat`) или из памяти о
+#     последнем ряде этого чата. `get_chat()`/`get_entity()` здесь нет: они вправе спросить сервер;
+#   • сбой ленты не роняет обработчик: любое исключение — строка журнала, suggest идёт дальше.
+_FEED_PEER_MAX = 5000
+_FEED_PEERS = {}    # chat_id → User собеседника из последнего ряда (только память процесса)
+_FEED_COUNTS = {"written": 0, "team": 0, "partner": 0, "undecided": 0, "failed": 0}
+
+
+def _feed_chat_id(event):
+    try:
+        return event.chat_id
+    except Exception:                                    # noqa: BLE001 — только для строки журнала
+        return "?"
+
+
+def _feed_remember(peer):
+    """Запомнить собеседника для будущих исходящих (короткий апдейт приходит без сущности).
+    Память ограничена: самые давние уходят первыми."""
+    uid = getattr(peer, "id", None)
+    if not isinstance(uid, int):
+        return
+    _FEED_PEERS.pop(uid, None)
+    _FEED_PEERS[uid] = peer
+    while len(_FEED_PEERS) > _FEED_PEER_MAX:
+        _FEED_PEERS.pop(next(iter(_FEED_PEERS)))
+
+
+def _feed_undecided(event, direction, why):
+    _FEED_COUNTS["undecided"] += 1
+    log.warning(f"{_now()} | TG-ЛЕНТА: ряд НЕ записан — не решено, клиент ли собеседник ({why}); "
+                f"chat={_feed_chat_id(event)} dir={direction}; таких пропусков за жизнь процесса: "
+                f"{_FEED_COUNTS['undecided']}.")
+
+
+def _feed(event, peer, direction):
+    """Ряд ленты для личного сообщения, если собеседник — клиент. Ничего не возвращает и НИКОГДА
+    не бросает: обработчик обязан дойти до suggest при любой беде с лентой."""
+    try:
+        if not tg_feed.enabled():
+            return
+        _feed_remember(peer)
+        try:
+            if suggest.is_internal_sender(peer):
+                _FEED_COUNTS["team"] += 1
+                return
+            if suggest.non_client_window_ref(peer):
+                _FEED_COUNTS["partner"] += 1
+                return
+        except Exception as e:                           # noqa: BLE001 — не решено ≠ «клиент»
+            _feed_undecided(event, direction, f"фильтр suggest: {type(e).__name__}: {e}")
+            return
+        if direction == tg_feed.DIR_IN:
+            sender_id = getattr(peer, "id", None)
+        else:
+            sender_id = _ME_ID if _ME_ID is not None else getattr(event, "sender_id", None)
+        tg_feed.append(tg_feed.row(event.message, event.chat_id, direction, sender_id))
+        _FEED_COUNTS["written"] += 1
+    except Exception as e:                               # noqa: BLE001 — лента не роняет обработчик
+        _FEED_COUNTS["failed"] += 1
+        log.warning(f"{_now()} | TG-ЛЕНТА: ряд не записан ({type(e).__name__}: {e}); "
+                    f"chat={_feed_chat_id(event)} dir={direction}; сбоев записи за жизнь процесса: "
+                    f"{_FEED_COUNTS['failed']}. Обработчик продолжает.")
+
+
+async def on_outgoing(event):
+    """Исходящее ЛИЧНОЕ сообщение аккаунта (ответ менеджера с телефона, автоприветствие Business)
+    → ряд ленты dir=out. НИЧЕГО не шлёт и Telegram не зовёт. Собеседник берётся из апдейта, а нет
+    его там — из памяти о последнем ряде этого чата; нет нигде → решить «клиент ли это» нечем →
+    ряд не пишется, пропуск в журнал. Фильтры — те же, что у входящего: не бот, не свой аккаунт."""
+    try:
+        if not event.is_private:
+            return
+        cid = event.chat_id
+        if _ME_ID is not None and cid == _ME_ID:
+            return                                       # «Избранное»: чат с самим собой
+        peer = event.chat
+        if peer is None:
+            peer = _FEED_PEERS.get(cid)
+        if peer is None:
+            if tg_feed.enabled():
+                _feed_undecided(event, tg_feed.DIR_OUT,
+                                "собеседника нет ни в апдейте, ни в памяти процесса")
+            return
+        if not isinstance(peer, User) or peer.bot or peer.is_self:
+            return
+        if (peer.username or "").lower() in OWN_USERNAMES:
+            return
+        _feed(event, peer, tg_feed.DIR_OUT)
+    except Exception as e:                               # noqa: BLE001 — обработчик не падает
+        _FEED_COUNTS["failed"] += 1
+        log.warning(f"{_now()} | TG-ЛЕНТА: исходящее не разобрано ({type(e).__name__}: {e}); "
+                    f"chat={_feed_chat_id(event)}. Обработчик продолжает.")
 
 
 async def on_moderation(event):
@@ -614,6 +726,9 @@ async def main():
     # идёт на этом же объекте (см. serve_forever), иначе была бы вторая сессия.
     client = TelegramClient(SESSION, API_ID, API_HASH)
     client.add_event_handler(on_incoming, events.NewMessage(incoming=True))
+    # ЛЕНТА для «Агентов» (03.10.2026): исходящие ЛИЧНЫЕ — только ряд в файл, хендлер ничего не шлёт.
+    # Тот же клиент: второго нет и не будет.
+    client.add_event_handler(on_outgoing, events.NewMessage(outgoing=True))
     # ГРУППА-ТРЕНАЖЁР: отдельный хендлер только на ГРУППОВЫЕ входящие (func=is_group), чтобы
     # ЛС-путь (on_incoming) не задевать. Внутри — строгая изоляция по привязанному chat_id.
     client.add_event_handler(
@@ -630,6 +745,8 @@ async def main():
         log.warning(f"{_now()} | ТРЕНАЖЁР: init IPC meta: {e}")
 
     log.info(f"{_now()} | --- userbot_listen ЗАПУСК (ЭТАП C: слушаю, НЕ отвечаю) ---")
+    log.info(f"{_now()} | TG-ЛЕНТА: {'вкл' if tg_feed.enabled() else 'ВЫКЛ (' + tg_feed.OFF_ENV + ')'}"
+             f" → {tg_feed.FEED_FILE}")
     try:
         await serve_forever(client)
     finally:
