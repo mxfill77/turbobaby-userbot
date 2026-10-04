@@ -4837,6 +4837,7 @@ def _process_one(task, _plan_queue):
         # штатных каналов сознательно: ревью-контур — потребитель события, а не его участник,
         # и его сбой не смеет задеть ни закрытие ряда, ни журнал, ни карточку владельцу.
         _review_auto_note(tid, text, status, result)
+        _box_first_note_terminal(tid)   # BOXFIRST0410: терминал ряда ПК → ящик раньше E в этом витке
 
 
 # ═══ ТЕРМИНАЛ КАРТОЧКИ → ЖУРНАЛ ПОЛОСЫ (16.08.2026 UTC) ══════════════════════════════════════
@@ -14414,6 +14415,170 @@ def _revizor_route(packages, now=None):
             "card_delivered": True, "batched": len(batched)}
 
 
+# ═══ ЯЩИК РАНЬШЕ E: СЛЕДУЮЩЕЕ ЗАДАНИЕ СТАРТУЕТ В ТОМ ЖЕ ВИТКЕ (05.10.2026, BOXFIRST0410) ═══════
+# ЗАЧЕМ. Слово владельца 05.10 01:55 — «чтобы плотнее задачи шли». Замер 20 последних заданий ПК
+# (`docs/artifacts/2026-10-04-BOXFIRST0410.md`): от COMPLETE до RUN взятого ящиком — 412–2547 с,
+# типично 433–855. Время уходило не на работу, а на ПОРЯДОК тела витка: после `poll_once` шли
+# ступени A (сборка пакета), B, D, E, только потом ящик, за ним F, сводка, витрина, хвост витка,
+# сон POLL_SEC и голова следующего `poll_once` — и лишь там CLAIM. Ступень E ставила 0 и шла ДО
+# ящика (П2 задания); B+D без E по #70 съели ≈180 с.
+#
+# ЧТО МЕНЯЕТСЯ. Терминал ряда ПК в только что замкнутом `poll_once` (метка ставится в
+# `_process_one` сразу после расписки ступени A) → ПРЫЖОК: ящик → витрина → дешёвый хвост витка
+# → self-update → `poll_once` в ЭТОМ ЖЕ теле, то есть CLAIM и RUN без сна и без пяти дорогих
+# ступеней. Взял ящик полосе ПК ничего (пуст · сигнальная остановка · пауза ящика · взят только
+# серверный документ) — прыжка нет, тело идёт дальше ПРЕЖНИМ порядком, и отложенные ступени
+# исполняются там же, где всегда: «когда полоса пуста».
+#
+# ОТЛОЖЕННЫЕ ШАГИ И ГРАНИЦА КАЖДОГО (метка оборота — файл самой ступени; граница вышла → шаг
+# идёт РАНЬШЕ ящика в прежнем взаимном порядке; метка не читается → «не знаю» = граница вышла):
+#   • A, сборка пакета — 3600 с = `review_auto.RETRY_AFTER_SEC`: повод повторяется раз в час, и
+#     сама ступень называет пакет «не срочен НИКОГДА (повод переживёт виток)» (`_review_auto_owner_wait`);
+#   • B и D — 3600 с: их вход — лоток ответов, который пишут ТОЛЬКО A и F; пока они отложены той
+#     же границей, нового в лотке нет;
+#   • E — 2 × RECON_AUTO_MIN_SEC = 3600 с: «разведочный повод за полчаса не портится» — опоздание
+#     на ещё одну собственную паузу;
+#   • F — 2 × REVIEW_OUTBOX_MIN_SEC = 1200 с, ЕСЛИ в реестре исходящих есть `queued`: окна повтора
+#     (3000/2400 с) обязаны уложиться в час `RETRY_AFTER_SEC`, запас 600 с = одна пауза F. Очередь
+#     пуста — повторять нечего, граница та же, что у A (новые пакеты рождает только A). Реестр не
+#     прочитан → 1200 с.
+# Дешёвый хвост (сторож детей, немота сессий, ревизор, его список, сводка, G, ползунки, урок,
+# авто-фетч, реконсиляция детей, подъём агента) и self-update НЕ откладываются: они стоят в
+# прыжке, как в витке. Иначе цепочка заданий морила бы надзор детей и выкатку часами; цена хвоста
+# по логу — 2–4 с (витрина → следующий виток = 62–64 с при сне 60 с).
+#
+# СТОРОЖА. Heartbeat остаётся последней строкой КАЖДОГО `poll_once` (О2/О4 не тронуты); тишина
+# продукта между двумя `poll_once` прыжка = ящик + витрина + хвост + голова ≈ 2–5 мин против
+# 5–15 мин прежнего порядка, а сам заход объявлен CLAIM-отметкой, как всегда.
+#
+# ОТКАТ без правки кода и рестарта: стоп-файл `pc_orchestrator.box_first.off` — со следующего
+# терминала (`_flag_forced_off`, проверка каждый прыжок; не прочитан → откат); либо `BOX_FIRST=0`.
+BOX_FIRST_A_SEC = 3600.0                         # = review_auto.RETRY_AFTER_SEC (замок в тесте)
+BOX_FIRST_BD_SEC = 3600.0                        # вход B/D пишут только A и F
+_BOX_FIRST_TERMINAL = [None]                     # id ряда ПК, закрытого в последнем poll_once
+
+
+def _box_first_note_terminal(tid):
+    """Ряд ПК закрыт терминально в этом обороте → метка для прыжка. Fire-safe."""
+    _BOX_FIRST_TERMINAL[0] = tid
+
+
+def _box_first_pop():
+    """Метка терминала → id | None; читается ОДИН раз (прыжок на терминал — один)."""
+    tid, _BOX_FIRST_TERMINAL[0] = _BOX_FIRST_TERMINAL[0], None
+    return tid
+
+
+def _box_first_on():
+    """Прыжок включён? Дефолт — ВКЛЮЧЕНО; рубильники как у ступеней: стоп-файл и BOX_FIRST=0."""
+    if (os.environ.get("BOX_FIRST") or "").strip() == "0":
+        return False
+    if _flag_forced_off("BOX_FIRST"):
+        log.warning("ящик раньше E ВЫКЛЮЧЕН стоп-файлом %s — прежний порядок витка (снять: удалить файл)",
+                    os.path.basename(_flag_off_file("BOX_FIRST")))
+        return False
+    return True
+
+
+def _box_first_age(tick_path, now):
+    """Возраст метки оборота ступени, с → float | None (метки нет / не разобрана = «не знаю»)."""
+    try:
+        with open(tick_path, encoding="utf-8") as f:
+            return float(now) - float(json.load(f)["ts"])
+    except Exception:
+        return None
+
+
+def _box_first_f_bound(state_path=None):
+    """Граница ступени F, с: 1200 при `queued` в реестре исходящих (или реестр не прочитан), иначе 3600."""
+    try:
+        import review_outbox_queue_run as _roq
+        state, why = _roq.read_state_why(state_path or REVIEW_OUTBOX_STATE_FILE)
+        packs = (state or {}).get("packs") or {}
+        queued = None if why else sum(1 for r in packs.values()
+                                      if isinstance(r, dict) and r.get("state") == "queued")
+    except Exception:                               # noqa: BLE001 — не прочитали = есть что повторять
+        queued = None
+    return BOX_FIRST_A_SEC if queued == 0 else 2 * REVIEW_OUTBOX_MIN_SEC
+
+
+def _box_first_steps():
+    """Шаги прыжка — ссылками, в ПРЕЖНЕМ порядке витка. Точка инъекции для тестов."""
+    return {
+        "deferred": [
+            ("ступень A (сборка пакета ревью)", maybe_review_auto, REVIEW_AUTO_TICK_FILE, BOX_FIRST_A_SEC),
+            ("ступень B", maybe_review_intake, REVIEW_INTAKE_TICK_FILE, BOX_FIRST_BD_SEC),
+            ("ступень D", maybe_review_audit, REVIEW_AUDIT_TICK_FILE, BOX_FIRST_BD_SEC),
+            ("ступень E", maybe_recon_auto, RECON_AUTO_TICK_FILE, 2 * RECON_AUTO_MIN_SEC),
+            ("ступень F", maybe_review_outbox, REVIEW_OUTBOX_TICK_FILE, _box_first_f_bound()),
+        ],
+        "box": maybe_shtab_box,
+        "vitrina": maybe_vitrina,
+        "tail": [maybe_client_watchdog, maybe_session_watch, maybe_revizor, maybe_revizor_pachka,
+                 maybe_contour_digest, maybe_zayavki, maybe_polzunki, maybe_lesson_commit_retry,
+                 maybe_git_ff_pull, maybe_reconcile_children, maybe_raise_deferred_agent],
+    }
+
+
+def maybe_box_first(now=None, steps=None):
+    """ОДИН прыжок после терминала ряда ПК. → отчёт; `start=True` — вызывающий даёт СТАРТ в этом витке.
+
+    Порядок: отложенные ступени, чья граница вышла (раньше ящика) → ящик → [взят ряд ПК?] →
+    витрина → дешёвый хвост. Ящик не взял полосе ПК ничего — `start=False`, прыжка нет."""
+    tid = _box_first_pop()
+    if tid is None:
+        return {"start": False, "why": "терминала ряда ПК в обороте не было"}
+    if not _box_first_on():
+        return {"start": False, "why": "выключено рубильником"}
+    now = time.time() if now is None else float(now)
+    st = steps or _box_first_steps()
+    late, held = [], []
+    for name, fn, tick_path, bound in st["deferred"]:
+        age = _box_first_age(tick_path, now)
+        if age is None or age >= bound:
+            log.info("ящик раньше E: граница «%s» вышла (%s из %.0fс) — шаг идёт РАНЬШЕ ящика",
+                     name, "метка не прочитана" if age is None else "%.0fс" % age, bound)
+            late.append(name)
+            fn()
+        else:
+            held.append(name)
+    rep = st["box"]()
+    pc = [r for r in ((rep or {}).get("placed") or ()) if isinstance(r, dict) and r.get("lane") == LANE]
+    if not pc:
+        why = ("ящик не смотрел (пауза или выключен)" if rep is None else
+               "ящик остановлен сигналом" if (rep or {}).get("stop") else
+               "полосе ПК ящик не дал ничего")
+        log.info("ящик раньше E: после терминала #%s старта в этом витке нет (%s) — дальше прежний "
+                 "порядок", tid, why)
+        return {"start": False, "why": why, "late": late, "held": held, "tid": tid}
+    st["vitrina"]()
+    for fn in st["tail"]:
+        try:
+            fn()
+        except Exception as e:                      # noqa: BLE001 — хвост не роняет прыжок
+            log.warning("ящик раньше E: шаг хвоста %s упал (%s: %s)",
+                        getattr(fn, "__name__", fn), type(e).__name__, e)
+    log.info("ящик раньше E: после терминала #%s ящик взял полосе ПК %s — витрина прошла, старт в "
+             "этом же витке; отложены: %s", tid, ", ".join("#%s" % r.get("id") for r in pc),
+             ", ".join(held) or "ничего")
+    return {"start": True, "placed": pc, "late": late, "held": held, "tid": tid}
+
+
+def _box_first_chain(hop=None, start=None, update=None):
+    """Прыжки подряд, пока ящик даёт полосе ПК задание. → True, если self-update забрал процесс.
+
+    Спин невозможен устройством: старт требует нового терминала И нового взгляда ящика, а взгляд
+    не чаще SHTAB_BOX_MIN_SEC (600 с)."""
+    while True:
+        rep = (hop or maybe_box_first)()
+        if not rep.get("start"):
+            return False
+        _bridge_budget_note()
+        if (update or maybe_self_update)():
+            return True
+        (start or poll_once)()
+
+
 # ------------------- OS-синглтон демона (разбор #128, часть 4) ----------------
 # Инцидент: ДВА pc_orchestrator одновременно (оба стартовали в одну секунду от Планировщика
 # поверх уже живого) → оба поллят очередь и наперегонки claim'ят задачи (двойное исполнение).
@@ -14661,6 +14826,11 @@ def _main_loop():
             _loop_prev_wall = now
             _loop_prev_awake = awake_now
             poll_once()
+            # BOXFIRST0410: терминал ряда ПК → ящик, витрина и старт взятого В ЭТОМ ЖЕ витке
+            # (разбор у `maybe_box_first`); ящик ничего не дал полосе — ниже прежний порядок.
+            if _box_first_chain():
+                log.info("=== ДЕМОН ВЫШЕЛ ПО SELF-UPDATE (эстафета новому процессу) ===")
+                return
             maybe_client_watchdog()   # часть 3: следим за pc_agent/userbot/moderation_bot (троттлинг 5 мин)
             maybe_session_watch()     # инцидент 29.07: немая сессия (жива, но не работает) → карточка в 328
             maybe_revizor()           # шаг 2/7 (262): ревизор диалогов за DIALOG_REVIZOR (троттлинг REVIZOR_HOURS)

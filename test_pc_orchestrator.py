@@ -14102,5 +14102,220 @@ class TestSvcClockDemon(unittest.TestCase):
                          "демон читает не тот штамп, что пишут часы")
 
 
+class TestBoxFirst(unittest.TestCase):
+    """BOXFIRST0410 (05.10.2026): после терминала ряда ПК — ящик, витрина и старт В ТОМ ЖЕ витке.
+    Шаги — подмены-записыватели; мост, Drive, Telegram и модель не зовутся; метки — во временном
+    каталоге, стоп-файл — во временном REPO."""
+
+    NOW = 1_800_000_000.0
+    DEFERRED = ("A", "B", "D", "E", "F")
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self._save = (o.REPO, o._BOX_FIRST_TERMINAL[0], os.environ.pop("BOX_FIRST", None))
+        o.REPO = self.dir
+        o._BOX_FIRST_TERMINAL[0] = None
+        self.calls = []
+
+    def tearDown(self):
+        o.REPO, o._BOX_FIRST_TERMINAL[0], env = self._save
+        os.environ.pop("BOX_FIRST", None)
+        if env is not None:
+            os.environ["BOX_FIRST"] = env
+
+    def _tick(self, name, age):
+        p = os.path.join(self.dir, "tick_%s.json" % name)
+        if age is not None:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"ts": self.NOW - age}, f)
+        return p
+
+    def _rec(self, name, ret=None):
+        def fn():
+            self.calls.append(name)
+            return ret
+        fn.__name__ = name
+        return fn
+
+    def steps(self, box=None, ages=None, bound=3600.0):
+        ages = dict({k: 100.0 for k in self.DEFERRED}, **(ages or {}))
+        box = {"placed": [{"key": "aa1", "id": 72, "lane": "pc"}]} if box is None else box
+        return {"deferred": [(k, self._rec(k), self._tick(k, ages[k]), bound) for k in self.DEFERRED],
+                "box": self._rec("box", None if box == "none" else box),
+                "vitrina": self._rec("vitrina"),
+                "tail": [self._rec("watchdog"), self._rec("self_tail")]}
+
+    def hop(self, **kw):
+        return o.maybe_box_first(now=self.NOW, steps=self.steps(**kw))
+
+    # ── случаи п.5 ───────────────────────────────────────────────────────────────────────────
+    def test_terminal_and_pc_document_box_before_e_and_start_in_the_same_turn(self):
+        o._box_first_note_terminal(71)
+        started = []
+        hop = lambda: o.maybe_box_first(now=self.NOW, steps=self.steps())
+        out = o._box_first_chain(hop=hop, start=lambda: started.append(1), update=lambda: False)
+        self.assertFalse(out)
+        self.assertEqual(started, [1], "взятое ящиком обязано стартовать в этом же витке")
+        self.assertEqual(self.calls, ["box", "vitrina", "watchdog", "self_tail"],
+                         "E/F/A/B/D в пределах границы — после старта, а не до ящика")
+
+    def test_the_report_names_start_and_held_steps(self):
+        o._box_first_note_terminal(71)
+        rep = self.hop()
+        self.assertTrue(rep["start"])
+        self.assertEqual([r["id"] for r in rep["placed"]], [72])
+        self.assertEqual(rep["held"], list(self.DEFERRED))
+        self.assertIsNone(o._BOX_FIRST_TERMINAL[0], "метка терминала читается один раз")
+
+    def test_empty_box_keeps_the_old_order(self):
+        o._box_first_note_terminal(71)
+        rep = self.hop(box={"placed": []})
+        self.assertFalse(rep["start"])
+        self.assertEqual(self.calls, ["box"], "витрина и хвост идут в теле прежним порядком, а не здесь")
+        self.assertEqual(rep["held"], list(self.DEFERRED))
+
+    def test_e_past_its_bound_goes_before_the_box(self):
+        o._box_first_note_terminal(71)
+        rep = self.hop(ages={"E": 3600.0})
+        self.assertTrue(rep["start"])
+        self.assertEqual(self.calls[:2], ["E", "box"])
+        self.assertEqual(rep["late"], ["E"])
+
+    def test_unreadable_tick_means_the_bound_is_out(self):
+        o._box_first_note_terminal(71)
+        rep = self.hop(ages={"F": None})
+        self.assertEqual(self.calls[:2], ["F", "box"])
+        self.assertEqual(rep["late"], ["F"])
+
+    def test_late_steps_keep_their_old_mutual_order(self):
+        o._box_first_note_terminal(71)
+        self.hop(ages={"F": 5000.0, "A": 5000.0, "E": 5000.0})
+        self.assertEqual(self.calls[:4], ["A", "E", "F", "box"])
+
+    def test_signal_stop_keeps_the_old_order(self):
+        o._box_first_note_terminal(71)
+        rep = self.hop(box={"placed": [], "stop": "СИГНАЛЬНАЯ ОСТАНОВКА ЯЩИКА · сигнал А"})
+        self.assertFalse(rep["start"])
+        self.assertIn("сигналом", rep["why"])
+        self.assertEqual(self.calls, ["box"])
+
+    def test_stop_file_keeps_the_old_order(self):
+        with open(o._flag_off_file("BOX_FIRST"), "w", encoding="utf-8") as f:
+            f.write("")
+        o._box_first_note_terminal(71)
+        rep = self.hop()
+        self.assertFalse(rep["start"])
+        self.assertEqual(self.calls, [], "на откате прыжок не трогает ни ящик, ни ступени")
+
+    def test_env_zero_keeps_the_old_order(self):
+        os.environ["BOX_FIRST"] = "0"
+        try:
+            o._box_first_note_terminal(71)
+            self.assertFalse(self.hop()["start"])
+            self.assertEqual(self.calls, [])
+        finally:
+            os.environ.pop("BOX_FIRST", None)
+
+    def test_only_a_server_document_changes_nothing_for_the_pc_turn(self):
+        o._box_first_note_terminal(71)
+        rep = self.hop(box={"placed": [{"key": "bb1", "id": 73, "lane": "vps"}]})
+        self.assertFalse(rep["start"])
+        self.assertEqual(self.calls, ["box"])
+
+    def test_no_terminal_no_hop(self):
+        rep = self.hop()
+        self.assertFalse(rep["start"])
+        self.assertEqual(self.calls, [])
+
+    def test_box_pause_means_no_start(self):
+        o._box_first_note_terminal(71)
+        rep = self.hop(box="none")
+        self.assertFalse(rep["start"])
+        self.assertIn("не смотрел", rep["why"])
+
+    def test_chain_goes_on_while_the_box_feeds_and_stops_on_its_pause(self):
+        boxes = [{"placed": [{"key": "aa1", "id": 72, "lane": "pc"}]}, "none"]
+        started = []
+
+        def hop():
+            return o.maybe_box_first(now=self.NOW, steps=self.steps(box=boxes.pop(0)))
+
+        def start():
+            started.append(1)
+            o._box_first_note_terminal(72)       # стартовавшее задание закрылось в том же poll_once
+        o._box_first_note_terminal(71)
+        self.assertFalse(o._box_first_chain(hop=hop, start=start, update=lambda: False))
+        self.assertEqual(started, [1], "второй взгляд упёрся в паузу ящика — старта нет, спина нет")
+
+    def test_self_update_takes_the_process_before_the_start(self):
+        o._box_first_note_terminal(71)
+        started = []
+        out = o._box_first_chain(hop=lambda: o.maybe_box_first(now=self.NOW, steps=self.steps()),
+                                 start=lambda: started.append(1), update=lambda: True)
+        self.assertTrue(out)
+        self.assertEqual(started, [], "новый код обязан приехать ДО следующего задания")
+
+    def test_a_failing_tail_step_does_not_cancel_the_start(self):
+        o._box_first_note_terminal(71)
+        st = self.steps()
+
+        def boom():
+            raise RuntimeError("хвост упал")
+        st["tail"].insert(0, boom)
+        self.assertTrue(o.maybe_box_first(now=self.NOW, steps=st)["start"])
+
+    # ── границы — из кода ступеней ───────────────────────────────────────────────────────────
+    def test_bounds_come_from_the_steps_code(self):
+        import review_auto
+        self.assertEqual(o.BOX_FIRST_A_SEC, review_auto.RETRY_AFTER_SEC)
+        st = o._box_first_steps()
+        names = [d[0] for d in st["deferred"]]
+        self.assertEqual([n.split()[1] for n in names], ["A", "B", "D", "E", "F"])
+        self.assertEqual(st["deferred"][3][3], 2 * o.RECON_AUTO_MIN_SEC)
+        self.assertIs(st["deferred"][3][1], o.maybe_recon_auto)
+        self.assertIs(st["box"], o.maybe_shtab_box)
+        self.assertIs(st["vitrina"], o.maybe_vitrina)
+        self.assertIn(o.maybe_client_watchdog, st["tail"])
+
+    def test_f_bound_follows_its_queue(self):
+        p = os.path.join(self.dir, "outbox.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"packs": {"k1": {"state": "queued"}}}, f)
+        self.assertEqual(o._box_first_f_bound(p), 2 * o.REVIEW_OUTBOX_MIN_SEC)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"packs": {"k1": {"state": "exhausted"}}}, f)
+        self.assertEqual(o._box_first_f_bound(p), o.BOX_FIRST_A_SEC)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{битый")
+        self.assertEqual(o._box_first_f_bound(p), 2 * o.REVIEW_OUTBOX_MIN_SEC)
+
+    # ── проводка ─────────────────────────────────────────────────────────────────────────────
+    def test_wiring_terminal_mark_and_loop_place(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pc_orchestrator.py"),
+                  encoding="utf-8") as f:
+            src = f.read()
+        one = src.index("def _process_one(")
+        rec = src.index("_review_auto_note(tid, text, status, result)", one)
+        mark = src.index("_box_first_note_terminal(tid)", one)
+        self.assertLess(rec, mark, "метка терминала — после расписки ступени A")
+        body = src.split("def _main_loop", 1)[1]
+        self.assertLess(body.index("poll_once()"), body.index("if _box_first_chain():"))
+        self.assertLess(body.index("if _box_first_chain():"), body.index("maybe_client_watchdog()"))
+        order = [body.index(s) for s in ("maybe_review_auto()  ", "maybe_review_intake()  ",
+                                         "maybe_review_audit()  ", "maybe_recon_auto()  ",
+                                         "maybe_shtab_box()  ", "maybe_review_outbox()  ")]
+        self.assertEqual(order, sorted(order), "прежний порядок тела витка не тронут")
+
+    # ── п.6: сторож не поднимает ложной тревоги от нового порядка ────────────────────────────
+    def test_watchdog_sees_no_false_alarm_on_the_worst_measured_hop(self):
+        hop = 169 + 52 + 5 + 49          # худшие замеры: ящик, витрина, хвост, голова poll_once
+        v, why = o.daemon_product_verdict(wall_age=hop, silence=hop, busy_age=None)
+        self.assertEqual(v, o.PROD_OK, why)
+        v, why = o.daemon_product_verdict(wall_age=hop + o.TASK_TIMEOUT, silence=hop + o.TASK_TIMEOUT,
+                                          busy_age=o.TASK_TIMEOUT)
+        self.assertEqual(v, o.PROD_OK, why)
+        self.assertIn("объявленный заход", why)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
