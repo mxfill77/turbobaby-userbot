@@ -1157,8 +1157,12 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
          journal_fn=None, reader=None, node=None, ledger=None, lister=None,
          doc_reader=None, prefix=None, read_max=shtab_box.READ_MAX,
          taken_reader=None, remember_fn=None, hold_reader=None, hold_writer=None,
-         notify_fn=None, hold_notify_fn=None):
+         notify_fn=None, hold_notify_fn=None, lane_limit=None):
     """Один оборот ящика. → dict отчёта.
+
+    ``lane_limit`` (05.10.2026) — лимит витка НА ПОЛОСУ (:func:`shtab_box.select`);
+    ``None`` — прежний общий ``limit``. Демон передаёт его явно
+    (`pc_orchestrator._shtab_box_lane_limit`), умолчание здесь — прежнее поведение.
 
     ``place=False`` — сухой ход: папка перечислена, документы разобраны, тела
     прочитаны, ворота посчитаны, текст ряда собран, ОЧЕРЕДЬ НЕ ТРОНУТА. Боевой ход
@@ -1258,7 +1262,7 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
         today=today, budget=budget,
         owner_busy=bool(data["owner_busy"]), limit=limit,
         marks_ok=bool(data["marks_ok"]), source_ok=bool(data["folder_ok"]),
-        stop_words=data["stop"])
+        stop_words=data["stop"], lane_limit=lane_limit)
     report["held"] = [(k, why) for k, why in held]
     # Отказы РАЗБОРА докладываются наравне с отказами ворот: документ, о котором не
     # сказали, — это задание, молча пропавшее по дороге. «Где именно» называется
@@ -1662,8 +1666,12 @@ def _line(report):
     if not placed and not report.get("failed"):
         return ""
     retries = sum(1 for r in placed if r.get("retry"))
-    parts = ["ящик Штаба: взято %d%s"
-             % (len(placed), (" (из них дожимов %d)" % retries) if retries else "")]
+    # РАЗРЕЗ ПО ПОЛОСАМ — В ГОЛОВЕ СТРОКИ (05.10.2026): за взгляд берётся до одного
+    # задания КАЖДОЙ полосе, и «взято 2» без разреза не говорит, куда уехало каждое.
+    split = shtab_box.lane_split(placed)
+    parts = ["ящик Штаба: взято %d%s%s"
+             % (len(placed), (" [%s]" % split) if split else "",
+                (" (из них дожимов %d)" % retries) if retries else "")]
     for row in placed:
         # ПОЛОСА — В СТРОКЕ ИСХОДА, а не только в журнальном индексе. Эту строку
         # демон кладёт в `cowork_log` и в свой лог; по ней же владелец узнаёт о
@@ -2010,7 +2018,9 @@ def main(argv=None):
                         help="снять сигнальную остановку по метке (зовёт кнопка/слово pc_agent)")
     parser.add_argument("--by", default="", help="кем снято — след в замке, не проверка права")
     parser.add_argument("--limit", type=int, default=shtab_box.TICK_LIMIT,
-                        help="потолок заданий за виток")
+                        help="потолок заданий за виток (общий; действует при --lane-limit 0)")
+    parser.add_argument("--lane-limit", type=int, default=shtab_box.LANE_TICK_LIMIT,
+                        help="потолок заданий за виток НА ПОЛОСУ, как у демона; 0 — прежний общий")
     parser.add_argument("--budget", type=int, default=shtab_box.DAILY_BUDGET,
                         help="потолок заданий на сутки")
     parser.add_argument("--journal", action="store_true", help="писать строки-индексы в журнал")
@@ -2057,8 +2067,10 @@ def main(argv=None):
         print(json.dumps(data, ensure_ascii=False, indent=2, default=str) if args.json
               else _render(None, data))
         return 0
-    report = tick(HERE, place=bool(args.place), limit=args.limit, budget=args.budget,
-                  write_journal=bool(args.journal))
+    per_lane = args.lane_limit if args.lane_limit and args.lane_limit > 0 else None
+    report = tick(HERE, place=bool(args.place),
+                  limit=args.limit if per_lane is None else None, budget=args.budget,
+                  write_journal=bool(args.journal), lane_limit=per_lane)
     # ТОТ ЖЕ ДОВОД, ЧТО У СНЯТИЯ: при `--place` задание УЖЕ стои́т в очереди, ключ
     # УЖЕ записан в долгую память, и упавшая печать отчёта не смеет объявить этот
     # ход провалившимся.

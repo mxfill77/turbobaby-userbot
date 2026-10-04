@@ -12839,7 +12839,18 @@ SHTAB_BOX_MIN_SEC = float(os.getenv("SHTAB_BOX_MIN_SEC", "600") or "600")     # 
 # меньшему, а журнал доложит по большему, и разойдётся это молча; обоснование числа
 # и замок против расхождения — у самой константы в `shtab_box.py`.
 SHTAB_BOX_BUDGET = int(os.getenv("SHTAB_BOX_BUDGET", "40") or "40")           # заданий в сутки НА ПОЛОСУ (местные)
-SHTAB_BOX_LIMIT = int(os.getenv("SHTAB_BOX_LIMIT", "1") or "1")               # заданий за виток
+SHTAB_BOX_LIMIT = int(os.getenv("SHTAB_BOX_LIMIT", "1") or "1")               # заданий за виток (ОБЩИЙ — откат)
+# ЗА ВЗГЛЯД — НЕ БОЛЬШЕ ОДНОГО НА ПОЛОСУ (05.10.2026, слово владельца «чтобы плотнее
+# задачи шли»). Общий предел ставил серверное задание за документом ПК, а следующий
+# взгляд бывает только после конца задания ПК (оно исполняется синхронно внутри
+# `poll_once`): `0129m-7b1` ждал так 82 мин 47 с (разбор у `shtab_box.LANE_TICK_LIMIT`).
+# Полосе ПК не прибавляется ничего — у неё по-прежнему одно задание за взгляд.
+# ОТКАТ К ПРЕЖНЕМУ ОБЩЕМУ `SHTAB_BOX_LIMIT` — ДВУМЯ РУЧКАМИ, обе без правки кода:
+#   • стоп-файл `pc_orchestrator.shtab_box_lanes.off` — со следующего взгляда, БЕЗ
+#     рестарта (проверяется каждый виток, тем же `_flag_forced_off`, что у ступеней);
+#   • `SHTAB_BOX_LANE_LIMIT=0` — как `SHTAB_BOX_MIN_SEC`, со следующего старта процесса.
+# Стоп-файл не прочитан → откат («не знаю» у рубильника значит прежнее поведение).
+SHTAB_BOX_LANE_LIMIT = int(os.getenv("SHTAB_BOX_LANE_LIMIT", "1") or "1")     # заданий за виток НА ПОЛОСУ; 0 — откат
 SHTAB_BOX_TICK_FILE = _state(os.path.join(REPO, "pc_orchestrator.shtab_box_tick.json"))
 SHTAB_BOX_MARKS_KEEP = 20          # меток остановки в метке оборота: индекс, а не архив
 
@@ -12858,6 +12869,35 @@ def _shtab_box_on():
                     os.path.basename(_flag_off_file("SHTAB_BOX")))
         return False
     return True
+
+
+def _shtab_box_lane_limit():
+    """Лимит витка НА ПОЛОСУ → int, либо None = прежний общий `SHTAB_BOX_LIMIT` (откат)."""
+    if SHTAB_BOX_LANE_LIMIT <= 0 or _flag_forced_off("SHTAB_BOX_LANES"):
+        return None
+    return SHTAB_BOX_LANE_LIMIT
+
+
+def _shtab_box_census_view(report):
+    """Отчёт оборота → он же, где взятые ЭТИМ оборотом ключи стоят в маркерах. → dict.
+
+    Корпус маркеров читается ДО постановки, и без этого слепок «что дальше»
+    (`close_msg_pc.facts_from_box`) считал только что взятое «ждущим», а первым из
+    них — «следующим». При одном взятом за взгляд это врало на единицу, при двух
+    (05.10.2026) — на два и называло следующим уже взятое. Отчёт не меняется:
+    правится копия, которую видит только слепок.
+    """
+    rep = report if isinstance(report, dict) else {}
+    build = rep.get("build") if isinstance(rep.get("build"), dict) else None
+    placed = [r for r in (rep.get("placed") or ()) if isinstance(r, dict) and r.get("key")]
+    if build is None or not placed:
+        return rep
+    view = dict(build)
+    view["task_marks"] = (list(build.get("task_marks") or ())
+                          + [(rep.get("today") or "", str(r["key"])) for r in placed])
+    out = dict(rep)
+    out["build"] = view
+    return out
 
 
 def _shtab_box_read_tick(path=None):
@@ -12970,9 +13010,11 @@ def maybe_shtab_box(now=None, tick_path=None, runner=None):
                           census=st.get("census"))
     try:
         import shtab_box_run
+        lane_limit = _shtab_box_lane_limit()
         report = (runner or shtab_box_run.tick)(
-            root=_shtab_box_root(), place=True, limit=SHTAB_BOX_LIMIT,
-            budget=SHTAB_BOX_BUDGET, write_journal=True,
+            root=_shtab_box_root(), place=True,
+            limit=SHTAB_BOX_LIMIT if lane_limit is None else None,
+            budget=SHTAB_BOX_BUDGET, write_journal=True, lane_limit=lane_limit,
         )
     except Exception as e:
         log.warning("ящик Штаба: оборот упал (fail-safe, метка уже сдвинута — следующая попытка "
@@ -12986,7 +13028,7 @@ def maybe_shtab_box(now=None, tick_path=None, runner=None):
     # слепок раздел не показывает, он говорит «НЕИЗВЕСТНО»).
     census = st.get("census")
     try:
-        census = close_msg_pc.facts_from_box(report, prev=census, now=now)
+        census = close_msg_pc.facts_from_box(_shtab_box_census_view(report), prev=census, now=now)
     except Exception as e:                         # noqa: BLE001 — витрина не роняет оборот
         log.warning("ящик Штаба: слепок для сообщения о закрытии не снят: %s", e)
     _shtab_box_write_tick(now, tick_path, stop=report.get("stop") or "",
@@ -12995,10 +13037,10 @@ def maybe_shtab_box(now=None, tick_path=None, runner=None):
     if not report.get("acted"):
         log.info("ящик Штаба: %s", report.get("why") or "брать нечего")
         return report
+    # ВЗЯТОЕ — ПО ПОЛОСАМ (05.10.2026): «ПК 1: #64 ключ=…; VPS 1: #65 ключ=…».
     log.info("ящик Штаба: взято %d (%s), не встало %d",
              len(report.get("placed") or []),
-             ", ".join("#%s ключ=%s" % (r.get("id"), r.get("key"))
-                       for r in report.get("placed") or []),
+             shtab_box_run.shtab_box.lane_split(report.get("placed") or [], rows=True),
              len(report.get("failed") or []))
     _cowork(shtab_box_run._line(report) or "ящик Штаба: оборот без строки исхода")
     return report

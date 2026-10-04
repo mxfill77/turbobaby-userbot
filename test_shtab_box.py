@@ -2805,5 +2805,173 @@ class TestFolderCap(unittest.TestCase):
         self.assertIn("УСЕЧЕНО", rep["why"])
 
 
+# ═══════════════════ ЗА ВЗГЛЯД — ОДИН НА ПОЛОСУ (05.10.2026) ═══════════════════
+
+
+class TestLanePerTick(unittest.TestCase):
+    """За взгляд — не больше одного документа КАЖДОЙ полосе (задание 0129n-7b2.0410).
+
+    ПОВОД — ЖИВОЙ ЛОГ 05.10: серверный `0129m-7b1` лежал на взглядах 01:26:21 и
+    01:58:28, оба отдали единственный слот витка документам ПК (#61, #62), а взят
+    он в 02:49:08 — 82 мин 47 с за документами ПК. Общий предел остался ОТКАТОМ
+    (``lane_limit=None``), и прежнее поведение стережёт соседний
+    ``TestLaneCeilings.test_the_TICK_limit_stays_COMMON_to_both_lanes``.
+    """
+
+    LANE = sb.LANE_TICK_LIMIT
+
+    def _run(self, *pairs, **kw):
+        kw.setdefault("lane_limit", self.LANE)
+        kw.setdefault("limit", None)
+        kw.setdefault("notify_fn", _Notifier())
+        q = kw.pop("queue", None) or FakeQueue()
+        return _tick(_box(*pairs), queue=q, place=True, **kw), q
+
+    def test_pc_and_server_are_both_taken_in_one_look(self):
+        rep, q = self._run(("aa1", GOOD_BODY), ("bb1", _lane_body("сервер")))
+        self.assertEqual(["aa1", "bb1"], [r["key"] for r in rep["placed"]], rep["held"])
+        self.assertEqual([sb.LANE_PC, sb.LANE_VPS], q.lanes)
+
+    def test_two_pc_documents_give_one_the_oldest(self):
+        rep, q = self._run(("aa1", GOOD_BODY), ("aa2", _lane_body("пк")))
+        self.assertEqual(["aa1"], [r["key"] for r in rep["placed"]])
+        self.assertIn(("aa2", "не больше 1 за виток на полосу ПК — возьмём следующим"),
+                      rep["held"])
+
+    def test_two_server_documents_give_one_the_oldest(self):
+        rep, q = self._run(("bb1", _lane_body("сервер")), ("bb2", _lane_body("vps")))
+        self.assertEqual(["bb1"], [r["key"] for r in rep["placed"]])
+        self.assertEqual([sb.LANE_VPS], q.lanes)
+        self.assertIn("на полосу VPS", " ".join(w for _k, w in rep["held"]))
+
+    def test_the_oldest_of_each_lane_when_lanes_interleave(self):
+        rep, _q = self._run(("aa1", GOOD_BODY), ("aa2", GOOD_BODY),
+                            ("bb1", _lane_body("сервер")), ("bb2", _lane_body("сервер")))
+        self.assertEqual(["aa1", "bb1"], [r["key"] for r in rep["placed"]])
+
+    def test_an_exhausted_day_of_one_lane_does_not_stop_the_other(self):
+        closed = [_row("p%02d" % i) for i in range(sb.DAILY_BUDGET)]
+        rep, _q = self._run(("aa1", GOOD_BODY), ("bb1", _lane_body("сервер")),
+                            queue=FakeQueue(closed=closed), budget=sb.DAILY_BUDGET)
+        self.assertEqual(["bb1"], [r["key"] for r in rep["placed"]])
+        self.assertIn("суточный потолок исчерпан", dict(rep["held"])["aa1"])
+
+    def test_a_signal_stop_takes_nothing(self):
+        take, held = sb.select(_ready(("aa1", GOOD_BODY), ("bb1", _lane_body("сервер"))),
+                               today=TODAY, limit=None, lane_limit=self.LANE,
+                               stop_words="СИГНАЛЬНАЯ ОСТАНОВКА ЯЩИКА · проба")
+        self.assertEqual([], take)
+        self.assertEqual(2, len(held))
+
+    def test_an_unclear_lane_is_refused_as_before(self):
+        rep, _q = self._run(("aa1", _lane_body("луна")), ("bb1", _lane_body("сервер")))
+        self.assertEqual(["bb1"], [r["key"] for r in rep["placed"]])
+        self.assertTrue(dict(rep["held"])["aa1"].startswith("НЕ ПРИНЯТ (bad_lane)"),
+                        rep["held"])
+
+    def test_rollback_none_is_the_old_common_limit(self):
+        rep, _q = self._run(("aa1", GOOD_BODY), ("bb1", _lane_body("сервер")),
+                            lane_limit=None, limit=sb.TICK_LIMIT)
+        self.assertEqual(["aa1"], [r["key"] for r in rep["placed"]])
+        self.assertIn(("bb1", "не больше 1 за виток — возьмём следующим"), rep["held"])
+
+    def test_the_outcome_line_names_lanes(self):
+        rep, _q = self._run(("aa1", GOOD_BODY), ("bb1", _lane_body("сервер")))
+        self.assertIn("ящик Штаба: взято 2 [ПК 1 · VPS 1]", rep["line"])
+        self.assertEqual("ПК 1: #%s ключ=aa1; VPS 1: #%s ключ=bb1"
+                         % (rep["placed"][0]["id"], rep["placed"][1]["id"]),
+                         sb.lane_split(rep["placed"], rows=True))
+
+    def test_the_digest_counts_both_markers_of_one_look(self):
+        """Сводка контура считает маркеры строк слепка — два взятых за взгляд
+        дают два, а не один и не три."""
+        import queue_snapshot_pc
+
+        rep, q = self._run(("aa1", GOOD_BODY), ("bb1", _lane_body("сервер")))
+        rows = [{"goal": queue_snapshot_pc.goal_line(text)} for _tid, text in q.tasks]
+        self.assertEqual(2, cd.shtab_taken(rows, rep["today"]))
+
+
+class TestLanePerTickDaemon(unittest.TestCase):
+    """Врезка в демона: ручка, откат стоп-файлом, лог по полосам, слепок и витрина."""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("TURBOBABY_TEST_LOGS", "1")
+        import pc_orchestrator
+
+        cls.o = pc_orchestrator
+
+    def _turn(self, off=False, knob=None, pairs=None):
+        from unittest import mock
+
+        root = tempfile.mkdtemp(prefix="shtabbox_lane_")
+        tick_path = os.path.join(root, "tick.json")
+        files, bodies = _files(pairs if pairs is not None else
+                               (("aa1", GOOD_BODY), ("bb1", _lane_body("сервер")),
+                                ("cc1", GOOD_BODY)))
+        q, seen = FakeQueue(), {}
+
+        def runner(**kw):
+            seen.update(kw)
+            kw["root"] = root                 # ни строки в живое дерево
+            kw["write_journal"] = False
+            return run.tick(queue=q, lister=_lister(files), doc_reader=_doc_reader(bodies),
+                            reader=_reader(HEAD_TEXT), notify_fn=_Notifier(),
+                            hold_notify_fn=_HoldDoor(),
+                            clock=lambda tz: datetime.datetime(2026, 9, 2, 12, 0, tzinfo=tz),
+                            **kw)
+
+        lanes_off = (lambda name: off and name == "SHTAB_BOX_LANES")
+        patches = [mock.patch.object(self.o, "_flag_forced_off", side_effect=lanes_off),
+                   mock.patch.object(self.o, "_cowork", return_value=None)]
+        if knob is not None:
+            patches.append(mock.patch.object(self.o, "SHTAB_BOX_LANE_LIMIT", knob))
+        for p in patches:
+            p.start()
+        try:
+            with self.assertLogs(self.o.log, "INFO") as logs:
+                rep = self.o.maybe_shtab_box(now=1000.0, tick_path=tick_path, runner=runner)
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        return rep, q, seen, logs.output, tick_path, root
+
+    def test_the_daemon_takes_one_per_lane(self):
+        rep, q, seen, out, _t, _r = self._turn()
+        self.assertEqual((None, sb.LANE_TICK_LIMIT), (seen["limit"], seen["lane_limit"]))
+        self.assertEqual(["aa1", "bb1"], [r["key"] for r in rep["placed"]])
+        line = [x for x in out if "ящик Штаба: взято" in x]
+        self.assertTrue(line and "ПК 1: #" in line[0] and "VPS 1: #" in line[0], out)
+
+    def test_the_stop_file_rolls_back_to_the_common_limit(self):
+        rep, _q, seen, _o, _t, _r = self._turn(off=True)
+        self.assertEqual((self.o.SHTAB_BOX_LIMIT, None), (seen["limit"], seen["lane_limit"]))
+        self.assertEqual(["aa1"], [r["key"] for r in rep["placed"]])
+
+    def test_the_knob_zero_rolls_back_too(self):
+        rep, _q, seen, _o, _t, _r = self._turn(knob=0)
+        self.assertEqual((self.o.SHTAB_BOX_LIMIT, None), (seen["limit"], seen["lane_limit"]))
+        self.assertEqual(["aa1"], [r["key"] for r in rep["placed"]])
+
+    def test_the_census_does_not_count_just_taken_as_waiting(self):
+        """Слепок «что дальше» после взгляда с ДВУМЯ взятыми: ждёт ровно cc1, и он
+        же следующий; моментов взятия прибавилось два."""
+        import json
+
+        _rep, _q, _s, _o, tick_path, _r = self._turn()
+        with io.open(tick_path, encoding="utf-8") as fh:
+            census = json.load(fh)["census"]
+        self.assertTrue(census["ok"], census)
+        self.assertEqual((1, "cc1"), (census["waiting"], census["next"]))
+        self.assertEqual([1000.0, 1000.0], census["taken"])
+
+    def test_the_showcase_reads_no_stop_after_two_taken(self):
+        import vitrina_pc_run
+
+        _rep, _q, _s, _o, tick_path, root = self._turn()
+        self.assertEqual("", vitrina_pc_run.read_box_stop(root=root, named=tick_path))
+
+
 if __name__ == "__main__":            # pragma: no cover
     unittest.main(verbosity=2)
