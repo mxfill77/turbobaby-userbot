@@ -429,6 +429,17 @@ def read_node(name=None, reader=None):
     return text, True, ""
 
 
+# ПОТОЛОК ПЕРЕЧИСЛЕНИЯ ПАПКИ — ПРЕДЕЛ МОСТА, А НЕ ЕГО УМОЛЧАНИЕ (04.10.2026). Мост
+# (`ReadDocs.js` → `handleListBrainFolder_`, прод @86) без ``limit`` отдаёт 500 и
+# больше 1000 не отдаёт вовсе. Без этого числа ящик звал перечисление молча с
+# умолчанием, и 501-й документ ``shtab_task_*`` делал список УСЕЧЁННЫМ: замер журнала
+# демона 03.10 20:04 и 20:16 — «перечисление УСЕЧЕНО (отдано 500…)», ноль постановок;
+# с 03.10 23:01 до 04.10 19:24 — «документов 500», ровно на пороге. Просим предел
+# моста: просить больше бессмысленно, мост урежет до 1000 сам. Усечение выше 1000
+# по-прежнему ОТКАЗ (см. :func:`read_folder`), а не короткий список.
+FOLDER_LIMIT = 1000
+
+
 def read_folder(prefix=None, lister=None):
     """Дети папки мозга с префиксом заданий → (файлы, ok, причина).
 
@@ -458,7 +469,7 @@ def read_folder(prefix=None, lister=None):
         def lister(p):
             import brain_writer
 
-            return brain_writer.list_folder(prefix=p)
+            return brain_writer.list_folder(prefix=p, limit=FOLDER_LIMIT)
     try:
         r = lister(pref)
     except Exception as exc:                            # noqa: BLE001 — любой отказ = «неизвестно»

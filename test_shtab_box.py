@@ -2681,5 +2681,129 @@ class TestTakeNotice(unittest.TestCase):
         self.assertIn("сокет закрыт", rep["notice_failed"][0]["why"])
 
 
+# ═══════════════════ ПОТОЛОК ПЕРЕЧИСЛЕНИЯ ПАПКИ (04.10.2026) ═══════════════════
+
+BRIDGE_DEFAULT, BRIDGE_MAX = 500, 1000     # ReadDocs.js → handleListBrainFolder_, прод @86
+
+
+def _bridge_folder(n_tasks, n_foreign=50):
+    """Мост-заглушка НА МЕСТЕ ``brain_writer.list_folder``: его подпись и логика
+    ``limit`` моста дословно (прод @86) — не передан или не больше нуля → 500, больше
+    1000 → 1000; ``truncated`` только когда встречен СЛЕДУЮЩИЙ подходящий файл сверх
+    потолка. Обход — «как у Drive», не по имени (задания задом наперёд вперемешку с
+    чужими детьми папки); сортируется уже отобранный кусок.
+
+    Подменяется именно ``brain_writer.list_folder``, а не ``lister`` ящика: предмет —
+    то, что ящик сам ПЕРЕДАЁТ мосту, а подменный ``lister`` этот вызов обходит целиком.
+    """
+    tasks = [{"name": sb.doc_name("k%04d" % i), "id": "fid-%04d" % i, "mime": "text/plain"}
+             for i in range(n_tasks)]
+    foreign = [{"name": "KB_doc_%02d" % i, "id": "kb-%02d" % i, "mime": "text/plain"}
+               for i in range(n_foreign)]
+    drive = []
+    for i, f in enumerate(reversed(tasks)):
+        drive.append(f)
+        if i < len(foreign):
+            drive.append(foreign[i])
+    drive += foreign[len(tasks):]
+    seen = []
+
+    def list_folder(prefix="", limit=0, env=None, get=None):
+        seen.append({"prefix": prefix, "limit": limit})
+        lim = int(limit) if limit else 0         # brain_writer шлёт limit, только если он не ноль
+        if not lim > 0:
+            lim = BRIDGE_DEFAULT
+        if lim > BRIDGE_MAX:
+            lim = BRIDGE_MAX
+        files, scanned, truncated = [], 0, False
+        for f in drive:
+            scanned += 1
+            if prefix and not f["name"].startswith(prefix):
+                continue
+            if len(files) >= lim:
+                truncated = True
+                break
+            files.append(dict(f))
+        files.sort(key=lambda f: f["name"])
+        return {"ok": True, "folder_id": "F1", "count": len(files), "files": files,
+                "folders_count": 0, "folders": [], "prefix": prefix or None,
+                "scanned": scanned, "truncated": truncated}
+
+    list_folder.seen = seen
+    list_folder.bodies = {f["id"]: GOOD_BODY for f in tasks}
+    list_folder.first = tasks[0]["name"] if tasks else ""
+    return list_folder
+
+
+class TestFolderCap(unittest.TestCase):
+    """ПОТОЛОК ПЕРЕЧИСЛЕНИЯ — ПРЕДЕЛ МОСТА, 1000 (04.10.2026).
+
+    Живой повод: перечисление звалось без ``limit``, мост отдавал своё умолчание 500,
+    и 501-й документ ``shtab_task_*`` делал список усечённым — журнал демона 03.10
+    20:04 и 20:16 «перечисление УСЕЧЕНО (отдано 500…)», ноль постановок. Числа 500,
+    501 и 1000 читаются целиком; 1001 — по-прежнему НЕИЗВЕСТНО и ноль постановок.
+    Мутант «limit не передан» краснеет здесь на 501 числом (0 вместо 501).
+    """
+
+    @staticmethod
+    def _patched(bridge):
+        import brain_writer
+        from unittest import mock
+
+        return mock.patch.object(brain_writer, "list_folder", bridge)
+
+    def _tick(self, n):
+        bridge = _bridge_folder(n)
+        q = FakeQueue()
+        with self._patched(bridge):
+            rep = run.tick(root=tempfile.mkdtemp(prefix="shtabbox_"), place=True, queue=q,
+                           lister=None, doc_reader=_doc_reader(bridge.bodies),
+                           reader=_reader(HEAD_TEXT), notify_fn=_Notifier(),
+                           hold_notify_fn=_HoldDoor(),
+                           clock=lambda tz: datetime.datetime(2026, 9, 2, 12, 0, tzinfo=tz))
+        return rep, q
+
+    def test_the_limit_is_the_bridge_maximum_and_it_reaches_the_bridge(self):
+        self.assertEqual(run.FOLDER_LIMIT, BRIDGE_MAX)
+        bridge = _bridge_folder(1)
+        with self._patched(bridge):
+            run.read_folder()
+        self.assertEqual(bridge.seen, [{"prefix": sb.TASK_PREFIX, "limit": BRIDGE_MAX}])
+
+    def test_500_501_and_1000_documents_are_read_whole(self):
+        for n in (500, 501, 1000):
+            with self.subTest(docs=n):
+                bridge = _bridge_folder(n)
+                with self._patched(bridge):
+                    files, ok, why = run.read_folder()
+                self.assertEqual((ok, len(files)), (True, n), why)
+                self.assertEqual(why, "")
+                self.assertEqual(files[0]["name"], bridge.first)
+
+    def test_1001_documents_are_truncation_not_a_short_list(self):
+        bridge = _bridge_folder(1001)
+        with self._patched(bridge):
+            files, ok, why = run.read_folder()
+        self.assertEqual((ok, len(files)), (False, 0))
+        self.assertIn("УСЕЧЕНО", why)
+        self.assertIn("отдано 1000", why)
+
+    def test_501_documents_the_box_takes_again(self):
+        """ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ витком: без него отрицательный ниже проходит и у
+        ящика, который не берёт ничего никогда."""
+        rep, q = self._tick(501)
+        self.assertTrue(rep["folder_ok"], rep["why"])
+        self.assertEqual(len(rep["placed"]), 1, rep["why"])
+        self.assertEqual(rep["placed"][0]["key"], "k0000")
+        self.assertEqual(len(q.tasks), 1)
+
+    def test_1001_documents_place_nothing(self):
+        rep, q = self._tick(1001)
+        self.assertFalse(rep["folder_ok"])
+        self.assertEqual((rep["placed"], q.tasks, q.asked), ([], [], []))
+        self.assertIn("НЕИЗВЕСТНО", rep["why"])
+        self.assertIn("УСЕЧЕНО", rep["why"])
+
+
 if __name__ == "__main__":            # pragma: no cover
     unittest.main(verbosity=2)
