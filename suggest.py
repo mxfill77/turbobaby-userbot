@@ -114,19 +114,61 @@ def _norm_window_name(s) -> str:
     return str(s or "").strip().lower().replace("ё", "е")
 
 
+# ПРИЗНАК ЗАГРУЗКИ РЕЕСТРА (03.10.2026, задание Штаба 0128q-79o.0310, TGFEEDREG0310). Реестр
+# FAIL-SAFE для черновиков: сбой чтения = пустой реестр, и этот контракт `_load_team_registry` НЕ
+# меняется. Но пустой реестр на вопрос «команда ли это» отвечает «нет» про ЛЮБОГО — для ленты
+# «Агентов» это незнание, выданное за ответ: переписка команды ушла бы туда как клиентская. Поэтому
+# рядом с реестром живёт признак — загружен ли он, и если нет, то почему. Ставится ОДНИМ
+# присваиванием с TEAM_REGISTRY (импорт и reload). suggest сам его не читает: его поведение прежнее,
+# признак — для потребителей, которым «не решено» дешевле ложного «клиент» (`userbot_listen._feed`).
+TEAM_REG_LOADED = "loaded"
+TEAM_REG_MISSING = "missing"
+TEAM_REG_BAD_JSON = "bad_json"
+TEAM_REG_NOT_DICT = "not_dict"
+TEAM_REG_READ_ERROR = "read_error"
+TEAM_REG_WHY = {TEAM_REG_LOADED: "загружен", TEAM_REG_MISSING: "нет файла",
+                TEAM_REG_BAD_JSON: "кривой JSON", TEAM_REG_NOT_DICT: "не словарь",
+                TEAM_REG_READ_ERROR: "ошибка чтения"}
+
+
+def _team_registry_with_state(path=None):
+    """→ (реестр, признак). Реестр — ровно то, что возвращал и возвращает `_load_team_registry`
+    (тот же разбор, те же исключения наружу). Признак — словарь: loaded (True только при прочитанном
+    JSON-словаре, в т.ч. пустом), reason (TEAM_REG_*), why (словами), detail (тип и текст ошибки),
+    path. Нет файла → missing; не открылся/не прочитался/не та кодировка → read_error; JSON не
+    разобран → bad_json; разобран, но не словарь → not_dict."""
+    path = path or TEAM_REGISTRY_FILE
+    reason, detail = TEAM_REG_LOADED, ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+    except Exception as e:
+        raw, detail = None, f"{type(e).__name__}: {e}"
+        reason = TEAM_REG_MISSING if isinstance(e, FileNotFoundError) else TEAM_REG_READ_ERROR
+    data = {}
+    if raw is not None:
+        try:
+            data = json.loads(raw)                 # == json.load(f): тот же разбор, что до 03.10
+        except Exception as e:
+            data, reason, detail = {}, TEAM_REG_BAD_JSON, f"{type(e).__name__}: {e}"
+    if not isinstance(data, dict):
+        data, reason, detail = {}, TEAM_REG_NOT_DICT, f"в файле {type(data).__name__}"
+    state = {"loaded": reason == TEAM_REG_LOADED, "reason": reason, "why": TEAM_REG_WHY[reason],
+             "detail": detail[:200], "path": path}
+    return _team_registry_build(data), state
+
+
 def _load_team_registry(path=None):
     """Прочитать реестр команды из JSON. FAIL-SAFE: нет файла/битый/не-словарь → пустой реестр
     (usernames/user_ids/group_ids + nonclient_*). usernames — lower без @; ids — int (в т.ч.
     отрицательные id групп); nonclient_titles — имена окон, нормализованные lower+ё→е.
-    Ключи-мусор игнорируем молча (fail-safe: генерация от реестра не ломается)."""
-    path = path or TEAM_REGISTRY_FILE
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
+    Ключи-мусор игнорируем молча (fail-safe: генерация от реестра не ломается).
+    Почему реестр пуст — знает признак (`_team_registry_with_state`, `team_registry_state`)."""
+    return _team_registry_with_state(path)[0]
+
+
+def _team_registry_build(data):
+    """Словарь из файла → реестр (разбор полей прежний, вынесен 03.10 без правок)."""
 
     def _ids(seq):
         out = set()
@@ -150,14 +192,22 @@ def _load_team_registry(path=None):
             "nonclient_titles": _titles(data.get("nonclient_titles"))}
 
 
-TEAM_REGISTRY = _load_team_registry()
+TEAM_REGISTRY, TEAM_REGISTRY_STATE = _team_registry_with_state()
 
 
 def reload_team_registry(path=None):
-    """Перечитать реестр (горячая замена/тесты). Обновляет глобаль TEAM_REGISTRY, возвращает её."""
-    global TEAM_REGISTRY
-    TEAM_REGISTRY = _load_team_registry(path)
+    """Перечитать реестр (горячая замена/тесты). Обновляет глобаль TEAM_REGISTRY, возвращает её.
+    Признак TEAM_REGISTRY_STATE перечитывается тем же присваиванием: реестр и признак не расходятся."""
+    global TEAM_REGISTRY, TEAM_REGISTRY_STATE
+    TEAM_REGISTRY, TEAM_REGISTRY_STATE = _team_registry_with_state(path)
     return TEAM_REGISTRY
+
+
+def team_registry_state():
+    """Признак реестра команды для потребителей вне suggest — КОПИЯ (чужая правка признак не
+    портит): {"loaded", "reason", "why", "detail", "path"}. loaded=False → фильтры команды и
+    партнёров отвечают «нет» про любого не потому, что знают, а потому, что реестра нет."""
+    return dict(TEAM_REGISTRY_STATE)
 
 
 def _team_usernames():
