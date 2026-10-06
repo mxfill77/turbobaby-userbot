@@ -340,8 +340,25 @@ class Queue(review_intake_run.Queue):
         pids = self._d._revizor_chain_pids(rows)
         busy = [it.get("id") for it in rows
                 if str(it.get("status") or "") in OPEN_STATUSES
-                and self._d._is_owner_work(it, pids)]
+                and self._d._is_owner_work(it, pids)
+                and not self._sealed(it)]
         return bool(busy), busy
+
+    def _sealed(self, it):
+        """Ряд, который демон УЖЕ закрыл и который с тех пор не двигался, — не работа владельца,
+        а отставший мост (SEALCATCH0610, живой #41: 6 ч 50 мин ящик стоял на закрытом ряде).
+
+        Судит тоже ФУНКЦИЯ ДЕМОНА (``_seal_lags``): печать живёт в его реестре, и путь к нему
+        она решает сама в момент зова — одолженная копия демона при импорте смотрит во временный
+        каталог. Старый демон без функции, её сбой, ряд моложе печати → прежний замок.
+        """
+        probe = getattr(self._d, "_seal_lags", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe(it))
+        except Exception:                                  # noqa: BLE001 — сомнение = прежний замок
+            return False
 
     def place_task(self, text):
         """АВТОЗАДАЧА — зелёный ряд ``new``. → (ok, id|None, причина).

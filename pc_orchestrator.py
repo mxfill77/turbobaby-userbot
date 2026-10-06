@@ -1963,7 +1963,7 @@ def _mark_time_key(val):
     return _started_at_raw(val) or (str(seal.get("at") or "") if seal else "")
 
 
-def _task_closed_mark(tid, status, ok=True, now=None, path=None):
+def _task_closed_mark(tid, status, ok=True, now=None, path=None, head=None, keep=False):
     """Запечатать ТЕРМИНАЛ задачи в реестре отметок. → ISO печати | "" (статус не терминальный).
 
     Ставится на КАЖДОЕ закрытие полосы — единственная дорога к мосту здесь `_complete`, — включая
@@ -1974,6 +1974,12 @@ def _task_closed_mark(tid, status, ok=True, now=None, path=None):
     моменту уже ушла, и второй, противоположной, он не должен получить ни в одном исходе. Расписку
     храним, чтобы сторож мог назвать её словами, а не молчать о том, что закрытие не подтверждено.
 
+    `head` (SEALCATCH0610) — текст закрытия; кладётся в печать ТОЛЬКО при непринятой расписке и
+    ровно в той форме, в какой его получил бы мост (`_seal_text`: до потолка очереди — как есть,
+    длиннее — тем же резом `_cap_result`): им догон терминала повторит закрытие тем же текстом.
+    `keep` — зов из догона: прежняя печать того же статуса отдаёт новой текст, время первого
+    закрытия и счёт попыток (иначе каждая попытка стирала бы окно повтора и текст).
+
     Печать НИКОГДА не смеет уронить закрытие: сбой диска отбрасывает нас к прежнему поведению
     (сторож судит как раньше), а не к потерянной задаче."""
     st_status = str(status or "")
@@ -1982,12 +1988,24 @@ def _task_closed_mark(tid, status, ok=True, now=None, path=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
     stamp = now.isoformat()
     try:
+        # Текст считаем ДО замка: длинный выносится на диск (`_cap_result`), а держать общий
+        # реестр на записи файла незачем.
+        text = _seal_text(head, tid) if (head is not None and not ok) else None
         with _STATE_LOCK:            # общий реестр, два захода — см. `_task_started_mark`
             st = _task_started_read(path)
             key = str(tid)
             rec = st.get(key)
             rec = dict(rec) if isinstance(rec, dict) else {"at": _started_at_raw(rec)}
-            rec["closed"] = {"at": stamp, "status": st_status, "ok": bool(ok)}
+            seal = {"at": stamp, "status": st_status, "ok": bool(ok)}
+            prev = _closed_seal_of(rec)
+            if keep and prev and prev.get("status") == st_status:
+                for k in _SEAL_KEEP:
+                    if k in prev:
+                        seal[k] = prev[k]
+                seal.setdefault("first_at", prev.get("at") or "")
+            if text is not None:
+                seal["head"] = text
+            rec["closed"] = seal
             st[key] = rec
             if len(st) > TASK_START_KEEP:      # тот же кап, что у отметки старта
                 for k in sorted(st, key=lambda x: _mark_time_key(st[x]))[:len(st) - TASK_START_KEEP]:
@@ -2030,17 +2048,251 @@ def _closed_by_us(tid, updated, st=None, path=None, now=None):
     return False, ""                 # ряд двигался ПОСЛЕ закрытия → это другая жизнь номера
 
 
-def _complete(tid, status, result, bridge=None):
+def _complete(tid, status, result, bridge=None, keep_seal=False):
     """ЕДИНСТВЕННАЯ дорога полосы к `complete_task`: закрыть ряд и ЗАПЕЧАТАТЬ терминал локально.
 
     Обёртка, а не правка клиента моста, по прицельной причине: клиент в регрессе подменяется
     двойником, и печать, спрятанная внутрь боевого класса, в тестах не жила бы вовсе — а именно её
     обязан проверять отрицательный тест «закрыто успехом, ребёнок убит, пометка «в работе» → сторож
-    молчит». Проверяемость здесь не удобство, а условие: молчание сторожа доказать больше нечем."""
+    молчит». Проверяемость здесь не удобство, а условие: молчание сторожа доказать больше нечем.
+
+    `keep_seal` — зов из догона терминала (`_seal_catch_up`): он идёт ЭТОЙ ЖЕ дорогой, а не мимо
+    неё, и печать при нём сохраняет текст закрытия, время первого закрытия и счёт попыток."""
     b = bridge if bridge is not None else bc
     r = b.complete_task(tid, status, result)
-    _task_closed_mark(tid, status, ok=bool(isinstance(r, dict) and r.get("ok")))
+    _task_closed_mark(tid, status, ok=bool(isinstance(r, dict) and r.get("ok")),
+                      head=None if keep_seal else result, keep=keep_seal)
     return r
+
+
+# ═══ ДОГОН ТЕРМИНАЛА: ЗАКРЫТИЕ, ПОТЕРЯННОЕ ОБРЫВОМ, ДЕМОН ДОЗАКРЫВАЕТ САМ (SEALCATCH0610) ══════
+# ЖИВОЙ ПОВОД — id=41, 05.10 (UTC): 19:42:36 «COMPLETE id=41 status=failed», а связи не было
+# 19:42 → 20:13; мост расписку не принял и ряд остался `in_progress`. Печать встала верно
+# (`ok=False`), сторож верно не судил ряд второй раз («НЕ СУЖУ … НЕ ПРИНЯТА», 20:20:58) — и НА
+# ЭТОМ ВСЁ: «мутацию НЕ переотправляем никогда» (клиент моста) значило, что закрытие не повторял
+# НИКТО. Ряд висел открытым, `_is_owner_work` печати не спрашивал, и ящик Штаба 6 ч 50 мин
+# (03:05 → 09:55 местного) писал «в очереди задача владельца (#41) — заданий Штаба не берём»,
+# пока владелец не закрыл ряд руками (06.10 03:04 UTC).
+#
+# ЗАПРЕТ КЛИЕНТА НЕ ОТМЕНЁН — у него другой предмет. Клиент не переотправляет мутацию ВСЛЕПУЮ,
+# в момент, когда судьба первой неизвестна. Догон — не повтор вслепую, а решение на ТРЁХ фактах,
+# каждый прочитан заново: мост СЕЙЧАС отдаёт ряд открытым (свежее чтение полосы этого витка) ·
+# мы его закрыли и расписка НЕ принята (печать) · ряд не моложе печати (номера очередь
+# переиспользует — молодой ряд есть другая задача, и закрыть её значило бы убить живую работу).
+# Плюс связь ПОДТВЕРЖДЕНА: при «не подтверждена» новая попытка ушла бы в тот же обрыв.
+# Перед мутацией статус читается: если закрытие уже лежит в мосте (полоса лишь отстала — живой
+# id=12, 05.09: ряд виден in_progress через 6 мин после принятого complete), повтора нет вовсе.
+# Повторяем тот же статус и ТОТ ЖЕ текст — в той форме, в какой его получил бы мост (хвостовые
+# маркеры итога и план цепи читаются из result, и голова их потеряла бы); после — статус читаем
+# ЗАНОВО, и только подтверждённый факт снимает печать «не принята».
+#
+# ОКНО ПОВТОРА — ИЗ ЗАМЕРА, А НЕ ИЗ ВКУСА (tmp/sealcatch_0610/measure_window.txt, журнал демона
+# 22.07–06.10): эпизодов отказа моста при живой связи 659, длины медиана 0 · p90 293 · p95 490 ·
+# max 3448 с; длиннее 900 с — 13 из 659 (2,0 %). Окно 900 с ставит повтор ПОСЛЕ 98 % эпизодов, а за
+# самый длинный даёт не больше четырёх попыток. Окно меряется и от САМОГО закрытия, а не только от
+# прошлой попытки: иначе первый повтор уходил бы на ближайшем витке (~60 с) — внутри того же
+# эпизода отказа и внутри отставания полосы. Короче окно — повтор множит мутации; длиннее — ряд
+# дольше висит открытым, хотя замок ящика печать снимает и без догона (`_seal_lags`).
+# ОТКАТ: `PC_SEAL_CATCH_SEC=0` — ветка мертва целиком.
+SEAL_CATCH_SEC = int(os.getenv("PC_SEAL_CATCH_SEC", "900") or "900")
+SEAL_CATCH_DONE = "ТЕРМИНАЛ ДОГНАН"
+SEAL_LAG_WORDS = "закрыт нами, мост отстал"
+_SEAL_KEEP = ("head", "first_at", "catch_at", "catch_n")
+_SEAL_LAG_SAID = set()        # дедуп ЛОГА замка (номер, печать) — новость раз за процесс, не каждый виток
+_SEAL_NOTE_SAID = set()       # дедуп ЛОГА «учёт попытки не записан» (номер, печать)
+_TASK_START_NAME = os.path.basename(TASK_START_FILE)
+_TASK_START_FROZEN = TASK_START_FILE      # путь, решённый при ИМПОРТЕ (см. `_seal_registry_path`)
+
+
+def _seal_text(text, tid=None):
+    """Текст закрытия для печати — ровно в той форме, в какой его получает мост: до потолка
+    очереди (`RESULT_MAX`) байт-в-байт, длиннее — тем же резом `_cap_result` (тело на диск, в
+    печать — голова с адресом тела). Своего второго правила обрезки здесь нет: две обрезки одного
+    текста разошлись бы, и догон положил бы в мост не то, что демон собирался положить."""
+    s = "" if text is None else str(text)
+    if len(s) <= RESULT_MAX:
+        return s
+    return _cap_result(s, tid)
+
+
+def _seal_registry_path():
+    """Путь реестра печатей, решённый В МОМЕНТ ЗОВА, а не при импорте модуля.
+
+    ЛОВУШКА, ради которой функция заведена (проба tmp/sealcatch_0610/probe_trap.txt): ящик Штаба и
+    ступень E одалживают демона ВТОРЫМ импортом под `TURBOBABY_TEST_LOGS=1`
+    (`review_intake_run._daemon`), а `TASK_START_FILE = _state(…)` решается при импорте — у такой
+    копии он указывает в одноразовый temp, где печатей нет и не будет. Замок `owner_busy`, читающий
+    `self._d.TASK_START_FILE`, молча судил бы по пустому реестру — то есть ровно как до правки.
+    После импорта флаг снят, и `_state` в момент зова отдаёт боевой путь; под настоящим тестом —
+    тестовый. Константу, подменённую тестом, уважаем: подмена и есть ответ на вопрос «где реестр»."""
+    if TASK_START_FILE != _TASK_START_FROZEN:
+        return TASK_START_FILE
+    return _state(os.path.join(REPO, _TASK_START_NAME))
+
+
+def _seal_row_state(tid, updated, st=None, path=None, now=None):
+    """Строгая сверка ряда с печатью. → (исход, печать|None).
+
+    Исходы: "none" — печати нет · "sealed" — печать есть и ряд НЕ моложе её · "younger" — ряд
+    двигался ПОСЛЕ печати (другая жизнь номера) · "unknown" — времени не разобрать.
+
+    В отличие от `_closed_by_us`, «не знаю» здесь НЕ равно «запечатан»: там незнание обязано
+    означать молчание сторожа, а здесь по печати ДЕЙСТВУЮТ — снимают замок и повторяют закрытие,
+    и действовать на незнании нельзя."""
+    if tid is None or str(tid) == "":
+        return "none", None
+    rec = (st if isinstance(st, dict) else _task_started_read(path)).get(str(tid))
+    seal = _closed_seal_of(rec)
+    if not seal:
+        return "none", None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    row_age, seal_age = _age_sec(updated, now=now), _age_sec(seal.get("at"), now=now)
+    if row_age is None or seal_age is None:
+        return "unknown", seal
+    return ("sealed" if row_age >= seal_age else "younger"), seal
+
+
+def _seal_lags(it, path=None, now=None):
+    """ЗАМОК ВЛАДЕЛЬЦА (ящик Штаба, ступень E): открытый ряд, который МЫ уже закрыли и который с
+    тех пор не двигался, работой владельца не является — мост просто отстал. → True | False.
+
+    Расписку не спрашиваем: печать с принятой распиской при открытом ряде — тот же отставший мост
+    (живой id=12, 05.09). Ряд моложе печати или время не сверить → False, то есть прежний замок.
+    Только `in_progress`: это единственный статус, где печать уважает сторож и где ряд лечит догон.
+    `approved` демон исполнит заново (`process_approved` печати не спрашивает), `needs_approval`
+    ждёт «да» владельца — там печать не терминал, и замок обязан держаться, как держался.
+    На каждый такой ряд — одна строка журнала за жизнь процесса (дедуп по номеру и печати)."""
+    tid = it.get("id") if isinstance(it, dict) else None
+    if not isinstance(it, dict) or str(it.get("status") or "") != "in_progress":
+        return False
+    try:
+        state, seal = _seal_row_state(tid, it.get("updated"), path=path or _seal_registry_path(),
+                                      now=now)
+    except Exception as e:           # noqa: BLE001 — замок не смеет падать: сомнение = прежний замок
+        log.warning("замок владельца: печать ряда #%s не прочитана (%s) — считаю его работой", tid, e)
+        return False
+    if state != "sealed":
+        return False
+    key = (str(tid), str(seal.get("at") or ""))
+    if key not in _SEAL_LAG_SAID:
+        _SEAL_LAG_SAID.add(key)
+        log.warning("замок владельца: ряд #%s — %s (печать %s статусом %s, расписка моста: %s; мост "
+                    "отдаёт ряд как %s) — работой владельца не считаю", tid, SEAL_LAG_WORDS,
+                    seal.get("at") or "?", seal.get("status") or "?",
+                    "принята" if seal.get("ok") else "НЕ ПРИНЯТА", it.get("status") or "?")
+    return True
+
+
+def _seal_note(tid, path=None, drop=(), **fields):
+    """Дописать поля в печать ряда (учёт попыток догона, подтверждение). → True | False.
+    `drop` — поля, которые печати больше не нужны (текст закрытия после подтверждения: реестр не
+    держит отчёты дольше, чем они нужны догону). Печати нет — писать некуда (False). Сбой диска НЕ
+    роняет виток: ответ False, и зовущий решает."""
+    try:
+        with _STATE_LOCK:
+            st = _task_started_read(path)
+            rec = st.get(str(tid))
+            seal = _closed_seal_of(rec)
+            if not seal:
+                return False
+            rec = dict(rec)
+            seal = {k: v for k, v in seal.items() if k not in drop}
+            rec["closed"] = dict(seal, **fields)
+            st[str(tid)] = rec
+            return bool(_task_started_write(st, tid, path))
+    except Exception as e:           # noqa: BLE001
+        log.warning("печать id=%s не дописана (%s)", tid, e)
+        return False
+
+
+def _seal_catch_up(task, st=None, now=None, bridge=None, link=None, path=None):
+    """ДОГОН ТЕРМИНАЛА одного ряда, который мост СЕЙЧАС отдаёт открытым. → исход словами.
+
+    Вызов `complete_task` случается РОВНО при шести условиях: ветка включена · связь подтверждена ·
+    у ряда наша печать с НЕпринятой распиской · ряд не моложе печати · окно прошло (от прошлой
+    попытки, а без неё — от самого закрытия) · чтение статуса показало, что закрытия в мосте НЕТ.
+    Попытка записывается в печать ДО всего остального; не записалась — мутации нет (окно не
+    отсчитано, и повтор стал бы слепым на каждом витке). Дальше — тот же статус и тот же текст
+    (нет текста в печати — строка «догон терминала» со временем) через `_complete`, затем статус
+    читается ЗАНОВО: подтверждён (или `complete_task` сам доказал запись фактом) → печать `ok=True`
+    + «ТЕРМИНАЛ ДОГНАН»; не подтверждён или «не знаю» → следующая попытка не раньше окна.
+    Ряд, уже закрытый мостом, сюда не попадает вовсе: зовёт сторож по рядам открытой полосы."""
+    if SEAL_CATCH_SEC <= 0:
+        return "выключено"
+    tid = task.get("id") if isinstance(task, dict) else None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    w = _link if link is None else link
+    name = w.verdict(now.timestamp())[0]
+    if name != LINK_OK:
+        return "связь: %s" % name
+    state, seal = _seal_row_state(tid, task.get("updated"), st=st, path=path, now=now)
+    if state != "sealed":
+        return "печать: %s" % state
+    if seal.get("ok"):
+        return "расписка принята — догонять нечего"
+    status = str(seal.get("status") or "")
+    if status not in ("done", "failed"):
+        return "статус печати не терминальный: %r" % status
+    if _is_running(tid):
+        return "ряд ведёт этот процесс"
+    ref = seal.get("catch_at") or seal.get("at")
+    last = _age_sec(ref, now=now) if ref else None
+    if last is None:
+        return "окно: время печати не разобрать — жду, а не стреляю"
+    if last < SEAL_CATCH_SEC:
+        return "окно: прошло %dс из %dс" % (int(last), SEAL_CATCH_SEC)
+    n = int(seal.get("catch_n") or 0) + 1
+    stamp = now.isoformat()
+    first = seal.get("first_at") or seal.get("at") or "?"
+    # Попытку записываем ДО чтения и мутации: оборвись процесс посреди вызова — окно отсчитано.
+    # Не записалась — дальше не идём: без отсчёта окна повтор шёл бы каждый виток.
+    if not _seal_note(tid, path=path, catch_at=stamp, catch_n=n):
+        key = (str(tid), str(seal.get("at") or ""))
+        if key not in _SEAL_NOTE_SAID:
+            _SEAL_NOTE_SAID.add(key)
+            log.warning("догон терминала id=%s: учёт попытки в реестр не лёг — окно не отсчитать, "
+                        "complete не шлю (ряд остаётся как был)", tid)
+        return "учёт попытки не записан — догон не делаю"
+    b = bridge if bridge is not None else bc
+    reader = getattr(b, "_in_status", None)
+
+    def _read():
+        try:
+            return reader(tid, status) if callable(reader) else None
+        except Exception:            # noqa: BLE001 — «не прочитали» не смеет выдавать себя за «не легло»
+            return None
+
+    pre = _read()
+    if pre is True:
+        # Закрытие уже лежит в мосте — отстала лишь полоса. Второй complete затёр бы result.
+        _seal_note(tid, path=path, ok=True, caught=stamp, drop=("head",))
+        log.warning("%s id=%s: статус %s в мосте УЖЕ стоит — полоса лишь отдавала ряд открытым; "
+                    "повтор не понадобился (первое закрытие %s)", SEAL_CATCH_DONE, tid, status, first)
+        return "уже закрыт — без повтора"
+    if pre is None:
+        log.warning("догон терминала id=%s: статус %s прочитать не удалось — повтор вслепую не шлю, "
+                    "следующая попытка не раньше %dс", tid, status, SEAL_CATCH_SEC)
+        return "чтение статуса не удалось — догон отложен"
+    text = seal.get("head") or ("догон терминала %s: закрытие статусом %s от %s мост не подтвердил "
+                                "(расписка не принята) — демон повторил его сам" % (stamp, status, first))
+    r = _complete(tid, status, text, bridge=b, keep_seal=True)
+    proven = isinstance(r, dict) and r.get("verified_by_fact") is True
+    got = True if proven else _read()       # клиент уже доказал запись фактом — второе чтение лишнее
+    receipt = "принята" if (isinstance(r, dict) and r.get("ok")) else "НЕ принята"
+    if got is True:
+        _seal_note(tid, path=path, ok=True, caught=stamp, drop=("head",))
+        log.warning("%s id=%s: статус %s подтверждён %s (попытка %d, первое закрытие %s, "
+                    "расписка догона: %s)", SEAL_CATCH_DONE, tid, status,
+                    "фактом в ответе моста" if proven else "чтением полосы", n, first, receipt)
+        return "догнан"
+    # Расписка без подтверждённого факта печать НЕ снимает: судьба записи — это чтение, а не ответ
+    # на мутацию. Иначе принятая расписка при всё ещё открытом ряде закрыла бы догон навсегда.
+    _seal_note(tid, path=path, ok=False)
+    log.warning("догон терминала id=%s: статус %s НЕ подтверждён (%s; расписка догона: %s, попытка %d) — "
+                "следующая не раньше %dс", tid, status,
+                "чтение полосы не удалось" if got is None else "ряд не в этом статусе", receipt, n,
+                SEAL_CATCH_SEC)
+    return "не подтверждён"
 
 
 def _git_commits_between(since, until):
@@ -5629,6 +5881,13 @@ def process_stuck_singles(now=None):
                 log.warning("stuck-single: id=%s НЕ СУЖУ — %s. Терминал необратим; полоса всё ещё "
                             "отдаёт ряд как in_progress — это новость о МОСТЕ, а не о задаче",
                             tid, seal_why)
+            # ДОГОН ТЕРМИНАЛА (SEALCATCH0610): не судить ряд — не значит оставить его открытым.
+            # Свежее чтение полосы этого витка и есть факт «мост отдаёт ряд открытым»; остальные
+            # условия судит `_seal_catch_up`. Его сбой витка не роняет: прежнее поведение — молчание.
+            try:
+                _seal_catch_up(task, st=marks, now=now)
+            except Exception as e:     # noqa: BLE001
+                log.warning("догон терминала id=%s не выполнен (%s) — ряд остаётся как был", tid, e)
             continue
         if _is_running(tid):
             # ЭТУ задачу демон ведёт ПРЯМО СЕЙЧАС — её судьбу решает прогон (и его TASK_TIMEOUT),
