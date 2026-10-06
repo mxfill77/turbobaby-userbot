@@ -234,8 +234,9 @@ class TestRows(_Base):
         run(ub.on_incoming(incoming(self.client, CLIENT, mid=10, text="Привет, байк на неделю?")))
         self.assertEqual(self.rows(), [{
             "chat_id": 1001, "msg_id": 10, "dir": "in", "ts": DATE_TS, "kind": "text",
-            "text": "Привет, байк на неделю?", "reply_to": None, "sender_id": 1001}])
-        self.assertEqual(list(self.rows()[0]), list(tg_feed.FIELDS))
+            "text": "Привет, байк на неделю?", "reply_to": None, "sender_id": 1001,
+            "username": "anna_test", "name": "Анна"}])           # 07.10: ник и имя клиента (З3)
+        self.assertEqual(list(self.rows()[0]), list(tg_feed.FIELDS) + list(tg_feed.OPTIONAL))
         self.no_telegram()
 
     def test_incoming_client_without_username(self):
@@ -246,7 +247,8 @@ class TestRows(_Base):
         run(ub.on_outgoing(outgoing(self.client, CLIENT, mid=21, text="Здравствуйте! Есть.")))
         self.assertEqual(self.rows(), [{
             "chat_id": 1001, "msg_id": 21, "dir": "out", "ts": DATE_TS, "kind": "text",
-            "text": "Здравствуйте! Есть.", "reply_to": None, "sender_id": ME.id}])
+            "text": "Здравствуйте! Есть.", "reply_to": None, "sender_id": ME.id,
+            "username": "anna_test", "name": "Анна"}])           # 07.10: ник клиента, не наш (З3)
         self.no_telegram()
 
     def test_outgoing_short_update_uses_memory_of_incoming(self):

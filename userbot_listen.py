@@ -274,7 +274,8 @@ def _feed(event, peer, direction):
             sender_id = getattr(peer, "id", None)
         else:
             sender_id = _ME_ID if _ME_ID is not None else getattr(event, "sender_id", None)
-        tg_feed.append(tg_feed.row(event.message, event.chat_id, direction, sender_id))
+        # 07.10 (NIGHT0710 З3): ник и имя — собеседника (клиента) в обоих направлениях, из того же peer
+        tg_feed.append(tg_feed.row(event.message, event.chat_id, direction, sender_id, peer=peer))
         _FEED_COUNTS["written"] += 1
     except Exception as e:                               # noqa: BLE001 — лента не роняет обработчик
         _FEED_COUNTS["failed"] += 1

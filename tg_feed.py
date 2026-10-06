@@ -18,6 +18,13 @@ tg_feed.py — ЛЕНТА ЛИЧНЫХ СООБЩЕНИЙ КЛИЕНТОВ Teleg
     text       str          текст; у медиа — подпись; нет подписи — пусто
     reply_to   int|null     id сообщения, на которое ответ
     sender_id  int|null     у входящего — клиент, у исходящего — наш аккаунт
+  необязательные (07.10.2026, NIGHT0710 З3 — для шапки карточки «TG · @ник · имя»):
+    username   str|null     ник СОБЕСЕДНИКА чата chat_id (клиента) в ОБОИХ направлениях, без «@»,
+                            регистр как у Telegram; null — ника у клиента нет
+    name       str|null     имя клиента: first_name и last_name через пробел; null — имени нет
+  Ключа нет вовсе — «неизвестно» (ряд до 07.10, собеседник не передан или не прочитан), и это НЕ
+  то же, что null. Берутся из объекта собеседника, который userbot уже держит в руках; ради них
+  Telegram не зовётся. У исходящего ник — клиента, а не нашего аккаунта (sender_id остаётся нашим).
 
 ЧЕГО ЗДЕСЬ НЕТ ПО ПОСТРОЕНИЮ: сети, Telegram, SQLite и чтения ленты. Модуль собирает ряд из уже
 полученного объекта сообщения и ДОПИСЫВАЕТ строку целиком: один `os.write` до последнего байта,
@@ -46,6 +53,9 @@ OFF_ENV = "TG_FEED_OFF"
 DIR_IN, DIR_OUT = "in", "out"
 KINDS = ("text", "photo", "voice", "video", "sticker", "file", "location", "other")
 FIELDS = ("chat_id", "msg_id", "dir", "ts", "kind", "text", "reply_to", "sender_id")
+# Пишутся в строку ТОЛЬКО если ключ есть в ряду: ряд без них — байт-в-байт прежний (пушер сверяет
+# байты под курсором, а старые ряды ленты переписывать нельзя).
+OPTIONAL = ("username", "name")
 
 # Вид медиа узнаём по имени TL-класса, а не по isinstance: модуль не тянет Telethon и проверяется
 # без него. Имена — из живой схемы Telethon 1.43 (telethon.tl.types).
@@ -127,16 +137,45 @@ def _ts(date):
     return int(date.timestamp())
 
 
-def row(msg, chat_id, direction, sender_id):
+def _str_or_none(v):
+    """Непустая строка (края без пробелов) или None."""
+    if not isinstance(v, str):
+        return None
+    v = v.strip()
+    return v or None
+
+
+def peer_names(peer, chat_id):
+    """Ник и имя собеседника → {"username": …, "name": …} или None («неизвестно»).
+
+    Только поля объекта, который уже в руках: ни одного вызова. None — когда сказать нечего честно:
+    собеседника нет, его id не совпал с чатом ряда (чужой объект — например, наш аккаунт у
+    исходящего) или поле не прочиталось. Сбой здесь ряд НЕ роняет: ряд пишется без этих ключей."""
+    if peer is None:
+        return None
+    try:
+        pid = _int_or_none(getattr(peer, "id", None))
+        if pid is None or pid != _int_or_none(chat_id):
+            return None
+        username = _str_or_none(getattr(peer, "username", None))
+        parts = [_str_or_none(getattr(peer, "first_name", None)),
+                 _str_or_none(getattr(peer, "last_name", None))]
+    except Exception:                       # noqa: BLE001 — кривой собеседник: «неизвестно», ряд цел
+        return None
+    return {"username": username, "name": " ".join(p for p in parts if p) or None}
+
+
+def row(msg, chat_id, direction, sender_id, peer=None):
     """Ряд по контракту из объекта сообщения Telethon. Сети не зовёт. Без id чата/сообщения или
-    даты ряда нет — ValueError (вызывающий пишет это в журнал, обработчик не падает)."""
+    даты ряда нет — ValueError (вызывающий пишет это в журнал, обработчик не падает).
+    `peer` — собеседник чата (клиент): из него ник и имя (`peer_names`); нет — ключей нет."""
     if direction not in (DIR_IN, DIR_OUT):
         raise ValueError(f"направление {direction!r} вне контракта")
     cid = _int_or_none(chat_id)
     mid = _int_or_none(getattr(msg, "id", None))
     if cid is None or mid is None:
         raise ValueError(f"нет ключа ряда: chat_id={chat_id!r} msg_id={getattr(msg, 'id', None)!r}")
-    return {
+    rec = {
         "chat_id": cid,
         "msg_id": mid,
         "dir": direction,
@@ -146,12 +185,19 @@ def row(msg, chat_id, direction, sender_id):
         "reply_to": _reply_to(msg),
         "sender_id": _int_or_none(sender_id),
     }
+    names = peer_names(peer, cid)
+    if names is not None:
+        rec.update(names)
+    return rec
 
 
 def line(rec):
     """Ряд → одна строка JSON с завершающим \\n. Переводы строки внутри текста экранированы
-    json.dumps, прочие разрывы строки — здесь (см. _LINE_BREAKERS)."""
-    s = json.dumps({k: rec.get(k) for k in FIELDS}, ensure_ascii=False, separators=(",", ":"))
+    json.dumps, прочие разрывы строки — здесь (см. _LINE_BREAKERS). Поля FIELDS — всегда, OPTIONAL —
+    только те, что есть в ряду; прочие ключи ряда в строку не идут."""
+    out = {k: rec.get(k) for k in FIELDS}
+    out.update((k, rec[k]) for k in OPTIONAL if k in rec)
+    s = json.dumps(out, ensure_ascii=False, separators=(",", ":"))
     for ch in _LINE_BREAKERS:
         if ch in s:
             s = s.replace(ch, "\\u%04x" % ord(ch))
