@@ -20,11 +20,17 @@ tg_feed.py — ЛЕНТА ЛИЧНЫХ СООБЩЕНИЙ КЛИЕНТОВ Teleg
     sender_id  int|null     у входящего — клиент, у исходящего — наш аккаунт
   необязательные (07.10.2026, NIGHT0710 З3 — для шапки карточки «TG · @ник · имя»):
     username   str|null     ник СОБЕСЕДНИКА чата chat_id (клиента) в ОБОИХ направлениях, без «@»,
-                            регистр как у Telegram; null — ника у клиента нет
+                            регистр как у Telegram: поле `username`, а нет его — первый АКТИВНЫЙ из
+                            `usernames` (коллекционные ники: у такого клиента `username` пуст);
+                            null — активного ника у клиента нет
     name       str|null     имя клиента: first_name и last_name через пробел; null — имени нет
   Ключа нет вовсе — «неизвестно» (ряд до 07.10, собеседник не передан или не прочитан), и это НЕ
   то же, что null. Берутся из объекта собеседника, который userbot уже держит в руках; ради них
   Telegram не зовётся. У исходящего ник — клиента, а не нашего аккаунта (sender_id остаётся нашим).
+  Каждое поле — не длиннее FIELD_MAX символов (у Telegram ник ≤ 32, имя и фамилия ≤ 64 — живое не
+  режется; потолок держит ряд меньше пачки пушера), символ, которого нет в UTF-8 (одиночный
+  суррогат), заменён на U+FFFD — как это делает сам Telethon при разборе: ряд с текстом клиента не
+  теряется из-за имени.
 
 ЧЕГО ЗДЕСЬ НЕТ ПО ПОСТРОЕНИЮ: сети, Telegram, SQLite и чтения ленты. Модуль собирает ряд из уже
 полученного объекта сообщения и ДОПИСЫВАЕТ строку целиком: один `os.write` до последнего байта,
@@ -56,6 +62,10 @@ FIELDS = ("chat_id", "msg_id", "dir", "ts", "kind", "text", "reply_to", "sender_
 # Пишутся в строку ТОЛЬКО если ключ есть в ряду: ряд без них — байт-в-байт прежний (пушер сверяет
 # байты под курсором, а старые ряды ленты переписывать нельзя).
 OPTIONAL = ("username", "name")
+# Потолок одного поля ника/имени в символах (07.10, красная команда NIGHT0710 Б4): у Telegram ник ≤ 32,
+# имя и фамилия ≤ 64 — живое не режется; без потолка ряд мог перерасти пачку пушера (256 КиБ), и
+# пушер вставал бы СТОПом на этом ряде навсегда.
+FIELD_MAX = 128
 
 # Вид медиа узнаём по имени TL-класса, а не по isinstance: модуль не тянет Telethon и проверяется
 # без него. Имена — из живой схемы Telethon 1.43 (telethon.tl.types).
@@ -137,12 +147,33 @@ def _ts(date):
     return int(date.timestamp())
 
 
+def _fit(v):
+    """Строка поля, годная в ряд: символ вне UTF-8 (одиночный суррогат) → U+FFFD, не длиннее FIELD_MAX
+    символов. Без этого `append` падал на кодировании строки, и терялся ВЕСЬ ряд с текстом клиента."""
+    try:
+        v.encode("utf-8")
+    except UnicodeEncodeError:
+        v = v.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    return v[:FIELD_MAX].rstrip()
+
+
 def _str_or_none(v):
-    """Непустая строка (края без пробелов) или None."""
+    """Непустая строка (края без пробелов, см. _fit) или None."""
     if not isinstance(v, str):
         return None
     v = v.strip()
-    return v or None
+    return _fit(v) or None
+
+
+def _active_username(peer):
+    """Первый АКТИВНЫЙ ник из `usernames` (коллекционные или несколько ников — тогда `username` у
+    Telethon пуст). Только поля объекта; активного нет — None («активного ника нет»)."""
+    for item in getattr(peer, "usernames", None) or ():
+        if getattr(item, "active", None) is True:
+            nick = _str_or_none(getattr(item, "username", None))
+            if nick:
+                return nick
+    return None
 
 
 def peer_names(peer, chat_id):
@@ -160,6 +191,8 @@ def peer_names(peer, chat_id):
         username = _str_or_none(getattr(peer, "username", None))
         parts = [_str_or_none(getattr(peer, "first_name", None)),
                  _str_or_none(getattr(peer, "last_name", None))]
+        if username is None:
+            username = _active_username(peer)
     except Exception:                       # noqa: BLE001 — кривой собеседник: «неизвестно», ряд цел
         return None
     return {"username": username, "name": " ".join(p for p in parts if p) or None}

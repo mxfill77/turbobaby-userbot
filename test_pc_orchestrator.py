@@ -14372,6 +14372,55 @@ class TestTgFeedPush(unittest.TestCase):
         self.assertNotIn("import tg_feed_push", text)
         self.assertNotIn("from tg_feed_push", text)
 
+    def test_switch_off_no_spawn_on_daemon_path(self):
+        """Путь ДЕМОНА (07.10.2026, NIGHT0710, выживший мутант K11): poll_once зовёт пушер БЕЗ runner и не
+        под юнит-тестом, поэтому замок «unittest в sys.modules» там не стоит, и выключатель — единственная
+        защита. Здесь путь воспроизведён так: «unittest» на время вызова убран из sys.modules,
+        subprocess.run — Mock (настоящего спавна нет ни в одной ветке). Контроль подмены: при «1» вызов
+        доходит до Mock ровно один раз; при любом ином значении — ноль вызовов."""
+        def daemon_call(value):
+            env = {k: v for k, v in os.environ.items() if k != "TG_FEED_PUSH"}
+            if value is not None:
+                env["TG_FEED_PUSH"] = value
+            run = mock.Mock(return_value=types.SimpleNamespace(returncode=0, stdout="", stderr=""))
+            saved = sys.modules.pop("unittest")
+            try:
+                with mock.patch.dict(os.environ, env, clear=True), \
+                        mock.patch.object(o.subprocess, "run", run), mock.patch.object(o, "log"):
+                    got = o._tg_feed_push()
+            finally:
+                sys.modules["unittest"] = saved
+            return got, run
+
+        got, run = daemon_call("1")
+        self.assertEqual((got, run.call_count), (0, 1), "контроль: при «1» путь демона обязан дойти до спавна")
+        for value in (None, "", "0", "true", "yes", "on", " 2 ", "да"):
+            with self.subTest(value=value):
+                got, run = daemon_call(value)
+                self.assertIsNone(got)
+                run.assert_not_called()
+
+    def test_switch_is_read_only_in_the_pusher(self):
+        """Выключатель читает ТОЛЬКО сам пушер (07.10.2026, NIGHT0710, выживший мутант K24): имя
+        TG_FEED_PUSH живёт в коде демона лишь внутри `_tg_feed_push`; poll_once зовёт пушер без аргументов
+        и окружение не трогает — оборот не может сам взвести отправку ленты клиентов на сервер."""
+        import ast
+        with open(o.__file__, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        owners = set()
+        for top in tree.body:
+            for node in ast.walk(top):
+                if isinstance(node, ast.Constant) and node.value == "TG_FEED_PUSH":
+                    owners.add(getattr(top, "name", "<модуль>"))
+        self.assertEqual(owners, {"_tg_feed_push"})
+        poll = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "poll_once"][0]
+        calls = [n for n in ast.walk(poll) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Name) and n.func.id == "_tg_feed_push"]
+        self.assertEqual([(c.args, c.keywords) for c in calls], [([], [])])
+        self.assertEqual([n.attr for n in ast.walk(poll)
+                          if isinstance(n, ast.Attribute) and n.attr in ("environ", "putenv")], [],
+                         "poll_once трогает окружение")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
