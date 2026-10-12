@@ -95,6 +95,8 @@ class FakeServer:
         self.headers = []
         self.send = "on"            # дверь сервера (пульс wa-agent): "off" — пустая выдача
         self.bogus = False          # «off» и всё равно ряды (сервер так не делает) — ПК обязан не слать
+        self.acks = []              # тела подтверждений, как их прислал ПК
+        self.ack_error = None       # ответ сервера на подтверждение: {"ok": false, "error": <это>} (200)
 
     def add(self, rid, chat=1001, text="Здравствуйте! PCX свободен, 350 ฿/сутки.", wait=20, token=None):
         self.rows[rid] = {"id": rid, "token": token or "tok%d" % rid, "chat_id": chat, "text": text,
@@ -124,7 +126,10 @@ class FakeServer:
             return 200, json.dumps({"ok": True, "send": self.send, "now": self.now, "items": items}).encode()
         if method == "POST" and url.endswith(S.ACK_PATH):
             p = json.loads(body.decode())
+            self.acks.append(p)
             r = self.rows.get(p.get("id"))
+            if self.ack_error is not None:
+                return 200, json.dumps({"ok": False, "error": self.ack_error}).encode()
             if r is None:
                 res = {"ok": False, "error": "not_found"}
             elif r["token"] != p.get("token"):
@@ -418,6 +423,80 @@ class TestSend(_Base):
         run(s.step())
         self.assertEqual((self.tg.sent, self.srv.rows[1]["state"]), ([], "queued"))
         self.assertIn("ответ 404", self.rec.text())
+
+
+class TestNotStarted(_Base):
+    """Круг правок 2: у failed, где отправка НЕ начиналась по ВРЕМЕННОЙ причине, подтверждение несёт
+    "not_started": true — сервер вернёт черновик ждать (кнопки живы). Постоянные отказы признака не несут.
+    Ответ сервера «conflict» на подтверждение — окончательный: не повторяем."""
+
+    def ack_of(self, rid):
+        got = [a for a in self.srv.acks if a.get("id") == rid]
+        self.assertTrue(got, "подтверждения ряда %d нет" % rid)
+        return got[-1]
+
+    def test_deadline_journal_disconnect_carry_not_started(self):
+        self.srv.add(1, wait=1.5)                                   # срок сервера на исходе
+        run(self.sender().step())
+        a = self.ack_of(1)
+        self.assertEqual((a["outcome"], a.get("not_started")), ("failed", True), a)
+        self.srv = FakeServer()
+        self.srv.add(2)
+        self.tg = FakeTG(fail=ConnectionError("Cannot send requests while disconnected"))
+        run(self.sender().step())
+        a = self.ack_of(2)
+        self.assertEqual((a["outcome"], a.get("not_started")), ("failed", True), a)
+        self.srv = FakeServer()
+        self.srv.add(3)
+        os.makedirs(os.path.join(TMP, "dir_as_journal2"), exist_ok=True)
+        s = S.Sender(FakeTG(), ME.id, S.Journal(os.path.join(TMP, "dir_as_journal2")), env=ENV, log=self.rec,
+                     http=self.srv, clock=lambda: 0.0)
+        run(s.step())
+        a = self.ack_of(3)
+        self.assertEqual((a["outcome"], a.get("not_started")), ("failed", True), a)
+
+    def test_halt_refusal_carries_not_started_but_telegram_refusal_does_not(self):
+        self.srv.add(1)
+        self.srv.add(2)
+        self.tg.fail = tl_errors.FloodWaitError(request=None, capture=30)
+        run(self.sender().step())
+        self.assertNotIn("not_started", self.ack_of(1), "отказ Telegram — не временная причина «не начинал»")
+        self.assertIs(self.ack_of(2).get("not_started"), True, "стоп-кран: ряд не начинали — временно")
+
+    def test_permanent_refusals_carry_no_flag(self):
+        for rid, chat in ((1, 7007), (2, 4004), (3, 5005), (4, -100)):
+            self.srv.add(rid, chat=chat)
+        self.srv.add(5, text="я" * 4097)
+        self.tg.fail = tl_errors.UserIsBlockedError(request=None)
+        self.srv.add(6)
+        run(self.sender().step())
+        for rid in range(1, 7):
+            a = self.ack_of(rid)
+            self.assertEqual(a["outcome"], "failed", a)
+            self.assertNotIn("not_started", a, a)
+
+    def test_sent_and_unknown_never_carry_the_flag(self):
+        self.srv.add(1)
+        run(self.sender().step())
+        self.assertEqual(self.ack_of(1)["outcome"], "sent")
+        self.assertNotIn("not_started", self.ack_of(1))
+        self.srv = FakeServer()
+        self.srv.add(2)
+        self.tg = FakeTG(fail=ValueError("Request was unsuccessful 6 time(s)"))
+        run(self.sender().step())
+        self.assertEqual(self.ack_of(2)["outcome"], "unknown")
+        self.assertNotIn("not_started", self.ack_of(2))
+
+    def test_conflict_answer_is_final_not_retried(self):
+        self.srv.add(1)
+        self.srv.ack_error = "conflict"
+        s = self.sender()
+        run(s.step())
+        self.assertEqual(len(self.srv.acks), 1)
+        rec = s.journal.get("tok1")
+        self.assertEqual(rec.get("acked"), "отказ:conflict", rec)
+        run(s.step())
+        self.assertEqual(len(self.srv.acks), 1, "conflict — окончательный отказ: повтора нет")
 
 
 class TestHaltCancelOnSent(_Base):

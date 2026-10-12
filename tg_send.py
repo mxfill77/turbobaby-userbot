@@ -33,6 +33,10 @@ tg_send.py — ОТПРАВКА ОТВЕТА АГЕНТА клиенту Telegra
 сервера вышел, журнал не пишется: сообщение заведомо не ушло) · unknown (сеть, таймаут, 5xx/-503 Telegram,
 любое иное исключение после начала отправки: могло уйти). Отправка позже срока сервера не начинается: дверь
 сервера к тому времени уже сказала человеку «исход неизвестен» или «не отправлено».
+У failed, где отправка НЕ НАЧИНАЛАСЬ по ВРЕМЕННОЙ причине (срок сервера на исходе, стоп-кран, журнал не пишется,
+клиент отключён), подтверждение несёт "not_started": true — сервер возвращает черновик ждать, кнопки живы.
+Постоянные отказы (не личный чат, бот, свой аккаунт, длина, отказ Telegram) признака не несут.
+Подтверждение уходит СРАЗУ после отправки, ДО ряда ленты (эхо своей отправки сервер узнаёт по msg_id).
 
 АДРЕС И СЕКРЕТ — тем же путём, что у пушера ленты (`tg_feed_push.py`; модуль userbot его не импортирует —
 имена переменных те же, значения читает процесс, совпадение формул стережёт тест):
@@ -79,7 +83,7 @@ ALARM_EVERY_S = 900             # затяжной сбой опроса — с�
 S_SENDING, S_SENT, S_FAILED, S_UNKNOWN = "sending", "sent", "failed", "unknown"
 FINAL = (S_SENT, S_FAILED, S_UNKNOWN)
 # отказ сервера на подтверждение, после которого повторять бессмысленно (ряд не наш / отменён / не выдан)
-ACK_FINAL_REFUSALS = ("not_found", "token_mismatch", "cancelled", "not_claimed")
+ACK_FINAL_REFUSALS = ("not_found", "token_mismatch", "cancelled", "not_claimed", "conflict")
 
 
 def _now():
@@ -389,6 +393,9 @@ class Sender:
                       % (rid, rec.get("state")))
             await self.ack(token)
             return True
+        # temp — признак «отправка не начиналась, причина ВРЕМЕННАЯ» (поле not_started подтверждения): сервер вернёт
+        # черновик ждать, кнопки живы. Постоянные отказы (не личный чат, бот, свой аккаунт, длина) — без признака
+        temp = bool(self.journal.broken) or self.halt_until is not None
         why = (self.journal.broken + " — без него повтор нечем отличить, не шлю") if self.journal.broken \
             else ("стоп-кран: %s — не шлю" % self.halt_why) if self.halt_until is not None \
             else self._refuse(chat, text)
@@ -397,14 +404,15 @@ class Sender:
             ent, why = await self._peer(chat)
         left = (expires - server_now) - (self.clock() - got_at)
         if why is None and left < MARGIN_S:
-            why = "срок сервера на исходе (осталось %.1f с) — отправку не начинаю" % left
+            why, temp = "срок сервера на исходе (осталось %.1f с) — отправку не начинаю" % left, True
         if why is not None:
             try:
-                self.journal.write(token, id=rid, chat_id=chat, state=S_FAILED, error=why[:ERROR_MAX])
+                self.journal.write(token, id=rid, chat_id=chat, state=S_FAILED, error=why[:ERROR_MAX],
+                                   not_started=temp)
             except Exception as e:                                  # noqa: BLE001 — исход в памяти, ack всё равно
                 self._say("error", "TG-ОТПРАВКА: журнал не записан (%s)" % type(e).__name__)
                 self.journal.recs[token] = {"token": token, "id": rid, "chat_id": chat, "state": S_FAILED,
-                                            "error": why[:ERROR_MAX]}
+                                            "error": why[:ERROR_MAX], "not_started": temp}
             self.counts["failed"] += 1
             self._say("warning", "TG-ОТПРАВКА: ряд %d НЕ отправлен — %s" % (rid, why))
             await self.ack(token)
@@ -413,12 +421,14 @@ class Sender:
             self.journal.write(token, id=rid, chat_id=chat, state=S_SENDING)        # ДО отправки, с fsync
         except Exception as e:                                      # noqa: BLE001
             why = "журнал отправки не пишется (%s) — без него повтор нечем отличить, не шлю" % type(e).__name__
-            self.journal.recs[token] = {"token": token, "id": rid, "chat_id": chat, "state": S_FAILED, "error": why}
+            self.journal.recs[token] = {"token": token, "id": rid, "chat_id": chat, "state": S_FAILED, "error": why,
+                                        "not_started": True}
             self.counts["failed"] += 1
             self._say("error", "TG-ОТПРАВКА: ряд %d — %s" % (rid, why))
             await self.ack(token)
             return True
         msg = None
+        not_started = False
         try:
             msg = await self.client.send_message(ent, text, parse_mode=None)
             msg_id = getattr(msg, "id", None)
@@ -436,14 +446,17 @@ class Sender:
         except Exception as e:                                      # noqa: BLE001
             state, err = classify_send_error(e)
             msg_id = None
+            # клиент отключён — Telethon отказал ДО сети (TELETHON_FACTS §3): отправка не начиналась, причина временная
+            not_started = state == S_FAILED and str(e).startswith(_PRE_NETWORK[2])
             self._maybe_halt(e)
         self.counts[state] += 1
         try:
-            self.journal.write(token, state=state, msg_id=msg_id, error=err)
+            self.journal.write(token, state=state, msg_id=msg_id, error=err, not_started=not_started)
         except Exception as e:                                      # noqa: BLE001
             self._say("error", "TG-ОТПРАВКА: исход ряда %d не записан в журнал (%s) — подтверждаю из памяти"
                       % (rid, type(e).__name__))
-            self.journal.recs[token] = dict(self.journal.recs.get(token, {}), state=state, msg_id=msg_id, error=err)
+            self.journal.recs[token] = dict(self.journal.recs.get(token, {}), state=state, msg_id=msg_id, error=err,
+                                            not_started=not_started)
         self._say("info" if state == S_SENT else "warning",
                   "TG-ОТПРАВКА: ряд %d → %s%s" % (rid, state, " (%s)" % err if err else ""))
         await self.ack(token)                                       # подтверждение — первым: дверь сервера ждёт
@@ -517,6 +530,8 @@ class Sender:
             payload["msg_id"] = msg_id
         if err:
             payload["error"] = str(err)[:ERROR_MAX]
+        if outcome == S_FAILED and rec.get("not_started") is True:
+            payload["not_started"] = True        # сервер вернёт черновик ждать: клиенту ничего не ушло, причина временная
         try:
             status, body = await self._http("POST", ACK_PATH, payload)
         except Exception as e:                                      # noqa: BLE001
@@ -555,7 +570,8 @@ class Sender:
 async def run(client, me_id, log, own_usernames=(), env=None, sleep=None, journal_path=None, sender=None,
               on_sent=None):
     """Фоновая задача userbot: опрос сервера при живом соединении; пауза — `next_poll` по ответу («on» — POLL_S,
-    «off»/ошибка — 30 → 45 → 60 с). Никогда не падает наружу (кроме отмены задачи): сбой шага — строка журнала."""
+    «off»/ошибка — 5 → 10 с, потолок 10 с). Никогда не падает наружу (кроме отмены задачи): сбой шага — строка
+    журнала."""
     sleep = sleep or asyncio.sleep
     if sender is None:
         if not door_token(env):
