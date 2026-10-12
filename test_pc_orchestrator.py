@@ -4001,6 +4001,21 @@ class TestReconcileChildren(Base):
         self.assertTrue(any("авто-применил dae330a00: рестарт userbot" in s for s in cows))
         self.assertEqual(o._last_child_commit, "dae330a00")       # метка сдвинута — второй раз не дёрнет
 
+    def test_golden_tg_send_commit_restarts_userbot(self):
+        # ГОЛДЕН живого случая 13.10 04:24 (c02917eb): коммит тронул ТОЛЬКО tg_send.py (+ его тест) →
+        # ворота пропустили по «owner», но tg_send.py не было в карте → рестарта не было, userbot
+        # жил на прежнем tg_send.py. Теперь — рестарт userbot (модербот tg_send не грузит).
+        o._last_child_commit = "old"
+        kinds, cows = [], []
+        o._cowork = lambda s: cows.append(s)
+        note = self._run("c02917eb1", ["tg_send.py", "test_tg_send.py"],
+                         restart_fn=lambda k: kinds.append(k) or (True, [929], "PID поднят, лог свежий"),
+                         state={})
+        self.assertEqual(kinds, ["userbot"])
+        self.assertIn("userbot рестартнут", note)
+        self.assertEqual(o._procs_for_file("tg_feed.py"), {"userbot"})
+        self.assertEqual(o._procs_for_file("tg_feed_push.py"), set())
+
     def test_golden_trainer_commit_restarts_both_bots(self):
         # ГОЛДЕН класса dae330a на trainer.py: коммит тронул ТОЛЬКО trainer.py (+ его тест) →
         # рестарт ОБОИХ ботов (импорт модульного уровня в userbot_listen.py:44 и moderation_bot.py:36).
