@@ -558,11 +558,11 @@ class TestRunLoop(_Base):
         with self.assertRaises(asyncio.CancelledError):
             run(S.run(self.tg, ME.id, self.rec, sender=Boom(), sleep=fake_sleep))
         self.assertEqual(len(calls), 2, "без связи шаг не идёт, со связью — идёт")
-        self.assertEqual(sleeps, [30.0, 45.0, 60.0, 60.0], "сбой и нет связи — реже, с отступом до 60 с")
+        self.assertEqual(sleeps, [5.0, 10.0, 10.0, 10.0], "сбой и нет связи — реже, потолок 10 с")
         self.assertIn("шаг упал", self.rec.text("WARNING"))
 
     def test_poll_schedule_follows_the_server_switch(self):
-        """«on» — раз в POLL_S; «off»/ошибка — 30 → 45 → 60 с; «on» снова — сразу частый опрос."""
+        """«on» — раз в POLL_S; «off»/ошибка — 5 → 10 с (потолок 10); «on» снова — сразу частый опрос."""
         states = ["on", "on", "off", "off", "off", "off", "error", "on", "off"]
 
         class Seq:
@@ -581,7 +581,22 @@ class TestRunLoop(_Base):
                 raise asyncio.CancelledError()
         with self.assertRaises(asyncio.CancelledError):
             run(S.run(self.tg, ME.id, self.rec, sender=Seq(), sleep=fake_sleep))
-        self.assertEqual(sleeps, [2.5, 2.5, 30.0, 45.0, 60.0, 60.0, 60.0, 2.5, 30.0])
+        self.assertEqual(sleeps, [2.5, 2.5, 5.0, 10.0, 10.0, 10.0, 10.0, 2.5, 5.0])
+
+    def test_off_poll_ceiling_fits_the_server_door_window(self):
+        """Потолок опроса вне «on» — 10 с, меньше окна двери сервера (по умолчанию 20 с, минимум 5–60): после
+        рестарта службы агента сервер отвечает «off», пока не ляжет свежий пульс, и ПК обязан узнать «on» в
+        пределах одного окна двери. Прежний отступ 30 → 60 с — нажатия следующей минуты не находили ПК."""
+        server_door_wait_default = 20.0
+        for state in ("off", "error", "halt", None, "что-то"):
+            for quiet in range(0, 200):
+                p = S.next_poll(state, quiet)
+                self.assertLessEqual(p, 10.0, (state, quiet, p))
+                self.assertLess(p, server_door_wait_default, (state, quiet, p))
+                self.assertGreater(p, S.POLL_S - 0.001, "реже частого — сервер не дёргаем впустую")
+        self.assertEqual(S.next_poll("on", 7), S.POLL_S)
+        self.assertEqual(max(S.OFF_POLL_S), 10.0)
+        self.assertEqual(S.OFF_POLL_CEIL_S, 10.0)
 
 
 class TestServerSwitch(_Base):
