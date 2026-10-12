@@ -7,10 +7,14 @@ tg_send.py — ОТПРАВКА ОТВЕТА АГЕНТА клиенту Telegra
 умеет userbot ПК, у него сессия аккаунта. Этот модуль — его руки: фоновая задача того же процесса и ТОГО ЖЕ
 клиента Telethon (второго клиента нет и не будет).
 
-ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО. Включает только `TG_SEND=1` (1/true/yes/on) в окружении userbot; иначе userbot не
-заводит задачи вовсе — ни сети, ни файла, ни строки журнала (`enabled()` спрашивает userbot ДО всего).
+ВЫКЛЮЧАТЕЛЬ ОДИН — НА СЕРВЕРЕ (WA_AGENT_TG_SEND у службы агента). Здесь своей ручки включения нет: файл
+окружения ПК правит только владелец. Отправитель живёт, когда живёт лента (`TG_FEED_OFF` не задан) и есть
+токен пушера; аварийный выключатель ПК — `TG_SEND_OFF=1` (по образцу `TG_FEED_OFF`), по умолчанию не задан.
+Не живёт — userbot не заводит задачи вовсе: ни сети, ни файла, ни строки (`enabled()` спрашивают ДО всего).
+Сервер отвечает на опрос признаком "send": "on"|"off". «off» (дверь у сервера закрыта) или ошибка — опрос
+раз в 30 → 45 → 60 с (OFF_POLL_S); «on» — раз в POLL_S. Отправляется ТОЛЬКО то, что сервер выдал при «on».
 
-ЦИКЛ (раз в POLL_S секунд, только при живом соединении):
+ЦИКЛ (раз в POLL_S секунд при «on», только при живом соединении):
   1. подтверждения, которые не доехали (журнал) — повтор POST /tg-queue/ack;
   2. GET /tg-queue/outbox — ряды {id, token, chat_id, text, expires_at} (сервер отдаёт их queued → claimed);
   3. на каждый ряд: уже в журнале (сервер выдал повторно — ответ на прошлую выдачу потерялся) → НЕ шлём,
@@ -51,7 +55,8 @@ from telethon.tl.types import User
 
 import tg_feed
 
-FLAG_ENV = "TG_SEND"
+OFF_ENV = "TG_SEND_OFF"         # аварийный выключатель ПК (по образцу tg_feed.OFF_ENV); по умолчанию не задан
+OFF_WORDS = ("1", "true", "yes", "on", "да")   # те же слова, что у tg_feed.enabled (сверяет тест)
 URL_ENV, TOKEN_ENV = "TG_FEED_PUSH_URL", "TG_FEED_PUSH_TOKEN"      # те же имена, что у пушера ленты
 BASE_ENV, PULL_SECRET_ENV = "WA_QUEUE_BASE", "WA_PULL_SECRET"
 DEFAULT_BASE = "https://wa.turbophuket.com"
@@ -60,6 +65,7 @@ OUTBOX_PATH, ACK_PATH = "/tg-queue/outbox", "/tg-queue/ack"
 JOURNAL_FILE = os.path.join(tg_feed.FEED_DIR, "tg_send.journal.jsonl")
 
 POLL_S = 2.5                    # опрос очереди сервера; дверь сервера ждёт ~20 с — это ~8 опросов
+OFF_POLL_S = (30.0, 45.0, 60.0)  # сервер сказал «off» или ошибка: опрос реже, с отступом до 60 с
 HTTP_TIMEOUT_S = 8.0
 MARGIN_S = 2.0                  # до срока сервера должно остаться больше — иначе не начинаем отправку
 TEXT_MAX = 4096                 # Telegram: ≤ 4096 знаков (единиц UTF-16)
@@ -77,8 +83,18 @@ def _now():
 
 
 def enabled(env=None) -> bool:
-    """TG_SEND=1/true/yes/on — включено; всё прочее (и отсутствие) — выключено."""
-    return _env(env, FLAG_ENV).lower() in ("1", "true", "yes", "on")
+    """Жить ли отправителю: лента включена (TG_FEED_OFF не задан), аварийный TG_SEND_OFF не задан и токен пушера
+    есть. Включать ли саму отправку — решает сервер (его единственный выключатель), а не ПК."""
+    if _env(env, tg_feed.OFF_ENV).lower() in OFF_WORDS or _env(env, OFF_ENV).lower() in OFF_WORDS:
+        return False
+    return bool(door_token(env))
+
+
+def next_poll(state, quiet):
+    """Пауза до следующего опроса: «on» — POLL_S; «off»/ошибка — OFF_POLL_S по числу таких подряд (quiet ≥ 1)."""
+    if state == "on":
+        return POLL_S
+    return OFF_POLL_S[min(max(quiet, 1), len(OFF_POLL_S)) - 1]
 
 
 def _env(env, name):
@@ -240,6 +256,7 @@ class Sender:
         self.own = {str(u).lower() for u in own_usernames}
         self.fail_since = None
         self.fail_said = None
+        self.door_open = None           # последнее сказанное сервером: True «on» · False «off» · None — не знаем
         self.counts = {"sent": 0, "failed": 0, "unknown": 0, "rehanded": 0, "acked": 0}
         # оборванная прошлым процессом отправка — исход неизвестен, повтора нет никогда
         for rec in list(journal.recs.values()):
@@ -280,30 +297,48 @@ class Sender:
 
     # ── шаг ──
     async def step(self):
+        """Один опрос. → "on" (дверь сервера открыта, выданное обработано) · "off" (сервер: отправка выключена) ·
+        "error" (сеть, не 200, ответ не по контракту). Отправляется только выданное при «on»."""
         await self.flush_acks()
         got_at = self.clock()
         try:
             status, body = await self._http("GET", OUTBOX_PATH)
         except Exception as e:                                      # noqa: BLE001
             self._net_fail("очередь не прочитана (%s)" % type(e).__name__)
-            return 0
+            return "error"
         if status != 200:
             self._net_fail("очередь: ответ %s" % status)
-            return 0
+            return "error"
         try:
             data = json.loads(_text(body))
-            items, server_now = data["items"], float(data["now"])
-            if not isinstance(items, list):
-                raise ValueError("items")
+            items, server_now, send = data["items"], float(data["now"]), data["send"]
+            if not isinstance(items, list) or send not in ("on", "off"):
+                raise ValueError("items/send")
         except Exception as e:                                      # noqa: BLE001
             self._net_fail("очередь: ответ не по контракту (%s)" % type(e).__name__)
-            return 0
+            return "error"
         self._net_ok()
-        done = 0
+        if send != "on":
+            if items:                                               # сервер так не отвечает; не шлём ничего
+                self._say("warning", "TG-ОТПРАВКА: сервер сказал «off» и выдал %d ряд(ов) — не шлю ни одного"
+                          % len(items))
+            self._door(False, data.get("why"))
+            return "off"
+        self._door(True, None)
         for it in items:
-            if await self.one(it, got_at, server_now):
-                done += 1
-        return done
+            await self.one(it, got_at, server_now)
+        return "on"
+
+    def _door(self, open_, why):
+        """Строка журнала на СМЕНУ состояния двери сервера (первое известное — тоже), а не на каждый опрос."""
+        if self.door_open is open_:
+            return
+        self.door_open = open_
+        if open_:
+            self._say("info", "TG-ОТПРАВКА: сервер — отправка ВКЛЮЧЕНА, опрос раз в %s с" % POLL_S)
+        else:
+            self._say("info", "TG-ОТПРАВКА: сервер — отправка выключена (%s), опрос раз в %d–%d с"
+                      % (why or "причина не названа", OFF_POLL_S[0], OFF_POLL_S[-1]))
 
     async def one(self, it, got_at, server_now):
         try:
@@ -447,30 +482,31 @@ class Sender:
                 break                                               # сервер молчит — остальное следующим шагом
 
 
-async def run(client, me_id, log, own_usernames=(), env=None, poll=POLL_S, sleep=None, journal_path=None,
-              sender=None):
-    """Фоновая задача userbot: шаг отправителя раз в `poll` с, только при живом соединении. Никогда не падает
-    наружу (кроме отмены задачи): сбой шага — строка журнала, следующий шаг через `poll`."""
+async def run(client, me_id, log, own_usernames=(), env=None, sleep=None, journal_path=None, sender=None):
+    """Фоновая задача userbot: опрос сервера при живом соединении; пауза — `next_poll` по ответу («on» — POLL_S,
+    «off»/ошибка — 30 → 45 → 60 с). Никогда не падает наружу (кроме отмены задачи): сбой шага — строка журнала."""
     sleep = sleep or asyncio.sleep
     if sender is None:
         if not door_token(env):
-            log.error(f"{_now()} | TG-ОТПРАВКА: TG_SEND=1, но токена нет ({TOKEN_ENV} / {PULL_SECRET_ENV}) — "
-                      f"задача отправки НЕ запущена, ответы агента не уходят")
+            log.error(f"{_now()} | TG-ОТПРАВКА: токена нет ({TOKEN_ENV} / {PULL_SECRET_ENV}) — задача отправки "
+                      f"НЕ запущена, ответы агента не уходят")
             return
         sender = Sender(client, me_id, Journal(journal_path or JOURNAL_FILE), env=env, log=log,
                         own_usernames=own_usernames)
-    log.info(f"{_now()} | TG-ОТПРАВКА: вкл (TG_SEND=1) — забираю ответы агента с {sender.base}{OUTBOX_PATH} раз в "
-             f"{poll} с, шлю с этого аккаунта, журнал {sender.journal.path}")
+    log.info(f"{_now()} | TG-ОТПРАВКА: живу — опрашиваю {sender.base}{OUTBOX_PATH}; включает отправку сервер "
+             f"(WA_AGENT_TG_SEND у wa-agent), аварийно выключить здесь — {OFF_ENV}=1; журнал {sender.journal.path}")
     if getattr(sender.journal, "broken", ""):
         log.error(f"{_now()} | TG-ОТПРАВКА: {sender.journal.broken} — ни один ответ не уйдёт (каждый подтверждаю "
                   f"отказом), пока журнал не починят и userbot не перезапустят")
+    quiet = 0
     while True:
+        state = "error"
         try:
             if client.is_connected():
-                await sender.step()
+                state = await sender.step()
         except asyncio.CancelledError:
             raise
         except Exception as e:                                      # noqa: BLE001 — задача не умирает
-            log.warning(f"{_now()} | TG-ОТПРАВКА: шаг упал ({type(e).__name__}: {sender._safe(e)}) — следующий "
-                        f"через {poll} с")
-        await sleep(poll)
+            log.warning(f"{_now()} | TG-ОТПРАВКА: шаг упал ({type(e).__name__}: {sender._safe(e)})")
+        quiet = 0 if state == "on" else quiet + 1
+        await sleep(next_poll(state, quiet))

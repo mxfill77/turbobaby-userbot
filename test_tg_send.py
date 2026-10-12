@@ -93,6 +93,8 @@ class FakeServer:
         self.now, self.rows, self.calls = now, {}, []
         self.drop_get = self.drop_ack = 0
         self.headers = []
+        self.send = "on"            # дверь сервера (пульс wa-agent): "off" — пустая выдача
+        self.bogus = False          # «off» и всё равно ряды (сервер так не делает) — ПК обязан не слать
 
     def add(self, rid, chat=1001, text="Здравствуйте! PCX свободен, 350 ฿/сутки.", wait=20, token=None):
         self.rows[rid] = {"id": rid, "token": token or "tok%d" % rid, "chat_id": chat, "text": text,
@@ -107,6 +109,9 @@ class FakeServer:
             return 404, b"Not found"
         if method == "GET" and url.endswith(S.OUTBOX_PATH):
             items = []
+            if self.send == "off" and not self.bogus:
+                return 200, json.dumps({"ok": True, "send": "off", "why": "дверь закрыта", "now": self.now,
+                                        "items": []}).encode()
             for r in self.rows.values():
                 if r["expires_at"] > self.now and (r["state"] == "queued" or r["state"] == "claimed"):
                     r["state"] = "claimed"
@@ -116,7 +121,7 @@ class FakeServer:
             if self.drop_get:
                 self.drop_get -= 1
                 raise ConnectionResetError("ответ потерян")
-            return 200, json.dumps({"ok": True, "now": self.now, "items": items}).encode()
+            return 200, json.dumps({"ok": True, "send": self.send, "now": self.now, "items": items}).encode()
         if method == "POST" and url.endswith(S.ACK_PATH):
             p = json.loads(body.decode())
             r = self.rows.get(p.get("id"))
@@ -158,39 +163,65 @@ class _Base(unittest.TestCase):
 
 # ─────────────────────── 1. флаг ───────────────────────
 
+_ENV_KEYS = (S.OFF_ENV, "TG_FEED_OFF", "TG_FEED_PUSH_TOKEN", "WA_PULL_SECRET")
+
+
 class TestFlag(R.Base):
+    """Выключатель ОДИН — на сервере. ПК: отправитель живёт при живой ленте и токене пушера; аварийный
+    TG_SEND_OFF=1 (по образцу TG_FEED_OFF). Не живёт — ни задачи, ни строки."""
+
     def setUp(self):
         super().setUp()
         self._saved_sender = getattr(ub, "_tg_sender", None)
         ub._tg_sender = None
-        self._env = os.environ.pop(S.FLAG_ENV, None)
+        self._env = {k: os.environ.pop(k, None) for k in _ENV_KEYS}
 
     def tearDown(self):
         ub._tg_sender = self._saved_sender
-        if self._env is not None:
-            os.environ[S.FLAG_ENV] = self._env
-        else:
-            os.environ.pop(S.FLAG_ENV, None)
+        for k, v in self._env.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
         super().tearDown()
 
     def test_enabled_rule(self):
-        for v in ("1", "true", "YES", " on "):
-            self.assertTrue(S.enabled({S.FLAG_ENV: v}), v)
-        for v in (None, "", "0", "no", "off", "2", "да"):
-            self.assertFalse(S.enabled({} if v is None else {S.FLAG_ENV: v}), v)
+        tok = {"TG_FEED_PUSH_TOKEN": "t"}
+        self.assertTrue(S.enabled(tok))
+        self.assertTrue(S.enabled({"WA_PULL_SECRET": "p"}))
+        self.assertFalse(S.enabled({}), "без токена пушера отправителю жить нечем")
+        for name in (S.OFF_ENV, "TG_FEED_OFF"):
+            for v in ("1", "true", "YES", " on ", "да"):
+                self.assertFalse(S.enabled(dict(tok, **{name: v})), (name, v))
+            for v in ("", "0", "no", "off", "2"):
+                self.assertTrue(S.enabled(dict(tok, **{name: v})), (name, v))
 
-    async def test_flag_off_no_task_no_line(self):
-        cl = R.FakeClient()
-        made = []
-        with mock.patch.object(S, "run", side_effect=lambda *a, **k: made.append(a)):
-            before = len(asyncio.all_tasks())
-            await ub._startup_once(cl)
-            after = len(asyncio.all_tasks())
-        self.assertEqual((made, ub._tg_sender, after - before), ([], None, 0))
-        self.assertNotIn("TG-ОТПРАВКА", self.rec.text())
+    def test_off_words_are_the_feed_rule(self):
+        import tg_feed
+        for v in ("1", "true", "yes", "on", "да", "YES", " On ", "0", "", "no", "off", "нет", "2"):
+            with self.subTest(v=v):
+                os.environ["TG_FEED_OFF"] = v
+                try:
+                    self.assertEqual(tg_feed.enabled(), v.strip().lower() not in S.OFF_WORDS)
+                finally:
+                    os.environ.pop("TG_FEED_OFF", None)
 
-    async def test_flag_on_exactly_one_task(self):
-        os.environ[S.FLAG_ENV] = "1"
+    async def test_off_no_task_no_line(self):
+        for env in ({}, {"TG_FEED_PUSH_TOKEN": "t", S.OFF_ENV: "1"}, {"TG_FEED_PUSH_TOKEN": "t", "TG_FEED_OFF": "1"}):
+            with self.subTest(env=env):
+                ub._startup_done, ub._tg_sender = False, None
+                cl = R.FakeClient()
+                made = []
+                with mock.patch.dict(os.environ, env), \
+                        mock.patch.object(S, "run", side_effect=lambda *a, **k: made.append(a)):
+                    before = len(asyncio.all_tasks())
+                    await ub._startup_once(cl)
+                    after = len(asyncio.all_tasks())
+                self.assertEqual((made, ub._tg_sender, after - before), ([], None, 0))
+                self.assertNotIn("TG-ОТПРАВКА", self.rec.text())
+
+    async def test_on_exactly_one_task(self):
+        os.environ["TG_FEED_PUSH_TOKEN"] = "t"
         runs = []
 
         async def fake_run(client, me_id, log, own_usernames=()):
@@ -235,7 +266,7 @@ class TestSend(_Base):
         text = "Привет! *PCX* свободен_до_15-го — [цена](x) `350` ฿"
         self.srv.add(1, text=text)
         s = self.sender()
-        self.assertEqual(run(s.step()), 1)
+        self.assertEqual(run(s.step()), "on")
         self.assertEqual(self.tg.sent, [(1001, text, None)])
         r = self.srv.rows[1]
         self.assertEqual((r["state"], r["msg_id"]), ("sent", 501))
@@ -243,7 +274,7 @@ class TestSend(_Base):
         self.assertEqual(states[:2], ["sending", "sent"], "«sending» пишется ДО отправки")
         self.assertIs(self.journal_lines()[-1]["acked"], True)
         self.assertNotIn(text, open(self.jpath, encoding="utf-8").read(), "текст клиенту в журнале")
-        self.assertEqual(run(s.step()), 0)                      # решённое сервер не выдаёт
+        self.assertEqual(run(s.step()), "on")                   # решённое сервер не выдаёт
         self.assertEqual(len(self.tg.sent), 1)
 
     def test_lost_ack_is_retried_from_journal_first(self):
@@ -410,8 +441,78 @@ class TestRunLoop(_Base):
         with self.assertRaises(asyncio.CancelledError):
             run(S.run(self.tg, ME.id, self.rec, sender=Boom(), sleep=fake_sleep))
         self.assertEqual(len(calls), 2, "без связи шаг не идёт, со связью — идёт")
-        self.assertEqual(sleeps, [S.POLL_S] * 4)
+        self.assertEqual(sleeps, [30.0, 45.0, 60.0, 60.0], "сбой и нет связи — реже, с отступом до 60 с")
         self.assertIn("шаг упал", self.rec.text("WARNING"))
+
+    def test_poll_schedule_follows_the_server_switch(self):
+        """«on» — раз в POLL_S; «off»/ошибка — 30 → 45 → 60 с; «on» снова — сразу частый опрос."""
+        states = ["on", "on", "off", "off", "off", "off", "error", "on", "off"]
+
+        class Seq:
+            base, journal = "https://x", types.SimpleNamespace(path="j")
+
+            async def step(self):
+                return states.pop(0)
+
+            def _safe(self, s):
+                return str(s)
+        sleeps = []
+
+        async def fake_sleep(sec):
+            sleeps.append(sec)
+            if not states:
+                raise asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError):
+            run(S.run(self.tg, ME.id, self.rec, sender=Seq(), sleep=fake_sleep))
+        self.assertEqual(sleeps, [2.5, 2.5, 30.0, 45.0, 60.0, 60.0, 60.0, 2.5, 30.0])
+
+
+class TestServerSwitch(_Base):
+    """Выключатель сервера: «off» — ничего не шлём (даже если сервер ошибочно выдал ряды), подтверждения
+    из журнала доезжают; смена состояния — одна строка журнала, а не строка на опрос."""
+
+    def test_off_sends_nothing_even_bogus_items(self):
+        self.srv.add(1)
+        self.srv.send, self.srv.bogus = "off", True
+        s = self.sender()
+        self.assertEqual(run(s.step()), "off")
+        self.assertEqual(self.tg.sent, [])
+        self.assertIn("не шлю ни одного", self.rec.text("WARNING"))
+
+    def test_transitions_said_once(self):
+        s = self.sender()
+        self.srv.send = "off"
+        for _ in range(3):
+            self.assertEqual(run(s.step()), "off")
+        self.srv.send = "on"
+        self.srv.add(1)
+        for _ in range(3):
+            self.assertEqual(run(s.step()), "on")
+        self.assertEqual(len(self.tg.sent), 1)
+        lines = [t for _, t in self.rec.lines]
+        self.assertEqual(sum("отправка выключена" in t for t in lines), 1, lines)
+        self.assertEqual(sum("отправка ВКЛЮЧЕНА" in t for t in lines), 1, lines)
+
+    def test_acks_flush_while_off(self):
+        self.srv.add(1)
+        s = self.sender()
+        lost = [1]
+
+        def ack_lost(method, url, body, headers, timeout):
+            if method == "POST" and lost:
+                lost.pop()
+                raise ConnectionResetError("ack не доехал")
+            return self.srv(method, url, body, headers, timeout)
+        s.http = ack_lost
+        run(s.step())                                           # ушло, подтверждение потеряно
+        self.srv.send = "off"                                   # дверь сервера закрылась
+        self.assertEqual(run(s.step()), "off")
+        self.assertEqual((len(self.tg.sent), self.srv.rows[1]["state"]), (1, "sent"))
+
+    def test_contract_without_send_word_is_an_error(self):
+        s = self.sender()
+        s.http = lambda *a: (200, json.dumps({"ok": True, "now": NOW, "items": []}).encode())
+        self.assertEqual(run(s.step()), "error")
 
 
 class TestNoRedirect(unittest.TestCase):
