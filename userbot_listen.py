@@ -23,6 +23,10 @@ turbobaby_session.session — те же ключи и та же сессия, ч
 клиента — ряд в локальный файл вне git. Команда и партнёры отсеиваются до записи функциями suggest.
 Telegram ради ленты не зовётся ни разу, второго клиента нет; сбой записи — строка журнала.
 
+ОТВЕТ АГЕНТА ИЗ «АГЕНТОВ» (13.10.2026, `tg_send.py`, TGSEND1310) — по умолчанию ВЫКЛЮЧЕН. Только при
+`TG_SEND=1` разовая инициализация заводит ОДНУ фоновую задачу на том же клиенте: она забирает с сервера
+ответы, одобренные кнопкой «✅ Отправить», и шлёт их в ЛИЧНЫЙ чат клиента. Выключен — ни задачи, ни сети.
+
 ЭТАП C (по умолчанию) — userbot только слушает и логирует, ноль исходящих.
 Ступень ① SUGGEST — ОПЦИОНАЛЬНА и по умолчанию ВЫКЛЮЧЕНА (SUGGEST_MODE=off в .env):
 при выключенной SUGGEST поведение идентично Stage C. При включении черновики ответов
@@ -50,6 +54,7 @@ import trainer_photo  # noqa: E402  СНИМОК В ТРЕНАЖЁРЕ: загр
 import booking_draft  # noqa: E402  (текст-команда «до crm» в тренажёре — мост 2.1, read-only)
 import proc_identity  # noqa: E402  ЛИЧНОСТЬ ПРОЦЕССА: номер + имя запуска + момент старта
 import tg_feed  # noqa: E402  ЛЕНТА ЛС для «Агентов»: только дозапись файла, ноль вызовов Telegram
+import tg_send  # noqa: E402  «✅ Отправить» из «Агентов» (TGSEND1310): только при TG_SEND=1, иначе ни задачи, ни сети
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
@@ -643,6 +648,7 @@ _NET_ERRORS = (OSError, asyncio.TimeoutError)
 _startup_done = False       # разовый пост-стартовый блок отработал
 _moderation_hooked = False  # хендлер модерации повешен: второй = ДВОЙНАЯ обработка модерации
 _ipc_poller = None          # задача-исполнитель решений модербота: вторая = ДВОЙНАЯ отправка
+_tg_sender = None           # задача отправки ответов агента (TG_SEND=1, TGSEND1310): вторая = ДВОЙНАЯ отправка
 
 
 async def _startup_once(client):
@@ -652,7 +658,7 @@ async def _startup_once(client):
     опасны повтором и закрыты СВОИМИ замками: второй `on_moderation` — двойная обработка
     модерации, второй IPC-поллер — ДВОЙНАЯ ОТПРАВКА клиенту. Общий флаг снимается в самом
     конце: сорвавшийся на сети блок обязан повториться целиком."""
-    global _ME_ID, _startup_done, _moderation_hooked, _ipc_poller
+    global _ME_ID, _startup_done, _moderation_hooked, _ipc_poller, _tg_sender
     if _startup_done:
         return
     me = await client.get_me()
@@ -709,6 +715,10 @@ async def _startup_once(client):
         )
     else:
         log.info(f"{_now()} | SUGGEST выключен — чистый Stage C, исходящих ноль.")
+    # «✅ Отправить» из «Агентов» (TGSEND1310): ТОЛЬКО при TG_SEND=1 — иначе ни задачи, ни сети, ни строки.
+    # Тот же клиент, задача одна на процесс (замок как у IPC-поллера: вторая = двойная отправка).
+    if tg_send.enabled() and _tg_sender is None:
+        _tg_sender = asyncio.create_task(tg_send.run(client, _ME_ID, log, own_usernames=OWN_USERNAMES))
     _startup_done = True
 
 
