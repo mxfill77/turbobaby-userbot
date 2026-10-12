@@ -5257,6 +5257,414 @@ class TestSecretValueLeakIsTheReplacement(unittest.TestCase):
         self.assertEqual(noisy, [])
 
 
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# ВЛАДЕЛЬЦА НЕТ У ЭКРАНА — ВОПРОСА НЕТ (12.10.2026): interactive + bypass/dontAsk → ask = ОТКАЗ
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+class TestOwnerAwayNoQuestion(unittest.TestCase):
+    """Живой факт ночи 12.10 (pretool_guard.log, роль interactive): ask вида `env` в 07:51:38 и
+    08:03:13 остановили двух агентов workflow на 3 ч 41 мин — сессия стояла в bypass, владелец
+    спал, вопрос хука ждал человека до 11:44. Слово владельца: «надо что бы не спрашивал вообще».
+
+    Правило (`owner_away`): роль interactive и `permission_mode` ∈ `UNATTENDED_MODES` во входе
+    хука → всё, что стало бы ask, уходит `deny` с текстом исполнителю, без пуша и без маркера, с
+    меткой лога `DECISION_UNATTENDED`. Ни разу не allow. headless и прочие режимы — как было.
+
+    Гард гоняется ПОДПРОЦЕССОМ ТОГО ФАЙЛА, что импортирован как `g` (на копии — копия, после
+    переноса — живой), а не по пути PROJ: иначе тест судил бы не ту версию. Окружение — как у
+    живого интерактива: тест-флаги `_TEST_RUN_ENVS` сняты (иначе пуш гасится изоляцией, и счёт
+    пушей ничего не доказывает), канал 1 уведён в счётчик `NOTIFY_COUNT_FILE` — он стоит в `_push`
+    ДО спавна отправителя, сеть не трогается; лог — во временный файл, не в боевой."""
+
+    GUARD = os.path.join(os.path.dirname(os.path.abspath(g.__file__)), "pretool_guard.py")
+    RUNS = os.environ.get("GUARD_BYPASS_RUNS") or os.path.join(PROJ, "tmp", "guard_bypass_runs")
+    NO_FIELD = object()
+    BYPASS = "bypassPermissions"
+    KILL = {"tool_name": "Bash", "tool_input": {"command": "taskkill /PID 47121 /F"}}
+
+    # Входы, на которых БЕЗ поля режима рождается карточка (ask), — по видам. Ночной вид `env`
+    # двумя инструментами; `unknown_tool` — канал вне реестра (fail-closed гарда).
+    #
+    # ДОБРАНО 12.10.2026 (Д1 проверки review_escape): первые восемь входов покрывали 7 видов из 20
+    # спрашивающих и ни одного Edit/MultiEdit/NotebookEdit — пять мутантов правила («инструменты
+    # правки оставляют ask», «8 видов оставляют ask», «12 видов / инструменты правки → молчаливый
+    # defer», «правило молчит при тест-флаге») проходили класс целиком, 12 из 12. Теперь вход есть
+    # на КАЖДЫЙ спрашивающий вид `_KIND_VOCAB` (20 из 21: `unknown` вопроса не рождает — объект у
+    # него пуст по построению, `card_decision` отказывает на месте) и на каждый инструмент, которым
+    # ask приходит. Полноту держит сторож `test_ask_inputs_cover_every_asking_kind_and_tool`,
+    # посылку «без поля → ask ЭТОГО вида, пуш 1» — каждый прогон заново (замер 12.10: 35 из 35).
+    # Пути секретов — в НЕСУЩЕСТВУЮЩЕМ каталоге: гард только классифицирует, ничего не исполняется.
+    NOFILE = os.path.join(PROJ, "tmp", "guard_bypass_nofile")
+    PUB = r"C:\Users\Public"
+    ASK_INPUTS = (
+        ("env", {"tool_name": "Bash", "tool_input": {"command": "cat .env"}}),
+        ("env", {"tool_name": "PowerShell", "tool_input": {"command": "Get-Content .env"}}),
+        ("delete", {"tool_name": "Bash", "tool_input": {"command": "rm suggest.py"}}),
+        ("sqlite", {"tool_name": "Bash",
+                    "tool_input": {"command": 'sqlite3 bookings.db "DELETE FROM b WHERE id=1"'}}),
+        ("write_outside", {"tool_name": "Write",
+                           "tool_input": {"file_path": r"C:\Users\Public\guard_bypass_x.txt",
+                                          "content": "x"}}),
+        ("unknown_tool", {"tool_name": "FrobnicateTool", "tool_input": {"x": 1}}),
+        ("kill", KILL),
+        ("read_secret", {"tool_name": "Read",
+                         "tool_input": {"file_path": os.path.join(PROJ, ".env")}}),
+        # ── добрано 12.10 (Д1): остальные 13 видов и инструменты правки ─────────────────────
+        ("delete", {"tool_name": "PowerShell",
+                    "tool_input": {"command": r"Remove-Item D:\turbobaby-bot\suggest.py"}}),
+        ("kill", {"tool_name": "PowerShell",
+                  "tool_input": {"command": "Stop-Process -Id 47121 -Force"}}),
+        ("schtasks", {"tool_name": "Bash", "tool_input": {
+            "command": "schtasks /Change /TN TurboBabyExpectPC /Disable"}}),
+        ("git_force", {"tool_name": "Bash", "tool_input": {"command": "git reset --hard HEAD~1"}}),
+        ("git_force", {"tool_name": "PowerShell",
+                       "tool_input": {"command": "git push --force origin main"}}),
+        ("clasp", {"tool_name": "Bash",
+                   "tool_input": {"command": "clasp create --title guard_bypass_probe"}}),
+        ("clasp_push", {"tool_name": "Bash", "tool_input": {"command": "clasp push"}}),
+        ("clasp_deploy", {"tool_name": "Bash",
+                          "tool_input": {"command": "clasp deploy -i AKfycbXYZ -V 12"}}),
+        ("clasp_run", {"tool_name": "Bash", "tool_input": {"command": "clasp run sendAll"}}),
+        ("live_sheet", {"tool_name": "Bash", "tool_input": {"command": (
+            "python -c \"import gspread; gspread.service_account().open('Лист1').sheet1"
+            ".update('A1', 'x')\"")}}),
+        ("network", {"tool_name": "Bash", "tool_input": {
+            "command": "curl -X POST https://example.invalid/hook -d a=1"}}),
+        ("network", {"tool_name": "PowerShell", "tool_input": {
+            "command": "Invoke-WebRequest -Uri https://example.invalid/x -Method Post -Body a"}}),
+        ("outside", {"tool_name": "Bash",
+                     "tool_input": {"command": r"echo x > C:\Windows\Temp\guard_bypass_y.txt"}}),
+        ("write_outside", {"tool_name": "Edit", "tool_input": {
+            "file_path": PUB + r"\guard_bypass_x.txt", "old_string": "a", "new_string": "b"}}),
+        ("write_outside", {"tool_name": "MultiEdit", "tool_input": {
+            "file_path": PUB + r"\guard_bypass_x.txt",
+            "edits": [{"old_string": "a", "new_string": "b"}]}}),
+        ("write_outside", {"tool_name": "NotebookEdit", "tool_input": {
+            "notebook_path": PUB + r"\guard_bypass_x.ipynb", "new_source": "x"}}),
+        ("py_write", {"tool_name": "Bash", "tool_input": {
+            "command": "python -c \"import bridge_client as b; b.create_booking(1)\""}}),
+        ("edit_secret", {"tool_name": "Edit", "tool_input": {
+            "file_path": os.path.join(NOFILE, ".env"), "old_string": "a", "new_string": "b"}}),
+        ("edit_secret", {"tool_name": "Write", "tool_input": {
+            "file_path": os.path.join(NOFILE, ".env"), "content": "A=1"}}),
+        ("edit_secret", {"tool_name": "NotebookEdit", "tool_input": {
+            "notebook_path": os.path.join(NOFILE, ".env"), "new_source": "x"}}),
+        ("edit_claude", {"tool_name": "Edit", "tool_input": {
+            "file_path": os.path.join(PROJ, ".claude", "settings.json"),
+            "old_string": "a", "new_string": "b"}}),
+        ("edit_claude", {"tool_name": "MultiEdit", "tool_input": {
+            "file_path": os.path.join(PROJ, ".claude", "hooks", "x.py"),
+            "edits": [{"old_string": "a", "new_string": "b"}]}}),
+        ("edit_claude", {"tool_name": "NotebookEdit", "tool_input": {
+            "notebook_path": os.path.join(PROJ, ".claude", "agents", "x.ipynb"),
+            "new_source": "x"}}),
+        ("edit_git", {"tool_name": "Write", "tool_input": {
+            "file_path": os.path.join(PROJ, ".git", "hooks", "pre-commit"), "content": "echo x"}}),
+        ("edit_git", {"tool_name": "Edit", "tool_input": {
+            "file_path": os.path.join(PROJ, ".git", "config"), "old_string": "a",
+            "new_string": "b"}}),
+        ("edit_git", {"tool_name": "Bash",
+                      "tool_input": {"command": "echo x > .git/hooks/pre-commit"}}),
+        ("unknown_tool", {"tool_name": "mcp__drive__upload_file", "tool_input": {"path": "x"}}),
+    )
+
+    def _run(self, data=None, mode=NO_FIELD, headless=False, raw=None, env_extra=None):
+        """Один вызов хука процессом → dict(rc, dec, reason, pushes, log, marker, stderr).
+        `env_extra` — переменные окружения ХУКА поверх снятых (Д2: тест-флаг как предмет проверки);
+        замок ниже не даёт им увести канал 1 или лог мимо файлов прогона."""
+        os.makedirs(self.RUNS, exist_ok=True)
+        d = tempfile.mkdtemp(prefix="run_", dir=self.RUNS)
+        marker = os.path.join(d, "pc_ask_9001.marker")
+        pushes = os.path.join(d, "pushes.txt")
+        logp = os.path.join(d, "guard.log")
+        env = dict(os.environ)
+        for k in g._TEST_RUN_ENVS + ("PRETOOL_ASK_MARKER", "PRETOOL_MARKER_TOKEN",
+                                     "PRETOOL_APPROVED_KINDS", "PRETOOL_APPROVED_OBJECT",
+                                     "PRETOOL_APPROVED_TASK"):
+            env.pop(k, None)
+        env.update({"PYTHONIOENCODING": "utf-8", "TURBOBABY_TEST_LOGS": "1",
+                    "PRETOOL_GUARD_LOG": logp, g.NOTIFY_COUNT_ENV: pushes,
+                    "PYTHONPATH": PROJ + os.pathsep + env.get("PYTHONPATH", "")})
+        if headless:
+            env.update({"PRETOOL_ASK_MARKER": marker, "PRETOOL_MARKER_TOKEN": "bypass-1210-run"})
+        env.update(env_extra or {})
+        # ЗАМОК ИЗОЛЯЦИИ (12.10, к Д2): что бы ни добавил вызывающий, пуш уходит в счётчик, а лог —
+        # в файл прогона; иначе процесс не запускается вовсе.
+        self.assertEqual((env.get(g.NOTIFY_COUNT_ENV), env.get("PRETOOL_GUARD_LOG")),
+                         (pushes, logp), "изоляция каналов владельца сломана — прогона нет")
+        if raw is None:
+            payload = dict(data, cwd=PROJ)
+            if mode is not self.NO_FIELD:
+                payload["permission_mode"] = mode
+            raw = json.dumps(payload, ensure_ascii=False)
+        p = subprocess.run([sys.executable, self.GUARD], input=raw, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", env=env, timeout=60)
+        dec, reason = None, None
+        out = (p.stdout or "").strip()
+        if out:
+            hso = json.loads(out.splitlines()[-1])["hookSpecificOutput"]
+            dec, reason = hso["permissionDecision"], hso["permissionDecisionReason"]
+        n_push = 0
+        if os.path.isfile(pushes):
+            with io.open(pushes, encoding="utf-8") as f:
+                n_push = len([x for x in f.read().splitlines() if x.strip()])
+        log = ""
+        if os.path.isfile(logp):
+            with io.open(logp, encoding="utf-8") as f:
+                log = f.read()
+        return {"rc": p.returncode, "dec": dec, "reason": reason, "pushes": n_push, "log": log,
+                "marker": os.path.isfile(marker), "stderr": p.stderr}
+
+    def _assert_unattended(self, r, kind, tool, ctl, mode_word="bypass"):
+        """Отказ «владельца нет»: deny, приписка, ДОСЛОВНАЯ карточка контроля, 0 пушей, метка.
+        Молчание (пустой вывод, `defer` в логе) называется своим именем, а не «не deny»: для
+        красной операции оно хуже вопроса — это исполнение без «да» (мутанты m7/m8 Д1, 12.10)."""
+        self.assertEqual(r["rc"], 0, r["stderr"])
+        self.assertNotEqual(r["dec"], "allow", "режим сессии стал разрешением")
+        self.assertIsNotNone(r["dec"], "МОЛЧАНИЕ в режиме %s: вид %s исполнился бы без вопроса и "
+                             "без отказа" % (mode_word, kind))
+        self.assertNotIn("| defer |", r["log"], "правило пропустило красную операцию молча")
+        self.assertEqual(r["dec"], "deny", r["reason"])
+        for part in ("БЕЗ ВОПРОСА", "сессия в режиме %s" % mode_word, "владелец не у экрана",
+                     "Операция НЕ выполнена", "ни переделанной формой",
+                     "ЖДЁТ ВЛАДЕЛЬЦА: <команда>, вид %s" % kind):
+            self.assertIn(part, r["reason"])
+        self.assertEqual(g.card_from_decision(r["reason"]), g.card_from_decision(ctl["reason"]),
+                         "в отказе нет ДОСЛОВНОЙ карточки, которая собиралась уйти")
+        self.assertEqual(r["pushes"], 0, "пуш владельцу при bypass — владелец спит")
+        self.assertFalse(r["marker"])
+        self.assertIn("| interactive | %s | %s | %s |" % (tool, g.DECISION_UNATTENDED, kind),
+                      r["log"])
+        self.assertNotIn("| ask |", r["log"])
+
+    # (а) bypass + каждый ask-вид → отказ
+    def test_bypass_turns_every_ask_kind_into_refusal(self):
+        for kind, data in self.ASK_INPUTS:
+            with self.subTest(kind=kind, tool=data["tool_name"]):
+                ctl = self._run(data)
+                self.assertEqual(ctl["dec"], "ask", "посылка: без поля режима вид %s спрашивает"
+                                 % kind)
+                self.assertEqual(ctl["pushes"], 1, "посылка: без bypass карточка пушится")
+                self.assertIn("| interactive | %s | ask | %s |" % (data["tool_name"], kind),
+                              ctl["log"])
+                r = self._run(data, mode=self.BYPASS)
+                self._assert_unattended(r, kind, data["tool_name"], ctl)
+
+    def test_dont_ask_mode_is_unattended_too(self):
+        """dontAsk по определению «всё, что потребовало бы вопроса, — отказ»: человека там не
+        ждут, поэтому вопрос тоже уходит отказом с текстом, а не пушем владельцу. С 12.10 (Д1) —
+        на КАЖДОМ входе `ASK_INPUTS`, а не на двух: исключение вида или инструмента из правила
+        обязано валить и этот режим, а не только bypass."""
+        for kind, data in self.ASK_INPUTS:
+            with self.subTest(kind=kind, tool=data["tool_name"]):
+                ctl = self._run(data)
+                self.assertEqual(ctl["dec"], "ask", "посылка: без поля режима вид %s спрашивает"
+                                 % kind)
+                r = self._run(data, mode="dontAsk")
+                self._assert_unattended(r, kind, data["tool_name"], ctl, mode_word="dontAsk")
+
+    def test_ask_inputs_cover_every_asking_kind_and_tool(self):
+        """СТОРОЖ ОТ ПРОТУХАНИЯ (Д1 review_escape, 12.10.2026). Имя
+        `test_bypass_turns_every_ask_kind_into_refusal` обещает «каждый вид», и держит обещание не
+        память, а сверка с ЗАКРЫТЫМ словарём гарда: новый вид в `_KIND_VOCAB` без входа здесь
+        валит класс, пока вход не добавлен. `unknown` исключён замером, а не словом: объект у него
+        пуст по построению, и `card_decision` отказывает на месте при любой команде — вопроса
+        этого вида не бывает, превращать в отказ нечего. Инструменты — все, которыми приходит ask:
+        правило, исключившее инструменты правки, проходило прежний класс целиком."""
+        kinds = {kind for kind, _ in self.ASK_INPUTS}
+        self.assertEqual(kinds, set(g._KIND_VOCAB) - {"unknown"},
+                         "вход на спрашивающий вид отсутствует (или вид снят со словаря)")
+        for raw in ("frobnicate --x", "", "rm suggest.py"):
+            with self.subTest(raw=raw):
+                self.assertEqual(g.card_decision("unknown", "", raw)[0], "deny",
+                                 "вид unknown начал спрашивать — ему нужен вход в ASK_INPUTS")
+        tools = {data["tool_name"] for _, data in self.ASK_INPUTS}
+        for tool in ("Bash", "PowerShell", "Write", "Edit", "MultiEdit", "NotebookEdit", "Read"):
+            with self.subTest(tool=tool):
+                self.assertIn(tool, tools)
+
+    # Д2 review_escape (12.10): тест-флаг в ОКРУЖЕНИИ хука — изоляция каналов, а не выход из правила
+    def test_test_run_flag_in_hook_env_does_not_reopen_question(self):
+        """Флаг тест-прогона (`_TEST_RUN_ENVS`) в окружении ХУКА глушит каналы владельца
+        (`isolated`), но решения не меняет: без поля режима это перехваченный ask, в bypass и
+        dontAsk — тот же отказ «владельца нет». Мутант «правило молчит при `is_test_run()`» вернул
+        бы вопрос на экран сессии, унаследовавшей флаг из тестового окружения, а прежний класс
+        гонял хук только со СНЯТЫМИ флагами и этого не видел. Флаг префиксом КОМАНДЫ — другой путь
+        (латч пробы), его держит `test_probe_in_bypass_is_refused_without_push`."""
+        for flag in g._TEST_RUN_ENVS:
+            with self.subTest(flag=flag):
+                ctl = self._run(self.KILL, env_extra={flag: "1"})
+                self.assertEqual(ctl["dec"], "ask",
+                                 "посылка: без поля режима флаг-прогон спрашивает")
+                self.assertIn("ПЕРЕХВАЧЕНО НА ГРАНИЦЕ", ctl["reason"])
+                self.assertEqual(ctl["pushes"], 0, "посылка: флаг гасит пуш изоляцией")
+                for mode, word in ((self.BYPASS, "bypass"), ("dontAsk", "dontAsk")):
+                    r = self._run(self.KILL, mode=mode, env_extra={flag: "1"})
+                    self.assertNotEqual(r["dec"], "ask", "тест-флаг вернул вопрос в режиме %s"
+                                        % word)
+                    self._assert_unattended(r, "kill", "Bash", ctl, mode_word=word)
+
+    def test_probe_in_bypass_is_refused_without_push(self):
+        """Обе ночные строки были ПРОБАМИ (скрипты из tmp/): перехват пробы — тоже ask, и в bypass
+        он тоже обязан стать отказом, а не вопросом на экране."""
+        data = {"tool_name": "Bash",
+                "tool_input": {"command": "PRETOOL_TEST_RUN=1 taskkill /PID 47121 /F"}}
+        ctl = self._run(data)
+        self.assertEqual(ctl["dec"], "ask")
+        self.assertIn("ПЕРЕХВАЧЕНО НА ГРАНИЦЕ", ctl["reason"])
+        self.assertEqual(ctl["pushes"], 0)
+        r = self._run(data, mode=self.BYPASS)
+        self._assert_unattended(r, "kill", "Bash", ctl)
+
+    def test_failsafe_input_in_bypass_stays_plain_refusal(self):
+        """FAIL-SAFE (`ask unknown ''` → пустой объект → deny) в bypass не меняется: отказ был и
+        остаётся, текст тот же, метка лога обычная `deny`. Вход-не-dict — тоже отказ, без падения."""
+        crooked = {"tool_name": "Bash", "tool_input": "кривой вход"}
+        ctl = self._run(crooked)
+        r = self._run(crooked, mode=self.BYPASS)
+        self.assertEqual(ctl["dec"], "deny")
+        self.assertEqual(r["dec"], "deny")
+        self.assertEqual(r["reason"], ctl["reason"])
+        self.assertIn("| interactive | Bash | deny | unknown |", r["log"])
+        self.assertNotIn(g.DECISION_UNATTENDED, r["log"])
+        for raw in ('["bypassPermissions"]', '"bypassPermissions"', "17"):
+            with self.subTest(raw=raw):
+                r = self._run(raw=raw)
+                self.assertEqual(r["rc"], 0, r["stderr"])
+                self.assertEqual(r["dec"], "deny")
+
+    def _main_inproc(self, data, patches):
+        """`main()` в процессе теста: решение (dec, reason), пуши, строки лога. Нужен для веток,
+        которых процессом не достать (запасной ask `card_decision`, журнальная ветка)."""
+        from unittest import mock
+        import contextlib
+        os.makedirs(self.RUNS, exist_ok=True)
+        d = tempfile.mkdtemp(prefix="inproc_", dir=self.RUNS)
+        logp = os.path.join(d, "guard.log")
+        pushed = []
+        out = io.StringIO()
+        env = {"PRETOOL_GUARD_LOG": logp, "PRETOOL_ASK_MARKER": "", "PRETOOL_MARKER_TOKEN": ""}
+        with contextlib.ExitStack() as st:
+            st.enter_context(mock.patch.dict(os.environ, env))
+            st.enter_context(mock.patch.object(g, "_push", lambda c, k="": pushed.append(k)))
+            for name, fn in patches.items():
+                st.enter_context(mock.patch.object(g, name, fn))
+            st.enter_context(mock.patch.object(sys, "stdin", io.StringIO(json.dumps(data))))
+            st.enter_context(contextlib.redirect_stdout(out))
+            self.addCleanup(g.set_probe, False)        # латч пробы — глобал модуля
+            with self.assertRaises(SystemExit) as ex:
+                g.main()
+        self.assertEqual(ex.exception.code, 0)
+        dec, reason = None, None
+        if out.getvalue().strip():
+            hso = json.loads(out.getvalue().strip().splitlines()[-1])["hookSpecificOutput"]
+            dec, reason = hso["permissionDecision"], hso["permissionDecisionReason"]
+        log = ""
+        if os.path.isfile(logp):
+            with io.open(logp, encoding="utf-8") as f:
+                log = f.read()
+        return dec, reason, pushed, log
+
+    def test_fallback_ask_of_card_decision_is_refused_in_bypass(self):
+        """Запасной ask `card_decision` (сбой ВНУТРИ разбора карточки → except → `_card`) — тоже
+        вопрос, и в bypass он обязан стать отказом. Сбой вызываем подменой `_card_blocked`."""
+        def boom(*_a, **_k):
+            raise RuntimeError("сбой разбора карточки (тест)")
+        data = dict(self.KILL, cwd=PROJ)
+        dec, reason, pushed, log = self._main_inproc(data, {"_card_blocked": boom})
+        self.assertEqual((dec, len(pushed)), ("ask", 1), "посылка: без поля — вопрос и пуш")
+        dec2, reason2, pushed2, log2 = self._main_inproc(dict(data, permission_mode=self.BYPASS),
+                                                         {"_card_blocked": boom})
+        self.assertEqual(dec2, "deny")
+        self.assertEqual(pushed2, [])
+        self.assertEqual(g.card_from_decision(reason2), g.card_from_decision(reason))
+        self.assertIn("| interactive | Bash | %s | kill |" % g.DECISION_UNATTENDED, log2)
+
+    # (б) прочие режимы, нет поля, мусор в поле → вопрос как раньше
+    def test_other_modes_and_garbage_still_ask(self):
+        for mode in (self.NO_FIELD, "default", "acceptEdits", "plan", "auto", "", None, 123,
+                     ["bypassPermissions"], {"mode": "bypassPermissions"}, "BypassPermissions",
+                     "bypassPermissions ", "dontask"):
+            with self.subTest(mode=mode if mode is not self.NO_FIELD else "<нет поля>"):
+                r = self._run(self.KILL, mode=mode)
+                self.assertEqual(r["rc"], 0, r["stderr"])
+                self.assertEqual(r["dec"], "ask", r["reason"])
+                self.assertNotIn("БЕЗ ВОПРОСА", r["reason"])
+                self.assertEqual(r["pushes"], 1, "без bypass вопрос пушится владельцу, как было")
+                self.assertIn("| interactive | Bash | ask | kill |", r["log"])
+                self.assertNotIn(g.DECISION_UNATTENDED, r["log"])
+
+    # (в) headless + bypass → прежний путь (маркер демону и вопрос), не отказ
+    def test_headless_bypass_keeps_marker_card(self):
+        base = self._run(self.KILL, headless=True)
+        r = self._run(self.KILL, mode=self.BYPASS, headless=True)
+        for x in (base, r):
+            self.assertEqual(x["dec"], "ask", x["reason"])
+            self.assertTrue(x["marker"], "headless обязан писать карточку в маркер демону")
+            self.assertEqual(x["pushes"], 1)
+            self.assertIn("| headless | Bash | ask | kill |", x["log"])
+            self.assertNotIn(g.DECISION_UNATTENDED, x["log"])
+        self.assertEqual(r["reason"], base["reason"])
+
+    # (г) defer / deny / journal в bypass не меняются
+    def test_defer_and_plain_deny_unchanged_in_bypass(self):
+        green = {"tool_name": "Bash", "tool_input": {"command": "git status"}}
+        r = self._run(green, mode=self.BYPASS)
+        self.assertEqual((r["rc"], r["dec"]), (0, None), "зелёное в bypass обязано молчать")
+        self.assertIn("| interactive | Bash | defer |", r["log"])
+        unnamed = {"tool_name": "Bash", "tool_input": {"command": "find . -name x | xargs rm"}}
+        ctl = self._run(unnamed)
+        r = self._run(unnamed, mode=self.BYPASS)
+        self.assertEqual((ctl["dec"], r["dec"]), ("deny", "deny"))
+        self.assertEqual(r["reason"], ctl["reason"], "обычный отказ в bypass переписан")
+        self.assertIn("| interactive | Bash | deny | delete |", r["log"])
+        self.assertNotIn(g.DECISION_UNATTENDED, r["log"])
+        self.assertEqual(r["pushes"], 0)
+
+    def test_journal_branch_unchanged_in_bypass(self):
+        """Журнальная ветка мертва (`card_gate` безусловна), но правило её не трогает: оживи её —
+        в bypass она по-прежнему молчит строкой лога, а не превращается в отказ."""
+        data = dict(self.KILL, cwd=PROJ, permission_mode=self.BYPASS)
+        dec, reason, pushed, log = self._main_inproc(data, {"card_gate": lambda *a, **k: False})
+        self.assertEqual((dec, pushed), (None, []))
+        self.assertIn("| interactive | Bash | journal | kill |", log)
+
+    # (д) пуш: bypass — ни одного, default — как раньше
+    def test_push_only_when_owner_can_answer(self):
+        self.assertEqual(self._run(self.KILL, mode="default")["pushes"], 1)
+        self.assertEqual(self._run(self.KILL, mode=self.BYPASS)["pushes"], 0)
+
+    # (е) строка лога: своя метка, читатель лога её не путает с ask, боевой лог не тронут
+    def test_log_label_is_distinct_and_consumer_safe(self):
+        r = self._run(self.KILL, mode=self.BYPASS)
+        lines = [ln for ln in r["log"].splitlines() if g.DECISION_UNATTENDED in ln]
+        self.assertEqual(len(lines), 1, r["log"])
+        self.assertTrue(lines[0].endswith("| interactive | Bash | deny_unattended | kill | "
+                                          "taskkill /PID 47121 /F"), lines[0])
+        self.assertNotIn("| deny |", lines[0], "точный счёт обычных отказов смешался бы с этим")
+        import shum_opis_pc
+        m = shum_opis_pc._RE_GUARD.match(lines[0])
+        self.assertIsNotNone(m, "опись шума не разбирает строку")
+        self.assertEqual(m.group(4), g.DECISION_UNATTENDED)
+        self.assertEqual(shum_opis_pc.parse_guard_asks(lines), [], "опись приняла отказ за ask")
+        live = os.path.join(PROJ, "pretool_guard.log")
+        if os.path.isfile(live):
+            with io.open(live, encoding="utf-8", errors="replace") as f:
+                self.assertNotIn("deny_unattended | kill | taskkill /PID 47121", f.read(),
+                                 "фикстура теста осела в БОЕВОМ pretool_guard.log")
+
+    # чистая функция: без исключений на любом входе, роль решает
+    def test_owner_away_is_total_and_role_bound(self):
+        for data in (None, [], "bypassPermissions", 17, {}, {"permission_mode": None},
+                     {"permission_mode": ["bypassPermissions"]}, {"permission_mode": {"a": 1}},
+                     {"permission_mode": "auto"}, {"permission_mode": "default"}):
+            with self.subTest(data=data):
+                self.assertFalse(g.owner_away(data, False))
+        for mode in g.UNATTENDED_MODES:
+            self.assertTrue(g.owner_away({"permission_mode": mode}, False))
+            self.assertFalse(g.owner_away({"permission_mode": mode}, True), "headless не трогаем")
+        self.assertEqual(set(g.UNATTENDED_MODES), {"bypassPermissions", "dontAsk"})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
@@ -5407,6 +5815,16 @@ class TestTrustedRootsAndNetRead(unittest.TestCase):
     # ── (в) ЗАПИСЬ: C:\Users сознательно НЕ доверен — там ключи и креды ───────────────────────
     def test_users_root_still_asks(self):
         self.assertEqual(g.decide(self._w(r"C:\Users\mxfill1\x.txt"))[:2], ("ask", "write_outside"))
+
+    # ── (в2) ЗАПИСЬ: из C:\Users доверена ровно папка результатов аудита T27 (09.10.2026) ─────
+    def test_audit_outputs_root_is_silent_and_narrow(self):
+        root = r"C:\Users\mxfill1\Documents\Codex\2026-10-07\t27-migration-review\outputs"
+        self.assertEqual(g.decide(self._w(root + r"\owner-audit\pass-2\OWNER-REPORT.txt"))[0], "defer")
+        for p in (r"C:\Users\mxfill1\Documents\Codex\x.txt",
+                  r"C:\Users\mxfill1\Documents\Codex\2026-10-07\t27-migration-review\x.txt",
+                  root + r"2\x.txt"):
+            self.assertEqual(g.decide(self._w(p))[:2], ("ask", "write_outside"), p)
+        self.assertEqual(g.decide(self._w(root + r"\.env", "TOKEN=1"))[0], "ask")
 
     # ── (г) ЗАПИСЬ: секрет ВНУТРИ доверенного корня спрашивает как спрашивал ──────────────────
     def test_secret_inside_trusted_root_still_asks(self):
