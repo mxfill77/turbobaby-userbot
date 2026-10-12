@@ -14363,10 +14363,11 @@ class TestTgFeedPush(unittest.TestCase):
         self.assertEqual(log.error.call_count, 1)
 
     def test_poll_once_order_and_no_import(self):
+        # 13.10.2026 (b5_tglag): в обороте стоит не сам пушер, а проверка его часов (`_tg_push_clock`)
         src = inspect.getsource(o.poll_once)
         body = [ln.strip() for ln in src.splitlines() if ln.strip() and not ln.strip().startswith("#")]
         self.assertEqual(body[-1], "_write_heartbeat()")
-        self.assertLess(src.index("_tg_feed_push()"), src.index('_queue_snapshot("poll")'))
+        self.assertLess(src.index("_tg_push_clock()"), src.index('_queue_snapshot("poll")'))
         with open(o.__file__, encoding="utf-8") as f:
             text = f.read()
         self.assertNotIn("import tg_feed_push", text)
@@ -14413,13 +14414,363 @@ class TestTgFeedPush(unittest.TestCase):
                 if isinstance(node, ast.Constant) and node.value == "TG_FEED_PUSH":
                     owners.add(getattr(top, "name", "<модуль>"))
         self.assertEqual(owners, {"_tg_feed_push"})
+        # 13.10.2026 (b5_tglag): пушер зовут ЧАСЫ (`_tg_push_step`, через `push or _tg_feed_push`) и
+        # запасной путь витка (`_tg_push_clock`); poll_once зовёт только `_tg_push_clock()` без
+        # аргументов, сам пушер — ни разу. Все прямые вызовы пушера — без аргументов.
         poll = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "poll_once"][0]
-        calls = [n for n in ast.walk(poll) if isinstance(n, ast.Call)
-                 and isinstance(n.func, ast.Name) and n.func.id == "_tg_feed_push"]
-        self.assertEqual([(c.args, c.keywords) for c in calls], [([], [])])
-        self.assertEqual([n.attr for n in ast.walk(poll)
-                          if isinstance(n, ast.Attribute) and n.attr in ("environ", "putenv")], [],
-                         "poll_once трогает окружение")
+
+        def calls_of(node, name):
+            return [n for n in ast.walk(node) if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name) and n.func.id == name]
+
+        self.assertEqual(calls_of(poll, "_tg_feed_push"), [])
+        self.assertEqual([(c.args, c.keywords) for c in calls_of(poll, "_tg_push_clock")], [([], [])])
+        users = set()
+        for top in tree.body:
+            if isinstance(top, ast.FunctionDef) and top.name != "_tg_feed_push":
+                if any(isinstance(n, ast.Name) and n.id == "_tg_feed_push" for n in ast.walk(top)):
+                    users.add(top.name)
+                for c in calls_of(top, "_tg_feed_push"):
+                    self.assertEqual((c.args, c.keywords), ([], []), top.name)
+        self.assertEqual(users, {"_tg_push_step", "_tg_push_clock"})
+        clock = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in
+                 ("poll_once", "_tg_push_clock", "_tg_push_step", "_tg_push_loop", "_tg_push_start")]
+        self.assertEqual(len(clock), 5)
+        for fn in clock:
+            self.assertEqual([n.attr for n in ast.walk(fn)
+                              if isinstance(n, ast.Attribute) and n.attr in ("environ", "putenv")], [],
+                             "%s трогает окружение" % fn.name)
+
+
+class _FakeTgPush:
+    """Подделка `_tg_feed_push`: настоящего спавна нет. Пишет время и поток каждого вызова, держит
+    задержку и считает, сколько заходов шло ОДНОВРЕМЕННО (перекрытие в процессе — дефект)."""
+
+    def __init__(self, rcs=(), said=(), delay=0.0):
+        import time as _t
+        self._t = _t
+        self.rcs, self.said, self.delay = list(rcs), list(said), delay
+        self.calls = []
+        self.active = self.max_active = 0
+        self._lock = threading.Lock()
+
+    def __call__(self):
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.calls.append((self._t.perf_counter(), threading.current_thread().name))
+        try:
+            if self.delay:
+                self._t.sleep(self.delay)
+            o._TG_CLOCK["said"] = self.said.pop(0) if self.said else 0
+            return self.rcs.pop(0) if self.rcs else 0
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
+class TestTgPushClock(unittest.TestCase):
+    """Часы пушера ленты Telegram (13.10.2026, b5_tglag): пушер зовёт СВОЙ поток демона, а не виток —
+    TG-ряд не ждёт ни задачи (TASK_TIMEOUT 2700 с), ни залипшего моста (живой замер 08.10–13.10:
+    428 витков ≥ 300 с, max 2441 с). Настоящего спавна нет ни в одном тесте: пушер подменён везде;
+    потоки идут на своём стоп-событии и снимаются в cleanup."""
+
+    def setUp(self):
+        fresh = {"thread": None, "stat": None, "at": None, "again": False, "said": 0, "err": None}
+        for p in (mock.patch.dict(o._TG_CLOCK, fresh, clear=True),
+                  mock.patch.object(o, "_TG_CLOCK_STOP", threading.Event()),
+                  mock.patch.object(o, "_stopped", lambda: False),
+                  mock.patch.dict(os.environ, {k: v for k, v in os.environ.items()
+                                               if k not in ("PC_TG_PUSH_EVERY", "TG_FEED_PUSH")},
+                                  clear=True)):
+            p.start()
+            self.addCleanup(p.stop)
+        self.threads = []
+        self.addCleanup(self._halt)           # LIFO: снимается ПЕРВЫМ, пока подмены ещё стоят
+
+    def _halt(self):
+        o._TG_CLOCK_STOP.set()
+        for th in self.threads:
+            th.join(5)
+            self.assertFalse(th.is_alive(), "поток часов не остановился")
+
+    def _start(self, every):
+        th = o._tg_push_start(every)
+        self.threads.append(th)
+        return th
+
+    def _wait(self, cond, limit=3.0):
+        import time as _t
+        end = _t.monotonic() + limit
+        while not cond():
+            self.assertLess(_t.monotonic(), end, "не дождались")
+            _t.sleep(0.01)
+
+    def _quiet_turn(self, **real):
+        """Все вызовы оборота — пустышки, кроме `_tg_push_clock` и названных в `real`."""
+        import ast
+        tree = ast.parse(inspect.getsource(o.poll_once))
+        names = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        self.assertIn("_tg_push_clock", names)
+        names.discard("_tg_push_clock")
+        for nm in sorted(names):
+            p = mock.patch.object(o, nm, real.get(nm, lambda *a, **k: None))
+            p.start()
+            self.addCleanup(p.stop)
+
+    # ── правило «пора ли» и шаг ──────────────────────────────────────────────────────────────
+    def test_due_golden(self):
+        self.assertTrue(o.tg_push_due({"at": None}, None, 0.0, idle=60))
+        mem = {"at": 100.0, "stat": (10, 1), "again": False}
+        self.assertFalse(o.tg_push_due(mem, (10, 1), 159.9, idle=60))
+        self.assertTrue(o.tg_push_due(mem, (10, 1), 160.0, idle=60))
+        self.assertTrue(o.tg_push_due(mem, (11, 2), 100.1, idle=60), "лента сменилась")
+        self.assertTrue(o.tg_push_due(mem, None, 100.1, idle=60), "ленту убрали — тоже смена")
+        self.assertTrue(o.tg_push_due(dict(mem, again=True), (10, 1), 100.1, idle=60))
+
+    def test_step_sequence_change_retry_idle_silence(self):
+        push = _FakeTgPush(rcs=[0, 1, 0, 0, 0, 2], said=[0, 1, 0, 1, 0, 0])
+        steps = [(0, None, True),        # первый шаг процесса
+                 (5, None, False),       # ленты нет и не было — молчим до паузы
+                 (10, (5, 1), True),     # ряд лёг → заход; неудача (код 1, строка)
+                 (15, (5, 1), True),     # сразу ещё раз (пушер сам держит паузу повтора)
+                 (20, (5, 1), False),    # тихий заход — ждём перемены или паузы
+                 (75, (5, 1), True),     # пауза 60 с с прошлого захода (15 → 75)
+                 (80, (5, 1), True),     # прошлый ГОВОРИЛ (отправил) — сразу ещё раз
+                 (85, (5, 1), False),
+                 (90, (9, 2), True),     # новый ряд → заход; стоп молча (код 2) — не долбим
+                 (95, (9, 2), False)]
+        for now, stat, want in steps:
+            with self.subTest(now=now):
+                self.assertEqual(o._tg_push_step(push=push, stat_fn=lambda s=stat: s, now=now), want)
+        self.assertEqual(len(push.calls), 6)
+
+    def test_busy_code_3_is_retried_at_once(self):
+        push = _FakeTgPush(rcs=[3, 0])
+        self.assertTrue(o._tg_push_step(push=push, stat_fn=lambda: (1, 1), now=0))
+        self.assertTrue(o._tg_push_step(push=push, stat_fn=lambda: (1, 1), now=5))
+        self.assertFalse(o._tg_push_step(push=push, stat_fn=lambda: (1, 1), now=10))
+
+    def test_pusher_counts_its_spoken_lines(self):
+        out = "TG-ПУШЕР: отправлено 3 рядов\n\n!! TG-ПУШЕР: СТОП — x\n"
+        runner = mock.Mock(return_value=types.SimpleNamespace(returncode=0, stdout=out, stderr=""))
+        with mock.patch.dict(os.environ, {"TG_FEED_PUSH": "1"}), mock.patch.object(o, "log"):
+            self.assertEqual(o._tg_feed_push(runner=runner), 0)
+        self.assertEqual(o._TG_CLOCK["said"], 2)
+
+    def test_knob(self):
+        for raw, want in ((None, 5.0), ("", 5.0), ("  ", 5.0), ("0", 0.0), ("-3", 0.0), ("abc", 0.0),
+                          ("nan", 0.0), ("0.2", 1.0), ("7", 7.0), (" 2.5 ", 2.5)):
+            with self.subTest(raw=raw):
+                env = {} if raw is None else {"PC_TG_PUSH_EVERY": raw}
+                with mock.patch.dict(os.environ, env):
+                    self.assertEqual(o._tg_push_every(), want)
+
+    def test_feed_path_is_the_feed_of_tg_feed(self):
+        import tg_feed                      # тестовому процессу можно; демон пушер не импортирует
+        norm = lambda p: os.path.normcase(os.path.normpath(p))   # noqa: E731
+        self.assertEqual(norm(o.TG_FEED_FILE), norm(tg_feed.FEED_FILE))
+
+    def test_stat_of_missing_and_present_file(self):
+        d = tempfile.mkdtemp(prefix="turbobaby_TESTING_tgclock_")
+        p = os.path.join(d, "feed.jsonl")
+        self.assertIsNone(o._tg_feed_stat(p))
+        with open(p, "wb") as f:
+            f.write(b'{"a":1}\n')
+        a = o._tg_feed_stat(p)
+        with open(p, "ab") as f:
+            f.write(b'{"a":2}\n')
+        self.assertNotEqual(o._tg_feed_stat(p), a, "дописанный ряд обязан сменить отпечаток")
+
+    # ── подъём часов из оборота ──────────────────────────────────────────────────────────────
+    def test_under_unittest_no_thread_no_spawn(self):
+        push = _FakeTgPush()
+        with mock.patch.object(o, "_tg_feed_push", push):
+            self.assertEqual(o._tg_push_clock(), "test")
+        self.assertEqual(push.calls, [])
+        self.assertIsNone(o._TG_CLOCK["thread"])
+
+    def test_rollback_zero_calls_pusher_from_the_turn(self):
+        push, starter = _FakeTgPush(), mock.Mock()
+        with mock.patch.dict(os.environ, {"PC_TG_PUSH_EVERY": "0"}), \
+                mock.patch.object(o, "_tg_feed_push", push):
+            self.assertEqual(o._tg_push_clock(starter=starter), "turn")
+        starter.assert_not_called()
+        self.assertEqual([c[1] for c in push.calls], [threading.current_thread().name])
+
+    def test_start_failure_falls_back_to_the_turn(self):
+        push = _FakeTgPush()
+        starter = mock.Mock(side_effect=RuntimeError("can't start new thread"))
+        with mock.patch.object(o, "_tg_feed_push", push), mock.patch.object(o, "log") as log:
+            self.assertEqual(o._tg_push_clock(starter=starter), "turn")
+        self.assertEqual(len(push.calls), 1)
+        self.assertEqual(log.warning.call_count, 1)
+
+    def test_start_only_never_pushes_from_the_start(self):
+        """Подъём на старте процесса (`_main_loop`) пушер из витка не зовёт ни на откате, ни при
+        несостоявшемся потоке — это сделает сам виток на прежнем месте."""
+        push = _FakeTgPush()
+        with mock.patch.object(o, "_tg_feed_push", push), mock.patch.object(o, "log"):
+            with mock.patch.dict(os.environ, {"PC_TG_PUSH_EVERY": "0"}):
+                self.assertEqual(o._tg_push_clock(starter=mock.Mock(), start_only=True), "turn")
+            bad = mock.Mock(side_effect=RuntimeError("can't start new thread"))
+            self.assertEqual(o._tg_push_clock(starter=bad, start_only=True), "turn")
+        self.assertEqual(push.calls, [])
+
+    def test_main_loop_raises_the_clock_before_the_first_turn(self):
+        """Первый виток после эстафеты self-update может встать на задачу до TASK_TIMEOUT: часы
+        обязаны идти ДО него, а не с конца первого витка (замер стенда: без этой строки ряд,
+        легший во время первой задачи, ждал её конца)."""
+        with open(o.__file__, encoding="utf-8") as f:
+            body = f.read().split("def _main_loop", 1)[1]
+        i_stop = body.index("рубильник pc_orchestrator.stop активен")
+        i_clock = body.index("_tg_push_clock(start_only=True)")
+        i_loop = body.index("while not _stopped()")
+        self.assertLess(i_stop, i_clock, "часы поднимаются и при взведённом рубильнике")
+        self.assertLess(i_clock, i_loop, "часы поднимаются только после первого витка")
+        self.assertEqual(body[:i_loop].count("_tg_push_clock("), 1)
+
+    def test_dead_thread_is_raised_again_once(self):
+        alive = types.SimpleNamespace(is_alive=lambda: True)
+        starter = mock.Mock(return_value=alive)
+        o._TG_CLOCK["thread"] = types.SimpleNamespace(is_alive=lambda: False)
+        with mock.patch.object(o, "log") as log:
+            self.assertEqual(o._tg_push_clock(starter=starter), "clock")
+            self.assertEqual(o._tg_push_clock(starter=starter), "clock")
+        starter.assert_called_once_with(o.TG_PUSH_EVERY)
+        self.assertEqual(log.error.call_count, 1)
+        self.assertIs(o._TG_CLOCK["thread"], alive)
+
+    def test_raised_line_names_the_pusher_switch(self):
+        """Строка «TG-ЧАСЫ: подняты» несёт состояние TG_FEED_PUSH: часы тикают и при выключенном пушере,
+        и «подняты» без него читалось бы как «ряды едут» (замечание проверяющего b5)."""
+        for raw, word in (("1", "пушер вкл (TG_FEED_PUSH=1)"), (None, "пушер ВЫКЛ (TG_FEED_PUSH≠1"),
+                          ("0", "пушер ВЫКЛ (TG_FEED_PUSH≠1"), (" 1 ", "пушер вкл (TG_FEED_PUSH=1)")):
+            with self.subTest(raw=raw):
+                for k in ("thread", "at", "stat", "switch", "up_line"):
+                    o._TG_CLOCK.pop(k, None)
+                o._TG_CLOCK["at"] = None
+                starter = mock.Mock(return_value=types.SimpleNamespace(is_alive=lambda: True))
+                env = {} if raw is None else {"TG_FEED_PUSH": raw}
+                with mock.patch.dict(os.environ, env), mock.patch.object(o, "log") as log:
+                    self.assertEqual(o._tg_push_clock(starter=starter), "clock")
+                    self.assertEqual(log.info.call_count, 0, "строку говорит первый шаг, не подъём")
+                    # настоящий пушер: под unittest без runner не спавнит, но состояние выключателя кладёт
+                    self.assertTrue(o._tg_push_step(stat_fn=lambda: (1, 1), now=0))
+                    self.assertTrue(o._tg_push_step(stat_fn=lambda: (2, 2), now=1))
+                lines = [c[0][0] % c[0][1:] for c in log.info.call_args_list]
+                up = [ln for ln in lines if ln.startswith("TG-ЧАСЫ: подняты")]
+                self.assertEqual(len(up), 1, lines)
+                self.assertIn(word, up[0])
+
+    def test_feed_stat_is_taken_before_the_pusher_runs(self):
+        """Отпечаток ленты снимается ДО захода пушера: ряд, легший ВО ВРЕМЯ захода, меняет отпечаток, и
+        следующий шаг его увозит. Снимай часы отпечаток ПОСЛЕ захода — такой ряд ждал бы паузы TG_PUSH_IDLE."""
+        order, feed = [], {"stat": (10, 1)}
+
+        def stat_fn():
+            order.append(("stat", feed["stat"]))
+            return feed["stat"]
+
+        def push():
+            order.append(("push", None))
+            feed["stat"] = (20, 2)          # ряд лёг посреди захода
+            return 0
+        self.assertTrue(o._tg_push_step(push=push, stat_fn=stat_fn, now=0))
+        self.assertEqual(order, [("stat", (10, 1)), ("push", None)], "отпечаток снят после захода")
+        self.assertEqual(o._TG_CLOCK["stat"], (10, 1), "запомнен отпечаток ДО захода")
+        self.assertTrue(o._tg_push_step(push=push, stat_fn=stat_fn, now=1),
+                        "ряд, легший во время захода, не увезён следующим шагом")
+        self.assertEqual([k for k, _ in order], ["stat", "push", "stat", "push"])
+
+    def test_thread_is_a_named_daemon(self):
+        push = _FakeTgPush()
+        with mock.patch.object(o, "_tg_feed_push", push), mock.patch.object(o, "_tg_feed_stat", lambda: None):
+            th = self._start(30.0)
+            self._wait(lambda: push.calls)
+            self._halt()
+        self.assertTrue(th.daemon, "поток часов не смеет держать выход демона (эстафета self-update)")
+        self.assertEqual(th.name, "tg-push-clock")
+        self.assertEqual(push.calls[0][1], "tg-push-clock")
+
+    # ── главное: оборот не ждёт пушер, а пушер не ждёт оборот ────────────────────────────────
+    def test_pusher_does_not_block_the_turn(self):
+        import time as _t
+        push = _FakeTgPush(delay=1.5)
+        self._quiet_turn()
+        with mock.patch.object(o, "_tg_feed_push", push), mock.patch.object(o, "_tg_feed_stat", lambda: None):
+            self.assertEqual(o._tg_push_clock(starter=lambda every: self._start(0.05)), "clock")
+            self._wait(lambda: push.active == 1)          # заход часов идёт прямо сейчас
+            t0 = _t.perf_counter()
+            o.poll_once()
+            dt = _t.perf_counter() - t0
+            self._halt()                                  # часы снимаются, пока подмены стоят
+        self.assertLess(dt, 0.75, "оборот ждал пушер (%.2fс)" % dt)
+        self.assertEqual({c[1] for c in push.calls}, {"tg-push-clock"})
+        self.assertEqual(push.max_active, 1, "заходы пушера перекрылись внутри процесса")
+
+    def test_control_rollback_turn_waits_for_the_pusher(self):
+        """КОНТРОЛЬ МЕРКИ: та же мерка на откате (PC_TG_PUSH_EVERY=0) обязана увидеть ожидание —
+        иначе зелёный тест выше ничего не доказывал бы."""
+        import time as _t
+        push = _FakeTgPush(delay=0.4)
+        self._quiet_turn()
+        with mock.patch.dict(os.environ, {"PC_TG_PUSH_EVERY": "0"}), \
+                mock.patch.object(o, "_tg_feed_push", push):
+            t0 = _t.perf_counter()
+            o.poll_once()
+            dt = _t.perf_counter() - t0
+        self.assertGreaterEqual(dt, 0.3, "мерка не видит ожидания пушера в витке (%.3fс)" % dt)
+        self.assertEqual([c[1] for c in push.calls], [threading.current_thread().name])
+
+    def test_row_during_a_long_task_leaves_before_the_turn_ends(self):
+        """Задача держит виток (здесь 1.5 с вместо 2700), ряд клиента ложится посреди неё: часы
+        увозят его через ≤ шаг, а не после конца витка."""
+        import time as _t
+        push = _FakeTgPush()
+        row = {"t": None}
+
+        def long_task():
+            _t.sleep(0.2)
+            row["t"] = _t.perf_counter()
+            _t.sleep(1.3)
+
+        self._quiet_turn(process_new=long_task)
+        with mock.patch.object(o, "_tg_feed_push", push), \
+                mock.patch.object(o, "_tg_feed_stat", lambda: (1, 1) if row["t"] is not None else None):
+            o._tg_push_clock(starter=lambda every: self._start(0.05))
+            self._wait(lambda: push.calls)                # первый шаг процесса
+            o.poll_once()
+            t_end = _t.perf_counter()
+            self._halt()
+        after =[t for t, _ in push.calls if t >= row["t"]]
+        self.assertTrue(after, "ряд не увезён вовсе")
+        self.assertLess(after[0], t_end, "ряд ждал конца витка")
+        self.assertLess(after[0] - row["t"], 0.5)
+
+    # ── часы не умирают и слушают стоп-флаг ──────────────────────────────────────────────────
+    def test_loop_survives_a_failing_step_and_says_it_once(self):
+        n = {"k": 0}
+
+        def bad_step():
+            n["k"] += 1
+            if n["k"] >= 5:
+                o._TG_CLOCK_STOP.set()
+            raise ValueError("сломано")
+
+        with mock.patch.object(o, "log") as log:
+            o._tg_push_loop(0.001, step=bad_step)
+        self.assertEqual(n["k"], 5)
+        self.assertEqual(log.warning.call_count, 1)
+
+    def test_stop_flag_silences_the_steps(self):
+        step = mock.Mock()
+        timer = threading.Timer(0.2, o._TG_CLOCK_STOP.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        with mock.patch.object(o, "_stopped", lambda: True):
+            o._tg_push_loop(0.01, step=step)
+        step.assert_not_called()
 
 
 if __name__ == "__main__":

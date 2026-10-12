@@ -15,7 +15,10 @@ import io
 import json
 import os
 import socket
+import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -471,6 +474,59 @@ class TestRestartAndFile(_Base):
         finally:
             P.drop_lock(fd)
         self.assertEqual(self.tick(Door()), P.RC_OK)
+
+
+class TestLockOverlap(_Base):
+    """Второй заход при живом замке не шлёт НИЧЕГО (13.10.2026, b5_tglag). С 13.10 пушер зовут часы
+    демона — свой поток раз в несколько секунд; в процессе заходы не перекрываются по построению, а
+    между процессами (эстафета self-update: старый демон ещё доводит заход, новый уже зовёт; ручной
+    `--tick`) держит только этот замок."""
+
+    def test_second_tick_while_the_first_is_in_flight_sends_nothing(self):
+        self.write_feed(mk_row(1, 1), mk_row(1, 2))
+        door, entered, release, res = Door(), threading.Event(), threading.Event(), {}
+
+        def slow(url, body, headers, timeout):
+            entered.set()
+            release.wait(5)
+            return door(url, body, headers, timeout)
+
+        th = threading.Thread(target=lambda: res.setdefault("rc", self.tick(slow)))
+        th.start()
+        try:
+            self.assertTrue(entered.wait(5), "первый заход не дошёл до двери")
+            second = Door()
+            self.assertEqual(self.tick(second), P.RC_BUSY)
+            self.assertEqual(second.calls, [])
+        finally:
+            release.set()
+            th.join(5)
+        self.assertEqual(res.get("rc"), P.RC_OK)
+        self.assertEqual(len(door.calls), 1)
+        self.assertEqual(self.state()["count"], 2)
+        third = Door()
+        self.assertEqual(self.tick(third), P.RC_OK)
+        self.assertEqual(third.calls, [], "увезённое не уходит второй раз")
+
+    def test_lock_of_another_process_means_busy_and_dies_with_it(self):
+        self.write_feed(mk_row(2, 1))
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); import tg_feed_push as P; "
+                "fd = P.take_lock(sys.argv[2]); print('held' if fd is not None else 'busy', flush=True); "
+                "sys.stdin.read()")
+        child = subprocess.Popen([sys.executable, "-I", "-c", code, ROOT, self.lock],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "held")
+            door = Door()
+            self.assertEqual(self.tick(door), P.RC_BUSY)
+            self.assertEqual(door.calls, [])
+        finally:
+            child.stdin.close()
+            child.wait(10)
+            child.stdout.close()
+        door = Door()
+        self.assertEqual(self.tick(door), P.RC_OK, "замок умершего процесса держит ленту")
+        self.assertEqual(len(door.calls), 1)
 
 
 class TestBatchLimits(_Base):

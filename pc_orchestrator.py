@@ -1284,8 +1284,16 @@ def _tg_feed_push(runner=None):
 
     ИМПОРТА НЕТ СОЗНАТЕЛЬНО (как у `chatlog_ingest`): спавн не заводит ребра в графе, клиентское
     замыкание не растёт. Под юнит-тестами без подменённого runner не спавнит вовсе — гейт не должен
-    стать отправителем. ОТКАТ: убрать `TG_FEED_PUSH=1` — ветка мертва целиком."""
-    if str(os.getenv("TG_FEED_PUSH", "") or "").strip() != "1":
+    стать отправителем. ОТКАТ: убрать `TG_FEED_PUSH=1` — ветка мертва целиком.
+
+    С 13.10.2026 ЗОВЁТСЯ ИЗ ЧАСОВ ПУШЕРА (свой поток демона, `_tg_push_clock`), а не из витка: виток
+    стоит на задаче до TASK_TIMEOUT и на залипшем мосте — и TG-ряд ждал вместе с ним. Тело не
+    менялось; добавлен только счёт сказанных строк — по нему часы решают, звать ли сразу ещё раз.
+    И запись состояния выключателя в `_TG_CLOCK["switch"]` — для строки «TG-ЧАСЫ: подняты» (сам
+    выключатель по-прежнему читает только эта функция)."""
+    on = str(os.getenv("TG_FEED_PUSH", "") or "").strip() == "1"
+    _TG_CLOCK["switch"] = on
+    if not on:
         return None
     if runner is None and "unittest" in sys.modules:
         return None
@@ -1301,12 +1309,159 @@ def _tg_feed_push(runner=None):
     except Exception as e:
         log.warning("TG-ПУШЕР: не запущен: %s", e)
         return None
+    said = 0
     for line in (p.stdout or "").splitlines():
         if line.strip():
+            said += 1
             (log.error if line.startswith("!!") else log.info)("%s", line.strip())
+    _TG_CLOCK["said"] = said
     if p.returncode not in (0, 1, 2, 3):
         log.error("TG-ПУШЕР: код %s · %s", p.returncode, " ".join((p.stderr or "").split())[-300:])
     return p.returncode
+
+
+# ─── ЧАСЫ ПУШЕРА ЛЕНТЫ Telegram: свой поток, а не виток (13.10.2026, b5_tglag) ───────────────────
+# ЗАЧЕМ. До 13.10 пушер звался ОДИН раз за виток, в хвосте `poll_once`. А виток стои́т: задачу демон
+# исполняет синхронно (TASK_TIMEOUT 2700 с, две попытки), и даже без задач его держит залипший мост —
+# замер живого pc_orchestrator.log 08.10 07:06 → 13.10 00:13: 428 витков ≥ 300 с, все с именем
+# «залипание вызова моста», медиана 461 с · p90 937 · p99 1582 · max 2441 с. Ряд клиента Telegram
+# ждал этот виток целиком, а WhatsApp доезжает за секунды.
+# УСТРОЙСТВО. Поток-демон (`daemon=True`) раз в TG_PUSH_EVERY с меряет ленту одним os.stat и зовёт
+# тот же `_tg_feed_push` (тот же процесс, тот же таймаут 20 с, тот же выключатель TG_FEED_PUSH=1, те
+# же строки в журнал), когда: лента сменилась; прошлый заход говорил или упёрся (код 1/3) — тогда
+# сразу ещё раз; либо прошло TG_PUSH_IDLE с прошлого захода (пауза повтора пушера, снятый человеком
+# стоп, напоминание о стопе). Спавнов без перемены ленты — не чаще прежнего (раз в POLL_SEC).
+# Поднимается в `_main_loop` ДО первого витка (первый виток после эстафеты может стоять на задаче);
+# оборот лишь спрашивает, жив ли поток, и поднимает упавший.
+# ЗАМКИ. Перекрытия заходов нет: в процессе пушер зовёт ТОЛЬКО поток; вызов из витка остался
+# запасным путём, когда потока нет. Между процессами (эстафета self-update, ручной `--tick`) держит
+# замок ОС в самом пушере (`tg_feed_push.lock`, код 3 «занято»). Выход демона поток не держит;
+# прерванный заход по контракту пушера безвреден — курсор двигает только ответ сервера.
+# Под юнит-тестами поток не поднимается (гейт не отправитель); стоп-флаг демона глушит шаги.
+# ОТКАТ: `PC_TG_PUSH_EVERY=0` в окружении демона — потока нет, пушер снова зовётся из витка.
+TG_PUSH_EVERY = 5.0            # с, шаг часов: ПК-доля задержки TG-ряда при живой ленте
+TG_PUSH_EVERY_MIN = 1.0        # с, меньше не даём: горячего цикла из ручки не будет
+TG_PUSH_IDLE = float(max(POLL_SEC, 5))   # с, заход без перемены ленты — не чаще прежнего витка
+TG_FEED_FILE = os.path.join(REPO, "tg_feed", "tg_feed.jsonl")   # = tg_feed.FEED_FILE (сверяет тест)
+_TG_CLOCK = {"thread": None, "stat": None, "at": None, "again": False, "said": 0, "err": None}
+_TG_CLOCK_STOP = threading.Event()
+
+
+def _tg_push_every():
+    """Шаг часов из `PC_TG_PUSH_EVERY` → секунды; 0 — часы выключены (прежний вызов из витка).
+    Пусто — умолчание. Мусор — 0: непонятная настройка не смеет включать новое устройство."""
+    raw = str(os.getenv("PC_TG_PUSH_EVERY", "") or "").strip()
+    if not raw:
+        return TG_PUSH_EVERY
+    try:
+        v = float(raw)
+    except ValueError:
+        return 0.0
+    if v != v or v <= 0:                     # NaN и ноль/минус — выключено
+        return 0.0
+    return max(v, TG_PUSH_EVERY_MIN)
+
+
+def _tg_feed_stat(path=None):
+    """Отпечаток ленты (размер, mtime_ns) или None (ленты нет/не читается). Файл не открываем."""
+    try:
+        st = os.stat(path or TG_FEED_FILE)
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
+
+
+def tg_push_due(mem, stat, now, idle=None):
+    """Пора звать пушер? Чистая (голден). → bool."""
+    idle = TG_PUSH_IDLE if idle is None else idle
+    if mem.get("at") is None:
+        return True                          # первый шаг процесса
+    if mem.get("again"):
+        return True                          # прошлый заход говорил или упёрся — сразу ещё раз
+    if stat != mem.get("stat"):
+        return True                          # лента сменилась с прошлого захода
+    return now - mem["at"] >= idle
+
+
+def _tg_push_step(push=None, stat_fn=None, now=None):
+    """Один шаг часов → True, если пушер звали. Ленту меряем ДО захода: ряд, легший во время
+    захода, сменит отпечаток, и следующий шаг его увезёт."""
+    now = time.monotonic() if now is None else now
+    stat = (stat_fn or _tg_feed_stat)()
+    if not tg_push_due(_TG_CLOCK, stat, now):
+        return False
+    _TG_CLOCK["said"] = 0
+    rc = (push or _tg_feed_push)()
+    _TG_CLOCK.update(stat=stat, at=now, again=(rc in (1, 3) or _TG_CLOCK["said"] > 0))
+    up = _TG_CLOCK.pop("up_line", None)
+    if up is not None:
+        log.info("TG-ЧАСЫ: подняты — шаг %sс, заход без перемены ленты не чаще раза в %sс; %s",
+                 up[0], up[1], _tg_switch_word(_TG_CLOCK.get("switch")))
+    return True
+
+
+def _tg_push_loop(every, stop=None, step=None):
+    """Тело потока часов. Шаг не смеет убить часы: исключение — строка в журнал (одна на причину)."""
+    stop = _TG_CLOCK_STOP if stop is None else stop
+    step = step or _tg_push_step
+    while not stop.is_set():
+        if not _stopped():
+            try:
+                step()
+                _TG_CLOCK["err"] = None
+            except Exception as e:           # noqa: BLE001
+                why = "%s: %s" % (type(e).__name__, e)
+                if why != _TG_CLOCK.get("err"):
+                    log.warning("TG-ЧАСЫ: шаг упал (%s) — часы идут дальше", why)
+                _TG_CLOCK["err"] = why
+        stop.wait(every)
+
+
+def _tg_push_start(every):
+    th = threading.Thread(target=_tg_push_loop, args=(every,), name="tg-push-clock", daemon=True)
+    th.start()
+    return th
+
+
+def _tg_push_clock(starter=None, start_only=False):
+    """Пушер ленты Telegram в обороте: часы живы — ничего; нет — поднять. → "clock" | "turn" | "test".
+    "turn" — пушер зван прямо из витка, как до 13.10 (откат ручкой или поток не поднялся).
+    `start_only` — подъём на старте процесса (`_main_loop`, ДО первого витка: первый виток после
+    эстафеты может встать на задачу до TASK_TIMEOUT): там пушер из витка не зовём — его позовёт виток."""
+    every = _tg_push_every()
+    if every <= 0:
+        if not start_only:
+            _tg_feed_push()
+        return "turn"
+    th = _TG_CLOCK.get("thread")
+    if th is not None and th.is_alive():
+        return "clock"
+    if starter is None and "unittest" in sys.modules:
+        return "test"
+    if th is not None:
+        log.error("TG-ЧАСЫ: поток часов умер — поднимаю заново")
+    try:
+        _TG_CLOCK["thread"] = (starter or _tg_push_start)(every)
+    except Exception as e:                   # noqa: BLE001
+        log.warning("TG-ЧАСЫ: поток не поднят (%s: %s) — пушер зовётся из витка", type(e).__name__, e)
+        if not start_only:
+            _tg_feed_push()
+        return "turn"
+    # Строку «подняты» говорит ПЕРВЫЙ ШАГ часов (`_tg_push_step`), а не подъём: в ней состояние
+    # выключателя пушера, а читает выключатель ТОЛЬКО сам пушер (замок K24, test_switch_is_read_only_in_
+    # the_pusher) — он и кладёт его в `_TG_CLOCK["switch"]` на первом же заходе. Первый шаг идёт сразу
+    # после подъёма (цикл: шаг, затем пауза); при включённом пушере строка ляжет после его захода (≤ 20 с).
+    _TG_CLOCK["up_line"] = (every, TG_PUSH_IDLE)
+    return "clock"
+
+
+def _tg_switch_word(sw):
+    """Состояние выключателя пушера для строки часов: True/False — со слов пушера, None — не сказано."""
+    if sw is True:
+        return "пушер вкл (TG_FEED_PUSH=1)"
+    if sw is False:
+        return "пушер ВЫКЛ (TG_FEED_PUSH≠1 — часы идут, заходов нет)"
+    return "состояние пушера не сказано"
 
 
 # ─── ЧАСЫ АРХИВА ОБСЛУЖИВАНИЯ: исход каждого захода — одной строкой в журнал демона (30.09.2026) ───
@@ -6032,7 +6187,7 @@ def poll_once():
     process_new()
     _srv_delivery()               # 03.09: работа серверной полосы доезжает в общий репозиторий сама
     _chatlog_capture("poll")      # 22.09: архив переписки получил ЧАСЫ (сам решает, идти ли на диск)
-    _tg_feed_push()               # 03.10: лента Telegram → дверь сервера; только при TG_FEED_PUSH=1, ≤ 20 с
+    _tg_push_clock()              # 13.10: пушер ленты Telegram — свои часы (поток); здесь только «живы ли»
     # Слепок очереди — ПЕРЕД heartbeat СОЗНАТЕЛЬНО: `_write_heartbeat()` обязан остаться
     # ПОСЛЕДНЕЙ строкой оборота (на этом стоят О2 и О4 — «оборот замкнулся», а не «начался»).
     _queue_snapshot("poll")
@@ -15087,6 +15242,7 @@ def _main_loop():
     if _stopped():
         log.info("рубильник pc_orchestrator.stop активен — не стартую поллинг")
         return
+    _tg_push_clock(start_only=True)   # 13.10: часы пушера ленты Telegram — до первого витка (он может стоять на задаче)
     global _loop_prev_wall, _loop_prev_awake, _client_grace_until
     while not _stopped():
         try:

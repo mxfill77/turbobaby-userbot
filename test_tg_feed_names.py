@@ -74,6 +74,7 @@ class TestMergeShape(unittest.TestCase):
             return f.read()
 
     def test_one_pusher_function_and_one_call_in_poll_once(self):
+        """Функция пушера одна; в обороте — ровно одна проверка его часов (`_tg_push_clock`, 13.10)."""
         tree = ast.parse(self._src("pc_orchestrator.py"))
         defs = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_tg_feed_push"]
         self.assertEqual(len(defs), 1, "функция пушера в демоне должна быть ровно одна")
@@ -83,10 +84,12 @@ class TestMergeShape(unittest.TestCase):
             if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) \
                     and isinstance(st.value.func, ast.Name):
                 calls.append(st.value.func.id)
-        self.assertEqual(calls.count("_tg_feed_push"), 1)
+        # 13.10.2026 (b5_tglag): пушер зовут свои часы; в обороте — одна проверка часов на прежнем месте
+        self.assertEqual(calls.count("_tg_feed_push"), 0, "пушер снова зовётся из витка напрямую")
+        self.assertEqual(calls.count("_tg_push_clock"), 1)
         i = calls.index
-        self.assertLess(i("_chatlog_capture"), i("_tg_feed_push"))
-        self.assertLess(i("_tg_feed_push"), i("_queue_snapshot"))
+        self.assertLess(i("_chatlog_capture"), i("_tg_push_clock"))
+        self.assertLess(i("_tg_push_clock"), i("_queue_snapshot"))
         self.assertEqual(calls[-1], "_write_heartbeat", "heartbeat — последняя строка оборота")
 
     def test_both_conflict_classes_kept(self):
