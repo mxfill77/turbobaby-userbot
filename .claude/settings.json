@@ -58,8 +58,6 @@
       "Edit(//c/Users/mxfill1/.claude/settings*.json)",
       "Edit(//c/Users/mxfill1/.claude.json)",
       "Edit(//c/Users/mxfill1/.claude.json)",
-      "WebFetch",
-      "WebSearch",
       "Bash(sqlite3 *)",
       "Bash(sqlite3:*)",
       "Bash(clasp deploy *)",
