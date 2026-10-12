@@ -224,8 +224,9 @@ class TestFlag(R.Base):
         os.environ["TG_FEED_PUSH_TOKEN"] = "t"
         runs = []
 
-        async def fake_run(client, me_id, log, own_usernames=()):
+        async def fake_run(client, me_id, log, own_usernames=(), on_sent=None):
             runs.append((client, me_id, tuple(sorted(own_usernames))))
+            self.assertIs(on_sent, ub._feed_sent, "ряд ленты своей отправки не подключён")
         cl = R.FakeClient()
         with mock.patch.object(S, "run", fake_run):
             await ub._startup_once(cl)
@@ -357,9 +358,16 @@ class TestSend(_Base):
                  (tl_errors.RpcCallFailError(request=None), "unknown"),
                  (tl_errors.RPCError(None, "Timeout", -503), "unknown"),
                  (tl_errors.ServerError(None, "No workers running"), "unknown"),
+                 (tl_errors.RandomIdDuplicateError(request=None), "unknown"),     # прошлая попытка, вероятно, дошла
+                 (tl_errors.UserPrivacyRestrictedError(request=None), "failed"),
+                 (tl_errors.InputUserDeactivatedError(request=None), "failed"),
                  (ConnectionError("Connection to Telegram failed"), "unknown"),
+                 (ConnectionError("Cannot send requests while disconnected"), "failed"),   # до сети
                  (asyncio.TimeoutError(), "unknown"),
-                 (ValueError("Could not find the input entity"), "failed")]
+                 (ValueError("Could not find the input entity for PeerUser(user_id=1001)"), "failed"),
+                 (ValueError("The message cannot be empty unless a file is provided"), "failed"),
+                 # Telethon 1.43 при raise_last_call_error=False: исчерпанные повторы 5xx/таймаута — ValueError
+                 (ValueError("Request was unsuccessful 6 time(s)"), "unknown")]
         for i, (err, want) in enumerate(cases, start=1):
             with self.subTest(err=type(err).__name__):
                 self.srv = FakeServer()
@@ -410,6 +418,115 @@ class TestSend(_Base):
         run(s.step())
         self.assertEqual((self.tg.sent, self.srv.rows[1]["state"]), ([], "queued"))
         self.assertIn("ответ 404", self.rec.text())
+
+
+class TestHaltCancelOnSent(_Base):
+    """Факты Telethon (b6v_telethon/TELETHON_FACTS.md): стоп-кран после FloodWait/PeerFlood (§6.5), отмена изнутри
+    при отключении клиента (§4), свой ряд ленты (§2 — на СВОЮ отправку NewMessage(outgoing) обычно нет)."""
+
+    def setUp(self):
+        super().setUp()
+        self.t = [0.0]
+
+    def sender(self, journal=None, **kw):
+        return S.Sender(self.tg, ME.id, journal or S.Journal(self.jpath), env=ENV, log=self.rec, http=self.srv,
+                        clock=lambda: self.t[0], own_usernames=ub.OWN_USERNAMES, **kw)
+
+    def test_flood_wait_halts_until_it_passes(self):
+        self.srv.add(1)
+        self.srv.add(2)
+        self.tg.fail = tl_errors.FloodWaitError(request=None, capture=30)
+        s = self.sender()
+        self.assertEqual(run(s.step()), "on")
+        self.assertEqual(len(self.tg.sent), 1, "после FloodWait второй ряд пачки отправлять нельзя")
+        self.assertEqual([self.srv.rows[i]["state"] for i in (1, 2)], ["failed", "failed"])
+        self.assertIn("стоп-кран", self.srv.rows[2]["error"])
+        self.srv.add(3)
+        calls = len(self.srv.calls)
+        self.assertEqual(run(s.step()), "halt")
+        self.assertEqual([m for m, _ in self.srv.calls[calls:]], [], "при стопе ряды не забираем")
+        self.assertEqual(self.srv.rows[3]["state"], "queued")
+        self.t[0] = 31.0
+        self.tg.fail = None
+        self.assertEqual(run(s.step()), "on")
+        self.assertEqual(self.srv.rows[3]["state"], "sent")
+        self.assertIn("СТОП", self.rec.text("ERROR"))
+        self.assertIn("стоп снят", self.rec.text("INFO"))
+
+    def test_peer_flood_halts_until_restart(self):
+        self.srv.add(1)
+        self.tg.fail = tl_errors.PeerFloodError(request=None)
+        s = self.sender()
+        run(s.step())
+        self.t[0] = 10 ** 9
+        self.assertEqual(run(s.step()), "halt")
+
+    def test_cancel_from_inside_telethon_is_unknown_and_task_lives(self):
+        self.srv.add(1)
+        self.tg.fail = asyncio.CancelledError()            # client.disconnect() отменил висящий запрос
+        s = self.sender()
+        self.assertEqual(run(s.step()), "on")
+        self.assertEqual(self.srv.rows[1]["state"], "unknown")
+        self.assertIn("отключением клиента", self.srv.rows[1]["error"])
+
+    def test_own_cancel_is_not_swallowed(self):
+        self.srv.add(1)
+        s = self.sender()
+
+        async def slow_send(entity, text, parse_mode="md"):
+            await asyncio.sleep(10)
+        self.tg.send_message = slow_send
+
+        async def main():
+            task = asyncio.create_task(s.step())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        run(main())
+        self.assertEqual(S.Journal(self.jpath).get("tok1")["state"], S.S_SENDING, "при старте — unknown без повтора")
+
+    def test_on_sent_after_ack_only_for_sent(self):
+        got = []
+        self.srv.add(1)
+        s = self.sender(on_sent=lambda msg, chat, ent: got.append((msg.id, chat, ent.id, self.srv.rows[1]["state"])))
+        run(s.step())
+        self.assertEqual(got, [(501, 1001, 1001, "sent")], "ряд ленты — после подтверждения и только у ушедшего")
+        self.srv = FakeServer()
+        self.srv.add(2)
+        self.tg.fail = tl_errors.UserIsBlockedError(request=None)
+        got.clear()
+        run(self.sender(on_sent=lambda *a: got.append(a)).step())
+        self.assertEqual(got, [])
+
+    def test_on_sent_failure_does_not_break_sending(self):
+        self.srv.add(1)
+
+        def boom(*a):
+            raise OSError(28, "No space left")
+        run(self.sender(on_sent=boom).step())
+        self.assertEqual(self.srv.rows[1]["state"], "sent")
+        self.assertIn("ряд ленты своей отправки не записан", self.rec.text("WARNING"))
+
+
+import test_tg_feed as F  # noqa: E402
+
+
+class TestFeedRowOfOwnSend(F._Base):
+    """userbot `_feed_sent`: ответ, ушедший отправителем, — ряд ленты dir=out теми же фильтрами, что on_outgoing."""
+
+    def test_row_written_with_client_names(self):
+        msg = F.mk_msg(777, F.CLIENT.id, out=True, text="Байк свободен, *350* ฿")
+        ub._feed_sent(msg, F.CLIENT.id, F.CLIENT)
+        (r,) = self.rows()
+        self.assertEqual((r["chat_id"], r["msg_id"], r["dir"], r["text"], r["sender_id"]),
+                         (F.CLIENT.id, 777, "out", "Байк свободен, *350* ฿", F.ME.id))
+        self.assertEqual((r["username"], r["name"]), ("anna_test", "Анна"))
+        self.no_telegram()
+
+    def test_team_peer_no_row(self):
+        ub._feed_sent(F.mk_msg(778, F.TEAM.id, out=True, text="x"), F.TEAM.id, F.TEAM)
+        self.assertEqual(self.rows(), [])
 
 
 class TestRunLoop(_Base):

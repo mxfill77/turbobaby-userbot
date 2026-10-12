@@ -290,6 +290,21 @@ def _feed(event, peer, direction):
                     f"{_FEED_COUNTS['failed']}. Обработчик продолжает.")
 
 
+class _SentEvent:
+    """Ряд ленты своей отправки (TGSEND1310): у `_feed` то же лицо, что у события исходящего."""
+
+    def __init__(self, msg, chat_id):
+        self.message, self.chat_id, self.sender_id = msg, chat_id, _ME_ID
+
+
+def _feed_sent(msg, chat_id, peer):
+    """Ответ, ушедший отправителем `tg_send`, — ряд ленты dir=out теми же фильтрами, что у `on_outgoing`. На
+    СОБСТВЕННЫЙ send_message Telethon событие NewMessage(outgoing) обычно не даёт (разведка TELETHON_FACTS §2),
+    и без этого ответа агента в ленте не было бы; редкий дубль (путь через getDifference) — тот же ключ, его
+    снимает читатель. Не бросает (`_feed`)."""
+    _feed(_SentEvent(msg, chat_id), peer, tg_feed.DIR_OUT)
+
+
 async def on_outgoing(event):
     """Исходящее ЛИЧНОЕ сообщение аккаунта (ответ менеджера с телефона, автоприветствие Business)
     → ряд ленты dir=out. НИЧЕГО не шлёт и Telegram не зовёт. Собеседник берётся из апдейта, а нет
@@ -720,7 +735,8 @@ async def _startup_once(client):
     # TG_SEND_OFF=1 / TG_FEED_OFF=1 / нет токена — ни задачи, ни сети, ни строки. Включает отправку сервер.
     # Тот же клиент, задача одна на процесс (замок как у IPC-поллера: вторая = двойная отправка).
     if tg_send.enabled() and _tg_sender is None:
-        _tg_sender = asyncio.create_task(tg_send.run(client, _ME_ID, log, own_usernames=OWN_USERNAMES))
+        _tg_sender = asyncio.create_task(tg_send.run(client, _ME_ID, log, own_usernames=OWN_USERNAMES,
+                                                     on_sent=_feed_sent))
     _startup_done = True
 
 

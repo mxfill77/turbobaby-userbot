@@ -226,9 +226,25 @@ def outcome_of(rec):
     return S_UNKNOWN, None, rec.get("error") or "исход неизвестен"
 
 
+# Ошибки ДО сети, которые Telethon бросает обычным ValueError/ConnectionError (TELETHON_FACTS §3, Telethon 1.43):
+# сущности нет в кэше · пустой текст после разбора · клиент отключён. Любой ИНОЙ ValueError из send_message —
+# это «Request was unsuccessful N time(s)»: ретраи на 5xx/таймаут/RANDOM_ID_DUPLICATE исчерпаны (клиент userbot
+# создан с raise_last_call_error=False), сообщение МОГЛО уйти — исход неизвестен.
+_PRE_NETWORK = ("Could not find the input entity", "The message cannot be empty",
+                "Cannot send requests while disconnected")
+# Отказы, после которых брать следующие ряды бессмысленно и вредно (TELETHON_FACTS §6.5): FloodWait сверх порога
+# клиента (следующие получат «досрочный» FloodWait без сети) — до его истечения; спам-ограничение аккаунта, 401,
+# заморозка — до руки человека (перезапуска userbot). Ряды в это время НЕ забираем — сервер честно скажет
+# «ПК не забрал».
+_HALT_FLOOD = tuple(getattr(tl_errors, n) for n in ("FloodWaitError", "FloodPremiumWaitError") if hasattr(tl_errors, n))
+_HALT_STOP = tuple(getattr(tl_errors, n) for n in ("PeerFloodError", "FrozenMethodInvalidError", "UserDeactivatedError",
+                                                   "UserDeactivatedBanError", "AuthKeyUnregisteredError")
+                   if hasattr(tl_errors, n)) + (tl_errors.UnauthorizedError,)
+
+
 def classify_send_error(e):
-    """Исключение отправки → (state, слова). Отказ Telegram (RPC 4xx/420/303) и ошибка входа до сети — failed:
-    сообщение заведомо не ушло. 5xx/-503 Telegram, сеть, таймаут, иное — unknown: могло уйти."""
+    """Исключение отправки → (state, слова). Отказ Telegram (RPC 4xx/420/303) и ошибка ДО сети — failed:
+    сообщение заведомо не ушло. 5xx/-503 Telegram, «ретраи исчерпаны», сеть, таймаут, иное — unknown."""
     name = type(e).__name__
     if isinstance(e, tl_errors.RPCError):
         code = getattr(e, "code", None)
@@ -238,7 +254,12 @@ def classify_send_error(e):
         if isinstance(code, int):
             return S_FAILED, "Telegram отказал: %s (%s)" % (name, code)
         return S_UNKNOWN, "Telegram %s без кода" % name
-    if isinstance(e, (ValueError, TypeError)):
+    text = str(e)
+    if isinstance(e, (ValueError, ConnectionError)) and text.startswith(_PRE_NETWORK):
+        return S_FAILED, "до отправки: %s (%s)" % (name, text[:60])
+    if isinstance(e, ValueError):
+        return S_UNKNOWN, "Telethon: %s — повторы исчерпаны, могло уйти" % text[:80]
+    if isinstance(e, TypeError):
         return S_FAILED, "до отправки: %s" % name
     return S_UNKNOWN, "%s — могло уйти" % name
 
@@ -247,8 +268,12 @@ def classify_send_error(e):
 
 class Sender:
     def __init__(self, client, me_id, journal, env=None, log=None, http=None, clock=None,
-                 own_usernames=()):
+                 own_usernames=(), on_sent=None):
         self.client, self.me_id, self.journal = client, me_id, journal
+        # on_sent(msg, chat_id, entity) — ряд ленты dir=out для своей отправки: Telethon на СОБСТВЕННЫЙ send_message
+        # NewMessage(outgoing) обычно НЕ даёт (TELETHON_FACTS §2), и без этого ответа агента в ленте не было бы
+        self.on_sent = on_sent
+        self.halt_until, self.halt_why = None, ""   # стоп-кран после FloodWait/PeerFlood/401/заморозки
         self.base, self.token = door_base(env), door_token(env)
         self.log = log
         self.http = http or http_call
@@ -298,8 +323,11 @@ class Sender:
     # ── шаг ──
     async def step(self):
         """Один опрос. → "on" (дверь сервера открыта, выданное обработано) · "off" (сервер: отправка выключена) ·
-        "error" (сеть, не 200, ответ не по контракту). Отправляется только выданное при «on»."""
+        "error" (сеть, не 200, ответ не по контракту) · "halt" (стоп-кран после отказа Telegram — ряды не
+        забираем). Отправляется только выданное при «on»."""
         await self.flush_acks()
+        if self.halted():
+            return "halt"
         got_at = self.clock()
         try:
             status, body = await self._http("GET", OUTBOX_PATH)
@@ -358,6 +386,7 @@ class Sender:
             await self.ack(token)
             return True
         why = (self.journal.broken + " — без него повтор нечем отличить, не шлю") if self.journal.broken \
+            else ("стоп-кран: %s — не шлю" % self.halt_why) if self.halt_until is not None \
             else self._refuse(chat, text)
         ent = None
         if why is None:
@@ -385,6 +414,7 @@ class Sender:
             self._say("error", "TG-ОТПРАВКА: ряд %d — %s" % (rid, why))
             await self.ack(token)
             return True
+        msg = None
         try:
             msg = await self.client.send_message(ent, text, parse_mode=None)
             msg_id = getattr(msg, "id", None)
@@ -392,9 +422,17 @@ class Sender:
                 state, err = S_SENT, None
             else:
                 state, err, msg_id = S_UNKNOWN, "Telegram не вернул id сообщения", None
+        except asyncio.CancelledError:
+            # отключение клиента отменяет висящий запрос изнутри (TELETHON_FACTS §4) — задача при этом жива;
+            # отменили саму задачу (остановка userbot) — наружу, журнал останется «sending» → unknown при старте
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            state, err, msg_id = S_UNKNOWN, "отправка прервана отключением клиента — могло уйти", None
         except Exception as e:                                      # noqa: BLE001
             state, err = classify_send_error(e)
             msg_id = None
+            self._maybe_halt(e)
         self.counts[state] += 1
         try:
             self.journal.write(token, state=state, msg_id=msg_id, error=err)
@@ -404,8 +442,36 @@ class Sender:
             self.journal.recs[token] = dict(self.journal.recs.get(token, {}), state=state, msg_id=msg_id, error=err)
         self._say("info" if state == S_SENT else "warning",
                   "TG-ОТПРАВКА: ряд %d → %s%s" % (rid, state, " (%s)" % err if err else ""))
-        await self.ack(token)
+        await self.ack(token)                                       # подтверждение — первым: дверь сервера ждёт
+        if state == S_SENT and self.on_sent is not None:
+            try:
+                self.on_sent(msg, chat, ent)
+            except Exception as e:                                  # noqa: BLE001 — лента не роняет отправителя
+                self._say("warning", "TG-ОТПРАВКА: ряд ленты своей отправки не записан (%s)" % type(e).__name__)
         return True
+
+    def _maybe_halt(self, e):
+        """Стоп-кран (TELETHON_FACTS §6.5): FloodWait сверх порога клиента — не брать ряды до его истечения;
+        спам-ограничение, 401, заморозка — до перезапуска userbot. Ряд, на котором это случилось, — failed."""
+        if isinstance(e, _HALT_FLOOD):
+            sec = getattr(e, "seconds", None)
+            sec = sec if isinstance(sec, int) and sec > 0 else 60
+            self.halt_until, self.halt_why = self.clock() + sec, "%s на %d с" % (type(e).__name__, sec)
+        elif isinstance(e, _HALT_STOP):
+            self.halt_until, self.halt_why = float("inf"), "%s — до перезапуска userbot" % type(e).__name__
+        else:
+            return
+        self._say("error", "TG-ОТПРАВКА: СТОП — %s; ряды не забираю (сервер скажет «ПК не забрал»), "
+                           "подтверждения доезжают" % self.halt_why)
+
+    def halted(self):
+        if self.halt_until is None:
+            return False
+        if self.clock() < self.halt_until:
+            return True
+        self._say("info", "TG-ОТПРАВКА: стоп снят (%s истёк) — снова забираю ряды" % self.halt_why)
+        self.halt_until, self.halt_why = None, ""
+        return False
 
     def _refuse(self, chat, text):
         if chat <= 0:
@@ -482,7 +548,8 @@ class Sender:
                 break                                               # сервер молчит — остальное следующим шагом
 
 
-async def run(client, me_id, log, own_usernames=(), env=None, sleep=None, journal_path=None, sender=None):
+async def run(client, me_id, log, own_usernames=(), env=None, sleep=None, journal_path=None, sender=None,
+              on_sent=None):
     """Фоновая задача userbot: опрос сервера при живом соединении; пауза — `next_poll` по ответу («on» — POLL_S,
     «off»/ошибка — 30 → 45 → 60 с). Никогда не падает наружу (кроме отмены задачи): сбой шага — строка журнала."""
     sleep = sleep or asyncio.sleep
@@ -492,7 +559,7 @@ async def run(client, me_id, log, own_usernames=(), env=None, sleep=None, journa
                       f"НЕ запущена, ответы агента не уходят")
             return
         sender = Sender(client, me_id, Journal(journal_path or JOURNAL_FILE), env=env, log=log,
-                        own_usernames=own_usernames)
+                        own_usernames=own_usernames, on_sent=on_sent)
     log.info(f"{_now()} | TG-ОТПРАВКА: живу — опрашиваю {sender.base}{OUTBOX_PATH}; включает отправку сервер "
              f"(WA_AGENT_TG_SEND у wa-agent), аварийно выключить здесь — {OFF_ENV}=1; журнал {sender.journal.path}")
     if getattr(sender.journal, "broken", ""):
@@ -505,7 +572,11 @@ async def run(client, me_id, log, own_usernames=(), env=None, sleep=None, journa
             if client.is_connected():
                 state = await sender.step()
         except asyncio.CancelledError:
-            raise
+            task = asyncio.current_task()
+            if task is None or task.cancelling():
+                raise                                               # отменили саму задачу — остановка userbot
+            # отмена ИЗНУТРИ Telethon (отключение клиента отменяет висящие запросы) — задача живёт дальше
+            log.warning(f"{_now()} | TG-ОТПРАВКА: шаг прерван отключением клиента — следующий по расписанию")
         except Exception as e:                                      # noqa: BLE001 — задача не умирает
             log.warning(f"{_now()} | TG-ОТПРАВКА: шаг упал ({type(e).__name__}: {sender._safe(e)})")
         quiet = 0 if state == "on" else quiet + 1
