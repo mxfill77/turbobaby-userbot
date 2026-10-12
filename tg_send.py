@@ -78,26 +78,38 @@ def _now():
 
 def enabled(env=None) -> bool:
     """TG_SEND=1/true/yes/on — включено; всё прочее (и отсутствие) — выключено."""
-    e = os.environ if env is None else env
-    return str(e.get(FLAG_ENV, "") or "").strip().lower() in ("1", "true", "yes", "on")
+    return _env(env, FLAG_ENV).lower() in ("1", "true", "yes", "on")
+
+
+def _env(env, name):
+    """Значение переменной без краевых пробелов; нет её или не строка — пустая строка (решение «нет» — у
+    вызывающего: пустое значение и отсутствие для адреса и токена здесь одно и то же, как у пушера)."""
+    v = (os.environ if env is None else env).get(name)
+    return v.strip() if isinstance(v, str) else ""
 
 
 def door_base(env=None) -> str:
     """База адреса сервера тем же путём, что у пушера: TG_FEED_PUSH_URL без /tg-queue/push; иначе WA_QUEUE_BASE."""
-    e = os.environ if env is None else env
-    url = (e.get(URL_ENV) or "").strip()
+    url = _env(env, URL_ENV)
     if url and url.rstrip("/").endswith(PUSH_PATH):
         return url.rstrip("/")[:-len(PUSH_PATH)]
-    return ((e.get(BASE_ENV) or "").strip() or DEFAULT_BASE).rstrip("/")
+    base = _env(env, BASE_ENV)
+    return (base if base else DEFAULT_BASE).rstrip("/")
 
 
 def door_token(env=None) -> str:
-    e = os.environ if env is None else env
-    return (e.get(TOKEN_ENV) or "").strip() or (e.get(PULL_SECRET_ENV) or "").strip()
+    tok = _env(env, TOKEN_ENV)
+    return tok if tok else _env(env, PULL_SECRET_ENV)
 
 
 def tg_len(text) -> int:
-    return len(str(text or "").encode("utf-16-le", "surrogatepass")) // 2
+    s = text if isinstance(text, str) else str(text)
+    return len(s.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def _text(body):
+    """Тело ответа → текст; не байты (ответа нет) — пустая строка: разбор JSON её отвергнет."""
+    return body.decode("utf-8") if isinstance(body, bytes) else ""
 
 
 # ─── транспорт ───────────────────────────────────────────────────────────────────────────
@@ -132,6 +144,7 @@ class Journal:
         self.recs = {}
         self.bad_lines = 0
         self.broken = ""            # журнал есть, но не читается — отправлять нельзя (повтор нечем отличить)
+        self.fresh = False
         try:
             with open(path, "rb") as f:
                 for raw in f.read().split(b"\n"):
@@ -147,7 +160,7 @@ class Journal:
                         continue
                     self.recs[tok] = dict(self.recs.get(tok, {}), **rec)
         except FileNotFoundError:
-            pass
+            self.fresh = True       # журнала ещё нет: первый запуск, отправленного не было
         except OSError as e:
             self.broken = "журнал отправки не читается (%s)" % type(e).__name__
 
@@ -224,7 +237,7 @@ class Sender:
         self.log = log
         self.http = http or http_call
         self.clock = clock or time.monotonic
-        self.own = {str(u).lower() for u in own_usernames or ()}
+        self.own = {str(u).lower() for u in own_usernames}
         self.fail_since = None
         self.fail_said = None
         self.counts = {"sent": 0, "failed": 0, "unknown": 0, "rehanded": 0, "acked": 0}
@@ -278,7 +291,7 @@ class Sender:
             self._net_fail("очередь: ответ %s" % status)
             return 0
         try:
-            data = json.loads((body or b"").decode("utf-8"))
+            data = json.loads(_text(body))
             items, server_now = data["items"], float(data["now"])
             if not isinstance(items, list):
                 raise ValueError("items")
@@ -384,7 +397,8 @@ class Sender:
             return None, "свой аккаунт"
         if getattr(ent, "deleted", False):
             return None, "аккаунт собеседника удалён"
-        if (getattr(ent, "username", None) or "").lower() in self.own:
+        nick = getattr(ent, "username", None)
+        if isinstance(nick, str) and nick.lower() in self.own:
             return None, "свой аккаунт"
         return ent, None
 
@@ -404,9 +418,11 @@ class Sender:
             self._net_fail("подтверждение ряда %s не доехало (%s)" % (rec.get("id"), type(e).__name__))
             return False
         try:
-            data = json.loads((body or b"").decode("utf-8")) if body else {}
-        except Exception:                                           # noqa: BLE001
-            data = {}
+            data = json.loads(_text(body))
+            if not isinstance(data, dict):
+                raise ValueError("ответ не объект")
+        except Exception:                                           # noqa: BLE001 — тело не JSON: решает код ответа
+            data = {"_unparsed": True}
         if status == 200 and data.get("ok"):
             mark = True
         elif (status == 200 and data.get("error") in ACK_FINAL_REFUSALS) or status in (400, 413):
