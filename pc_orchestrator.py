@@ -3493,6 +3493,31 @@ def _fail_is_network(out_s, err_s, watch=None, witness=None):
               "задачу имеет смысл, когда связь вернётся")
 
 
+# ── ВХОД ВЫБРАННОГО ПРОФИЛЯ НЕ ПЕРЕБИВАЕТСЯ УНАСЛЕДОВАННЫМ ТОКЕНОМ (16.10.2026) ──────────────
+# Реестр учёток решает учётку ребёнка ключом CLAUDE_CONFIG_DIR (`accounts.apply_builders`), а в
+# каталоге профиля лежит вход `/login`. CLI ставит переменные-токены ВЫШЕ такого входа (справка
+# CLI «Authentication precedence», code.claude.com/docs/en/authentication: ANTHROPIC_AUTH_TOKEN —
+# п.2, CLAUDE_CODE_OAUTH_TOKEN — п.5, вход `/login` — п.7). Значит токен, застрявший в окружении
+# демона, увёл бы ребёнка с учётки, названной реестром, МОЛЧА — при честной строке журнала
+# «учётка №N». Поэтому: профиль назван явно (apply_builders ПОСТАВИЛ ключ) → имена снимаются из
+# окружения РЕБЁНКА; ОСНОВНОЙ и любая ветка без ключа → окружение не тронуто, байт-в-байт как до
+# правки. Значения не читаются ни одной строкой (только `in` и `del` по имени), в журнал уходят
+# только ИМЕНА; окружение самого демона (`os.environ`) не трогается.
+_PROFILE_LOGIN_OVERRIDES = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN")
+
+
+def _drop_login_overrides(env, choice):
+    """Профиль выбран явно (ACT_SET и ключ в env равен выбору) → снять из env ребёнка
+    перебивки входа → кортеж СНЯТЫХ ИМЁН. Иначе → () и env не тронут. Значений не касается."""
+    if not (choice is not None and getattr(choice, "action", None) == accounts.ACT_SET
+            and getattr(choice, "value", "") and env.get(accounts.KEY) == choice.value):
+        return ()
+    gone = tuple(k for k in _PROFILE_LOGIN_OVERRIDES if k in env)
+    for k in gone:
+        del env[k]
+    return gone
+
+
 def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=""):
     """Исполнить задачу через headless claude -p. → (status, result). status ∈ done|failed|needs_approval.
     Контракт результата (фикс ложного done задачи #24): done ТОЛЬКО при непустом stdout со строкой
@@ -3552,6 +3577,10 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=
     # ОСНОВНОЙ плюс WARNING (прямое требование задания), пустого значения нет ни на одной дороге.
     _pchoice = accounts.apply_builders(env, REPO)
     (log.warning if _pchoice.warn else log.info)("%s", accounts.line(_pchoice, tid))
+    _gone = _drop_login_overrides(env, _pchoice)   # профиль назван явно → токен-перебивка входа не наследуется
+    if _gone:
+        log.warning("id=%s учётка строителей: в окружении демона перебивки входа %s — у ребёнка "
+                    "сняты (значения не читались)", tid, ",".join(_gone))
     env["PYTHONIOENCODING"] = "utf-8"            # ребёнок пишет stdout/stderr в utf-8 → нет кракозябр (пара к encoding в run_claude)
     env[ASK_MARKER_ENV] = marker_path            # pretool_guard в headless пишет сюда красную карточку
     env[MARKER_TOKEN_ENV] = run_token            # …штампуя её нашим токеном — чужие карточки отсеем
@@ -6755,6 +6784,10 @@ def _thinker_exec(prompt, timeout, tag):
     # `test_profile_choice.TestBothSpawnBranchesAsk` (с 25.09 — реестр учёток, `accounts_registry.py`).
     _pchoice = accounts.apply_builders(env, REPO)
     (log.warning if _pchoice.warn else log.info)("%s: %s", tag, accounts.line(_pchoice))
+    _gone = _drop_login_overrides(env, _pchoice)   # та же снятая перебивка входа, что у исполнителя
+    if _gone:
+        log.warning("%s: учётка строителей: в окружении демона перебивки входа %s — у ребёнка "
+                    "сняты (значения не читались)", tag, ",".join(_gone))
     env["PYTHONIOENCODING"] = "utf-8"
     # Глубина размышления ЯВНО. Нейтральный cwd (tempdir) — сознательное решение выше: он
     # отсекает hooks/pretool_guard репо. Но вместе с ними отсекается и `effortLevel` из
