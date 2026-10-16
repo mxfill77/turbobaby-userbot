@@ -5258,7 +5258,8 @@ class TestSecretValueLeakIsTheReplacement(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
-# ВЛАДЕЛЬЦА НЕТ У ЭКРАНА — ВОПРОСА НЕТ (12.10.2026): interactive + bypass/dontAsk → ask = ОТКАЗ
+# ВЛАДЕЛЬЦА НЕТ У ЭКРАНА — ВОПРОСА НЕТ (12.10.2026): interactive + dontAsk → ask = ОТКАЗ.
+# С 16.10.2026 (решение владельца) bypass из правила СНЯТ: в bypass ask — ПРЕЖНИЙ вопрос с карточкой.
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 class TestOwnerAwayNoQuestion(unittest.TestCase):
     """Живой факт ночи 12.10 (pretool_guard.log, роль interactive): ask вида `env` в 07:51:38 и
@@ -5268,6 +5269,14 @@ class TestOwnerAwayNoQuestion(unittest.TestCase):
     Правило (`owner_away`): роль interactive и `permission_mode` ∈ `UNATTENDED_MODES` во входе
     хука → всё, что стало бы ask, уходит `deny` с текстом исполнителю, без пуша и без маркера, с
     меткой лога `DECISION_UNATTENDED`. Ни разу не allow. headless и прочие режимы — как было.
+
+    ПОПРАВКА 16.10.2026 (решение владельца: «исправь это я настаиваю что бы байпас работал»;
+    в гарде `UNATTENDED_MODES = ("dontAsk",)`). bypass из набора снят: в bypass красное снова идёт
+    ТЕМ ЖЕ решением, что в обычном интерактиве без поля режима, — тот же ask, ДОСЛОВНО та же
+    карточка, тот же счёт пушей, та же строка лога `ask`, и это сторожится на КАЖДОМ спрашивающем
+    виде и инструменте `ASK_INPUTS`. dontAsk остаётся отказом «владельца нет» с текстом. «Байпас
+    работает» значит «вопрос как обычно», а не «красное без да»: allow не выдаёт НИ ОДНА ветка —
+    ни в каком режиме, ни в какой роли (`test_no_branch_returns_allow`).
 
     Гард гоняется ПОДПРОЦЕССОМ ТОГО ФАЙЛА, что импортирован как `g` (на копии — копия, после
     переноса — живой), а не по пути PROJ: иначе тест судил бы не ту версию. Окружение — как у
@@ -5414,11 +5423,13 @@ class TestOwnerAwayNoQuestion(unittest.TestCase):
         return {"rc": p.returncode, "dec": dec, "reason": reason, "pushes": n_push, "log": log,
                 "marker": os.path.isfile(marker), "stderr": p.stderr}
 
-    def _assert_unattended(self, r, kind, tool, ctl, mode_word="bypass"):
+    def _assert_unattended(self, r, kind, tool, ctl, mode_word="dontAsk"):
         """Отказ «владельца нет»: deny, приписка, ДОСЛОВНАЯ карточка контроля, 0 пушей, метка.
         Молчание (пустой вывод, `defer` в логе) называется своим именем, а не «не deny»: для
-        красной операции оно хуже вопроса — это исполнение без «да» (мутанты m7/m8 Д1, 12.10)."""
+        красной операции оно хуже вопроса — это исполнение без «да» (мутанты m7/m8 Д1, 12.10).
+        С 16.10.2026 этот исход у interactive даёт ТОЛЬКО dontAsk — отсюда и умолчание."""
         self.assertEqual(r["rc"], 0, r["stderr"])
+        self.assertNotEqual(ctl["dec"], "allow", "контроль без поля режима стал разрешением")
         self.assertNotEqual(r["dec"], "allow", "режим сессии стал разрешением")
         self.assertIsNotNone(r["dec"], "МОЛЧАНИЕ в режиме %s: вид %s исполнился бы без вопроса и "
                              "без отказа" % (mode_word, kind))
@@ -5430,30 +5441,61 @@ class TestOwnerAwayNoQuestion(unittest.TestCase):
             self.assertIn(part, r["reason"])
         self.assertEqual(g.card_from_decision(r["reason"]), g.card_from_decision(ctl["reason"]),
                          "в отказе нет ДОСЛОВНОЙ карточки, которая собиралась уйти")
-        self.assertEqual(r["pushes"], 0, "пуш владельцу при bypass — владелец спит")
+        self.assertEqual(r["pushes"], 0, "пуш владельцу в режиме %s — владельца нет" % mode_word)
         self.assertFalse(r["marker"])
         self.assertIn("| interactive | %s | %s | %s |" % (tool, g.DECISION_UNATTENDED, kind),
                       r["log"])
         self.assertNotIn("| ask |", r["log"])
 
-    # (а) bypass + каждый ask-вид → отказ
-    def test_bypass_turns_every_ask_kind_into_refusal(self):
+    def _assert_same_as_interactive(self, r, ctl, kind, tool, mode_word="bypass"):
+        """Решение в режиме `mode_word` = решение обычного интерактива (`ctl`, без поля режима),
+        и ДОСЛОВНО: тот же ask, та же карточка (весь текст решения, а не только её хвост), тот же
+        счёт пушей, маркера нет, в логе `ask` этого вида, метки «владельца нет» нет. Allow и
+        молчание называются своими именами: для красной операции оба — исполнение без «да».
+        Ловит мутантов 16.10: bypass вернулся в `UNATTENDED_MODES` (deny), bypass → allow,
+        bypass → молчаливый defer, bypass задавил пуш или переписал карточку."""
+        self.assertEqual(r["rc"], 0, r["stderr"])
+        self.assertNotEqual(ctl["dec"], "allow", "контроль без поля режима стал разрешением")
+        self.assertNotEqual(r["dec"], "allow", "режим %s стал разрешением на красное" % mode_word)
+        self.assertIsNotNone(r["dec"], "МОЛЧАНИЕ в режиме %s: вид %s исполнился бы без вопроса"
+                             % (mode_word, kind))
+        self.assertNotIn("| defer |", r["log"], "режим %s пропустил красную операцию молча"
+                         % mode_word)
+        self.assertEqual(ctl["dec"], "ask", "посылка: без поля режима вид %s спрашивает" % kind)
+        self.assertEqual(r["dec"], ctl["dec"], "режим %s: решение разошлось с обычным "
+                         "интерактивом: %s" % (mode_word, r["reason"]))
+        self.assertEqual(r["reason"], ctl["reason"], "режим %s: карточка не та, что в обычном "
+                         "интерактиве" % mode_word)
+        self.assertNotIn("БЕЗ ВОПРОСА", r["reason"])
+        self.assertEqual(r["pushes"], ctl["pushes"], "режим %s: счёт пушей разошёлся с обычным "
+                         "интерактивом" % mode_word)
+        self.assertFalse(ctl["marker"])
+        self.assertFalse(r["marker"], "interactive не пишет маркер демону ни в каком режиме")
+        self.assertIn("| interactive | %s | ask | %s |" % (tool, kind), r["log"])
+        self.assertNotIn(g.DECISION_UNATTENDED, r["log"])
+
+    # (а) bypass + каждый ask-вид → ТОТ ЖЕ вопрос, что в обычном интерактиве (с 16.10.2026)
+    def test_bypass_keeps_every_ask_kind_as_plain_question(self):
+        """До 16.10 здесь стоял `test_bypass_turns_every_ask_kind_into_refusal` — та же матрица
+        видов × инструментов, с обратным ожиданием. Матрица сохранена целиком; ожидание теперь —
+        решение bypass ДОСЛОВНО равно решению без поля режима (`_assert_same_as_interactive`)."""
         for kind, data in self.ASK_INPUTS:
             with self.subTest(kind=kind, tool=data["tool_name"]):
                 ctl = self._run(data)
                 self.assertEqual(ctl["dec"], "ask", "посылка: без поля режима вид %s спрашивает"
                                  % kind)
-                self.assertEqual(ctl["pushes"], 1, "посылка: без bypass карточка пушится")
+                self.assertEqual(ctl["pushes"], 1, "посылка: в интерактиве карточка пушится")
                 self.assertIn("| interactive | %s | ask | %s |" % (data["tool_name"], kind),
                               ctl["log"])
                 r = self._run(data, mode=self.BYPASS)
-                self._assert_unattended(r, kind, data["tool_name"], ctl)
+                self._assert_same_as_interactive(r, ctl, kind, data["tool_name"])
 
     def test_dont_ask_mode_is_unattended_too(self):
         """dontAsk по определению «всё, что потребовало бы вопроса, — отказ»: человека там не
         ждут, поэтому вопрос тоже уходит отказом с текстом, а не пушем владельцу. С 12.10 (Д1) —
         на КАЖДОМ входе `ASK_INPUTS`, а не на двух: исключение вида или инструмента из правила
-        обязано валить и этот режим, а не только bypass."""
+        обязано валить этот режим. С 16.10.2026 dontAsk — ЕДИНСТВЕННЫЙ режим правила, и эта
+        матрица — его единственный полный сторож."""
         for kind, data in self.ASK_INPUTS:
             with self.subTest(kind=kind, tool=data["tool_name"]):
                 ctl = self._run(data)
@@ -5463,8 +5505,9 @@ class TestOwnerAwayNoQuestion(unittest.TestCase):
                 self._assert_unattended(r, kind, data["tool_name"], ctl, mode_word="dontAsk")
 
     def test_ask_inputs_cover_every_asking_kind_and_tool(self):
-        """СТОРОЖ ОТ ПРОТУХАНИЯ (Д1 review_escape, 12.10.2026). Имя
-        `test_bypass_turns_every_ask_kind_into_refusal` обещает «каждый вид», и держит обещание не
+        """СТОРОЖ ОТ ПРОТУХАНИЯ (Д1 review_escape, 12.10.2026). Имена
+        `test_bypass_keeps_every_ask_kind_as_plain_question` и `test_dont_ask_mode_is_unattended_too`
+        обещают «каждый вид», и держит обещание не
         память, а сверка с ЗАКРЫТЫМ словарём гарда: новый вид в `_KIND_VOCAB` без входа здесь
         валит класс, пока вход не добавлен. `unknown` исключён замером, а не словом: объект у него
         пуст по построению, и `card_decision` отказывает на месте при любой команде — вопроса
@@ -5485,11 +5528,12 @@ class TestOwnerAwayNoQuestion(unittest.TestCase):
     # Д2 review_escape (12.10): тест-флаг в ОКРУЖЕНИИ хука — изоляция каналов, а не выход из правила
     def test_test_run_flag_in_hook_env_does_not_reopen_question(self):
         """Флаг тест-прогона (`_TEST_RUN_ENVS`) в окружении ХУКА глушит каналы владельца
-        (`isolated`), но решения не меняет: без поля режима это перехваченный ask, в bypass и
-        dontAsk — тот же отказ «владельца нет». Мутант «правило молчит при `is_test_run()`» вернул
-        бы вопрос на экран сессии, унаследовавшей флаг из тестового окружения, а прежний класс
-        гонял хук только со СНЯТЫМИ флагами и этого не видел. Флаг префиксом КОМАНДЫ — другой путь
-        (латч пробы), его держит `test_probe_in_bypass_is_refused_without_push`."""
+        (`isolated`), но решения не меняет: без поля режима это перехваченный ask, в bypass (с
+        16.10.2026) — ТОТ ЖЕ перехваченный ask, в dontAsk — отказ «владельца нет». Мутант «правило
+        молчит при `is_test_run()`» вернул бы вопрос на экран сессии, унаследовавшей флаг из
+        тестового окружения, а прежний класс гонял хук только со СНЯТЫМИ флагами и этого не видел.
+        Флаг префиксом КОМАНДЫ — другой путь (латч пробы), его держит
+        `test_probe_is_plain_intercept_in_bypass_and_refused_in_dont_ask`."""
         for flag in g._TEST_RUN_ENVS:
             with self.subTest(flag=flag):
                 ctl = self._run(self.KILL, env_extra={flag: "1"})
@@ -5497,15 +5541,17 @@ class TestOwnerAwayNoQuestion(unittest.TestCase):
                                  "посылка: без поля режима флаг-прогон спрашивает")
                 self.assertIn("ПЕРЕХВАЧЕНО НА ГРАНИЦЕ", ctl["reason"])
                 self.assertEqual(ctl["pushes"], 0, "посылка: флаг гасит пуш изоляцией")
-                for mode, word in ((self.BYPASS, "bypass"), ("dontAsk", "dontAsk")):
-                    r = self._run(self.KILL, mode=mode, env_extra={flag: "1"})
-                    self.assertNotEqual(r["dec"], "ask", "тест-флаг вернул вопрос в режиме %s"
-                                        % word)
-                    self._assert_unattended(r, "kill", "Bash", ctl, mode_word=word)
+                r = self._run(self.KILL, mode=self.BYPASS, env_extra={flag: "1"})
+                self._assert_same_as_interactive(r, ctl, "kill", "Bash")
+                r = self._run(self.KILL, mode="dontAsk", env_extra={flag: "1"})
+                self.assertNotEqual(r["dec"], "ask", "тест-флаг вернул вопрос в режиме dontAsk")
+                self._assert_unattended(r, "kill", "Bash", ctl, mode_word="dontAsk")
 
-    def test_probe_in_bypass_is_refused_without_push(self):
-        """Обе ночные строки были ПРОБАМИ (скрипты из tmp/): перехват пробы — тоже ask, и в bypass
-        он тоже обязан стать отказом, а не вопросом на экране."""
+    def test_probe_is_plain_intercept_in_bypass_and_refused_in_dont_ask(self):
+        """Обе ночные строки были ПРОБАМИ (скрипты из tmp/): перехват пробы — тоже ask. До 16.10
+        здесь стоял `test_probe_in_bypass_is_refused_without_push`; с 16.10 в bypass перехват
+        остаётся ТЕМ ЖЕ перехватом, что без поля режима (пуша нет — его гасит латч пробы, а не
+        режим), а в dontAsk обязан стать отказом, а не вопросом на экране."""
         data = {"tool_name": "Bash",
                 "tool_input": {"command": "PRETOOL_TEST_RUN=1 taskkill /PID 47121 /F"}}
         ctl = self._run(data)
@@ -5513,19 +5559,25 @@ class TestOwnerAwayNoQuestion(unittest.TestCase):
         self.assertIn("ПЕРЕХВАЧЕНО НА ГРАНИЦЕ", ctl["reason"])
         self.assertEqual(ctl["pushes"], 0)
         r = self._run(data, mode=self.BYPASS)
-        self._assert_unattended(r, "kill", "Bash", ctl)
+        self._assert_same_as_interactive(r, ctl, "kill", "Bash")
+        self.assertIn("ПЕРЕХВАЧЕНО НА ГРАНИЦЕ", r["reason"])
+        r = self._run(data, mode="dontAsk")
+        self._assert_unattended(r, "kill", "Bash", ctl, mode_word="dontAsk")
 
     def test_failsafe_input_in_bypass_stays_plain_refusal(self):
-        """FAIL-SAFE (`ask unknown ''` → пустой объект → deny) в bypass не меняется: отказ был и
-        остаётся, текст тот же, метка лога обычная `deny`. Вход-не-dict — тоже отказ, без падения."""
+        """FAIL-SAFE (`ask unknown ''` → пустой объект → deny) в bypass и dontAsk не меняется:
+        отказ был и остаётся, текст тот же, метка лога обычная `deny`. Вход-не-dict — тоже отказ,
+        без падения."""
         crooked = {"tool_name": "Bash", "tool_input": "кривой вход"}
         ctl = self._run(crooked)
-        r = self._run(crooked, mode=self.BYPASS)
         self.assertEqual(ctl["dec"], "deny")
-        self.assertEqual(r["dec"], "deny")
-        self.assertEqual(r["reason"], ctl["reason"])
-        self.assertIn("| interactive | Bash | deny | unknown |", r["log"])
-        self.assertNotIn(g.DECISION_UNATTENDED, r["log"])
+        for mode in (self.BYPASS, "dontAsk"):
+            with self.subTest(mode=mode):
+                r = self._run(crooked, mode=mode)
+                self.assertEqual(r["dec"], "deny")
+                self.assertEqual(r["reason"], ctl["reason"])
+                self.assertIn("| interactive | Bash | deny | unknown |", r["log"])
+                self.assertNotIn(g.DECISION_UNATTENDED, r["log"])
         for raw in ('["bypassPermissions"]', '"bypassPermissions"', "17"):
             with self.subTest(raw=raw):
                 r = self._run(raw=raw)
@@ -5564,78 +5616,122 @@ class TestOwnerAwayNoQuestion(unittest.TestCase):
                 log = f.read()
         return dec, reason, pushed, log
 
-    def test_fallback_ask_of_card_decision_is_refused_in_bypass(self):
+    def test_fallback_ask_of_card_decision_plain_in_bypass_refused_in_dont_ask(self):
         """Запасной ask `card_decision` (сбой ВНУТРИ разбора карточки → except → `_card`) — тоже
-        вопрос, и в bypass он обязан стать отказом. Сбой вызываем подменой `_card_blocked`."""
+        вопрос. До 16.10 здесь стоял `test_fallback_ask_of_card_decision_is_refused_in_bypass`;
+        с 16.10 в bypass он — ТОТ ЖЕ вопрос с пушем, что без поля режима, а в dontAsk обязан стать
+        отказом. Сбой вызываем подменой `_card_blocked`."""
         def boom(*_a, **_k):
             raise RuntimeError("сбой разбора карточки (тест)")
         data = dict(self.KILL, cwd=PROJ)
         dec, reason, pushed, log = self._main_inproc(data, {"_card_blocked": boom})
         self.assertEqual((dec, len(pushed)), ("ask", 1), "посылка: без поля — вопрос и пуш")
-        dec2, reason2, pushed2, log2 = self._main_inproc(dict(data, permission_mode=self.BYPASS),
+        dec1, reason1, pushed1, log1 = self._main_inproc(dict(data, permission_mode=self.BYPASS),
+                                                         {"_card_blocked": boom})
+        self.assertNotEqual(dec1, "allow", "bypass стал разрешением на запасном ask")
+        self.assertEqual((dec1, reason1, pushed1), (dec, reason, pushed),
+                         "запасной ask в bypass разошёлся с обычным интерактивом")
+        self.assertIn("| interactive | Bash | ask | kill |", log1)
+        self.assertNotIn(g.DECISION_UNATTENDED, log1)
+        dec2, reason2, pushed2, log2 = self._main_inproc(dict(data, permission_mode="dontAsk"),
                                                          {"_card_blocked": boom})
         self.assertEqual(dec2, "deny")
         self.assertEqual(pushed2, [])
         self.assertEqual(g.card_from_decision(reason2), g.card_from_decision(reason))
         self.assertIn("| interactive | Bash | %s | kill |" % g.DECISION_UNATTENDED, log2)
 
-    # (б) прочие режимы, нет поля, мусор в поле → вопрос как раньше
+    # (б) прочие режимы (с 16.10 — и bypass), нет поля, мусор в поле → вопрос как раньше
     def test_other_modes_and_garbage_still_ask(self):
-        for mode in (self.NO_FIELD, "default", "acceptEdits", "plan", "auto", "", None, 123,
-                     ["bypassPermissions"], {"mode": "bypassPermissions"}, "BypassPermissions",
-                     "bypassPermissions ", "dontask"):
+        for mode in (self.NO_FIELD, "default", "acceptEdits", "plan", "auto", self.BYPASS, "",
+                     None, 123, ["bypassPermissions"], {"mode": "bypassPermissions"},
+                     "BypassPermissions", "bypassPermissions ", "dontask", ["dontAsk"],
+                     "dontAsk "):
             with self.subTest(mode=mode if mode is not self.NO_FIELD else "<нет поля>"):
                 r = self._run(self.KILL, mode=mode)
                 self.assertEqual(r["rc"], 0, r["stderr"])
+                self.assertNotEqual(r["dec"], "allow")
                 self.assertEqual(r["dec"], "ask", r["reason"])
                 self.assertNotIn("БЕЗ ВОПРОСА", r["reason"])
-                self.assertEqual(r["pushes"], 1, "без bypass вопрос пушится владельцу, как было")
+                self.assertEqual(r["pushes"], 1, "вне dontAsk вопрос пушится владельцу, как было")
                 self.assertIn("| interactive | Bash | ask | kill |", r["log"])
                 self.assertNotIn(g.DECISION_UNATTENDED, r["log"])
 
-    # (в) headless + bypass → прежний путь (маркер демону и вопрос), не отказ
+    # (в) headless + bypass/dontAsk → прежний путь (маркер демону и вопрос), не отказ
     def test_headless_bypass_keeps_marker_card(self):
         base = self._run(self.KILL, headless=True)
-        r = self._run(self.KILL, mode=self.BYPASS, headless=True)
-        for x in (base, r):
-            self.assertEqual(x["dec"], "ask", x["reason"])
-            self.assertTrue(x["marker"], "headless обязан писать карточку в маркер демону")
-            self.assertEqual(x["pushes"], 1)
-            self.assertIn("| headless | Bash | ask | kill |", x["log"])
-            self.assertNotIn(g.DECISION_UNATTENDED, x["log"])
-        self.assertEqual(r["reason"], base["reason"])
+        for mode in (self.BYPASS, "dontAsk"):
+            with self.subTest(mode=mode):
+                r = self._run(self.KILL, mode=mode, headless=True)
+                for x in (base, r):
+                    self.assertNotEqual(x["dec"], "allow")
+                    self.assertEqual(x["dec"], "ask", x["reason"])
+                    self.assertTrue(x["marker"], "headless обязан писать карточку в маркер демону")
+                    self.assertEqual(x["pushes"], 1)
+                    self.assertIn("| headless | Bash | ask | kill |", x["log"])
+                    self.assertNotIn(g.DECISION_UNATTENDED, x["log"])
+                self.assertEqual(r["reason"], base["reason"])
 
-    # (г) defer / deny / journal в bypass не меняются
+    # (г) defer / deny / journal в bypass и dontAsk не меняются
     def test_defer_and_plain_deny_unchanged_in_bypass(self):
         green = {"tool_name": "Bash", "tool_input": {"command": "git status"}}
-        r = self._run(green, mode=self.BYPASS)
-        self.assertEqual((r["rc"], r["dec"]), (0, None), "зелёное в bypass обязано молчать")
-        self.assertIn("| interactive | Bash | defer |", r["log"])
         unnamed = {"tool_name": "Bash", "tool_input": {"command": "find . -name x | xargs rm"}}
         ctl = self._run(unnamed)
-        r = self._run(unnamed, mode=self.BYPASS)
-        self.assertEqual((ctl["dec"], r["dec"]), ("deny", "deny"))
-        self.assertEqual(r["reason"], ctl["reason"], "обычный отказ в bypass переписан")
-        self.assertIn("| interactive | Bash | deny | delete |", r["log"])
-        self.assertNotIn(g.DECISION_UNATTENDED, r["log"])
-        self.assertEqual(r["pushes"], 0)
+        self.assertEqual(ctl["dec"], "deny")
+        for mode in (self.BYPASS, "dontAsk"):
+            with self.subTest(mode=mode):
+                r = self._run(green, mode=mode)
+                self.assertEqual((r["rc"], r["dec"]), (0, None),
+                                 "зелёное в режиме %s обязано молчать" % mode)
+                self.assertIn("| interactive | Bash | defer |", r["log"])
+                r = self._run(unnamed, mode=mode)
+                self.assertEqual(r["dec"], "deny")
+                self.assertEqual(r["reason"], ctl["reason"],
+                                 "обычный отказ в режиме %s переписан" % mode)
+                self.assertIn("| interactive | Bash | deny | delete |", r["log"])
+                self.assertNotIn(g.DECISION_UNATTENDED, r["log"])
+                self.assertEqual(r["pushes"], 0)
 
     def test_journal_branch_unchanged_in_bypass(self):
         """Журнальная ветка мертва (`card_gate` безусловна), но правило её не трогает: оживи её —
-        в bypass она по-прежнему молчит строкой лога, а не превращается в отказ."""
-        data = dict(self.KILL, cwd=PROJ, permission_mode=self.BYPASS)
-        dec, reason, pushed, log = self._main_inproc(data, {"card_gate": lambda *a, **k: False})
-        self.assertEqual((dec, pushed), (None, []))
-        self.assertIn("| interactive | Bash | journal | kill |", log)
+        в bypass и dontAsk она по-прежнему молчит строкой лога, а не превращается в отказ."""
+        for mode in (self.BYPASS, "dontAsk"):
+            with self.subTest(mode=mode):
+                data = dict(self.KILL, cwd=PROJ, permission_mode=mode)
+                dec, reason, pushed, log = self._main_inproc(
+                    data, {"card_gate": lambda *a, **k: False})
+                self.assertEqual((dec, pushed), (None, []))
+                self.assertIn("| interactive | Bash | journal | kill |", log)
 
-    # (д) пуш: bypass — ни одного, default — как раньше
+    # (д) пуш: dontAsk — ни одного; default и (с 16.10) bypass — как раньше
     def test_push_only_when_owner_can_answer(self):
         self.assertEqual(self._run(self.KILL, mode="default")["pushes"], 1)
-        self.assertEqual(self._run(self.KILL, mode=self.BYPASS)["pushes"], 0)
+        self.assertEqual(self._run(self.KILL, mode=self.BYPASS)["pushes"], 1,
+                         "bypass с 16.10 — обычный вопрос: карточка обязана уйти владельцу")
+        self.assertEqual(self._run(self.KILL, mode="dontAsk")["pushes"], 0)
+
+    # (ж) ни одна ветка не выдаёт allow — ни в каком режиме, ни в какой роли
+    def test_no_branch_returns_allow(self):
+        """«Байпас работает» (16.10.2026) значит «вопрос как обычно», а не «красное без да». Гард
+        allow не выдаёт вовсе (зелёное молчит `defer`, и авто-allow делает CLI, а не гард), и
+        снятие bypass из правила этого не меняет. Матрица: роль × режим (все названные и мусор) на
+        красном входе; ожидаемое решение — ровно одно из двух: отказ «владельца нет» только у
+        interactive + dontAsk, во всех прочих клетках — вопрос. Полную матрицу видов держат
+        `test_bypass_keeps_every_ask_kind_as_plain_question` и `test_dont_ask_mode_is_unattended_too`
+        (каждая клетка там тоже проверяет «не allow»)."""
+        for headless in (False, True):
+            for mode in (self.NO_FIELD, "default", "acceptEdits", "plan", "auto", self.BYPASS,
+                         "dontAsk", "", None, "allow"):
+                name = mode if mode is not self.NO_FIELD else "<нет поля>"
+                with self.subTest(headless=headless, mode=name):
+                    r = self._run(self.KILL, mode=mode, headless=headless)
+                    self.assertEqual(r["rc"], 0, r["stderr"])
+                    self.assertNotEqual(r["dec"], "allow", "ветка выдала allow")
+                    want = "deny" if (not headless and mode == "dontAsk") else "ask"
+                    self.assertEqual(r["dec"], want, r["reason"])
 
     # (е) строка лога: своя метка, читатель лога её не путает с ask, боевой лог не тронут
     def test_log_label_is_distinct_and_consumer_safe(self):
-        r = self._run(self.KILL, mode=self.BYPASS)
+        r = self._run(self.KILL, mode="dontAsk")
         lines = [ln for ln in r["log"].splitlines() if g.DECISION_UNATTENDED in ln]
         self.assertEqual(len(lines), 1, r["log"])
         self.assertTrue(lines[0].endswith("| interactive | Bash | deny_unattended | kill | "
@@ -5656,13 +5752,17 @@ class TestOwnerAwayNoQuestion(unittest.TestCase):
     def test_owner_away_is_total_and_role_bound(self):
         for data in (None, [], "bypassPermissions", 17, {}, {"permission_mode": None},
                      {"permission_mode": ["bypassPermissions"]}, {"permission_mode": {"a": 1}},
-                     {"permission_mode": "auto"}, {"permission_mode": "default"}):
+                     {"permission_mode": "auto"}, {"permission_mode": "default"},
+                     {"permission_mode": "bypassPermissions"}, {"permission_mode": ["dontAsk"]}):
             with self.subTest(data=data):
                 self.assertFalse(g.owner_away(data, False))
         for mode in g.UNATTENDED_MODES:
             self.assertTrue(g.owner_away({"permission_mode": mode}, False))
             self.assertFalse(g.owner_away({"permission_mode": mode}, True), "headless не трогаем")
-        self.assertEqual(set(g.UNATTENDED_MODES), {"bypassPermissions", "dontAsk"})
+        self.assertFalse(g.owner_away({"permission_mode": self.BYPASS}, True))
+        # 16.10.2026 (решение владельца): bypass из набора снят, dontAsk остаётся.
+        self.assertNotIn(self.BYPASS, g.UNATTENDED_MODES, "bypass вернулся в правило «владельца нет»")
+        self.assertEqual(set(g.UNATTENDED_MODES), {"dontAsk"})
 
 
 if __name__ == "__main__":
