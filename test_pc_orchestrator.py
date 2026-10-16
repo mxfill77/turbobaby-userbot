@@ -3561,6 +3561,52 @@ class TestWatchdogClassFix(unittest.TestCase):
             self.assertIsNone(o._find_pids_by_script("userbot_listen.py"))             # таймаут → None
 
 
+def _dispatch_notify_isolated():
+    """`dispatch_notify` БЕЗ живого файла окружения (17.10.2026, r5, ADD1 — дверь 2).
+
+    Импорт исполняет тело модуля: `_env = _load_env(ENV_PATH)` (dispatch_notify.py:83) открывает
+    ЖИВОЙ файл окружения корня (`_load_env`, :71), а `import pc_agent` (:90) грузит его второй раз
+    (`load_dotenv()`, pc_agent.py:116) и перестраивает корневой logging (`basicConfig`, :129).
+    Тест ниже судит только ТЕКСТОВЫЙ маршрут (`_RE_CLOSED`, `awaits_reply`) — ни токен, ни каналы
+    pc_agent ему не нужны. Поэтому НА ВРЕМЯ ИМПОРТА:
+      • открытие файла с именем файла окружения (open и io.open, по имени, в любом каталоге) идёт
+        на синтетический файл во временном каталоге — живой путь не открывается вовсе;
+      • `pc_agent` не импортируется (None в sys.modules → ImportError → штатный фолбэк каналов,
+        dispatch_notify.py:94-98), если его в процессе ещё нет;
+      • AGENT_BOT_TOKEN скрыт из os.environ — токен модуля пуст, а не унаследован от процесса.
+    Модуль уже импортирован → отдаём его как есть: тело второй раз не исполняется."""
+    mod = sys.modules.get("dispatch_notify")
+    if mod is not None:
+        return mod
+    env_name = os.path.normcase("." + "env")       # имя собрано конкатенацией (правило полосы)
+    syn = os.path.join(tempfile.mkdtemp(prefix="iso_dnotify_"), "synthetic_environment")
+    with io.open(syn, "w", encoding="utf-8") as f:
+        f.write("# синтетика r5: ни одного настоящего значения\n")
+    real_open = _iso_builtins.open
+
+    def _open(file, *a, **k):
+        if not isinstance(file, int):
+            try:
+                if os.path.normcase(os.path.basename(os.fspath(file))) == env_name:
+                    file = syn
+            except TypeError:
+                pass
+        return real_open(file, *a, **k)
+
+    block_agent = "pc_agent" not in sys.modules
+    with mock.patch.object(_iso_builtins, "open", _open), mock.patch.object(io, "open", _open), \
+            mock.patch.dict(os.environ):
+        os.environ.pop("AGENT_BOT_TOKEN", None)
+        if block_agent:
+            sys.modules["pc_agent"] = None
+        try:
+            import dispatch_notify as dn
+        finally:
+            if block_agent and sys.modules.get("pc_agent", False) is None:
+                sys.modules.pop("pc_agent")
+    return dn
+
+
 class TestDowntimeLife(unittest.TestCase):
     """ЧИСЛА ВОТЧДОГА: «сколько лежал» = ЖИЗНЬ ПРОЦЕССА, а не возраст файла (фикс 19.08.2026).
 
@@ -3795,7 +3841,7 @@ class TestDowntimeLife(unittest.TestCase):
         «СТОРОЖ ПОДНЯЛ» регулярку не находит (в исходнике она строчными, с `\\s+` вместо пробела
         и `[яё]` классом), и «нашлось 0» прочиталось как «зависимостей нет». Замок держим кодом,
         а не прозой: любой будущий редактор шапки увидит падение здесь."""
-        import dispatch_notify as dn
+        dn = _dispatch_notify_isolated()     # r5: импорт без живого файла окружения (помощник выше)
         for src, down in (("перезагрузка", 3600.0), ("наблюдение", 300.0),
                           ("жизни процесса не наблюдали", None),
                           ("в дыре наблюдений момент исчезновения не локализуется", None)):
@@ -3882,6 +3928,17 @@ class TestAgentHitByClosure(unittest.TestCase):
     карта знает ДВА. Отрицательные тесты покрывают ровно то, что раньше молчало."""
 
     def setUp(self):
+        # ИЗОЛЯЦИЯ РЕЕСТРА ФОРМ (17.10.2026, r5, ADD1 — дверь 1). Класс — прямой TestCase, мимо
+        # увода ручек заморозки в Base (:602-607). test_selfupdate_marks_the_agent_on_a_file_the_map_
+        # never_knew зовёт _selfupdate_restart_children без client_block_fn → боевой _client_block →
+        # client_contour.gate_route → _seen_bump → _seen_save (client_contour.py:931): при живой
+        # заморозке (флаг в корне с 21.08) прогон дописывал ЖИВОЙ pc_orchestrator.gate_seen.json — на
+        # каждом гейте self-update. Путь реестра — во временный каталог на время теста, addCleanup
+        # сразу за ним. Ручку заморозки и RELEASE_FILE не трогаем: маршрут теста тот же, меняется
+        # только место, куда реестр читается и пишется.
+        _tmp_seen = tempfile.mkdtemp(prefix="iso_agenthit_")
+        self.addCleanup(setattr, o.client_contour, "GATE_SEEN_FILE", o.client_contour.GATE_SEEN_FILE)
+        o.client_contour.GATE_SEEN_FILE = os.path.join(_tmp_seen, "gate_seen.json")
         o._agent_gap_said.clear()
         # КАНАЛЫ ГЛУШАТСЯ НА ВЕСЬ КЛАСС, а не в отдельном кейсе. Ветка пометки агента зовёт
         # `_cowork` и `_notify`, а те СПАВНЯТ процессы (запись в журнал мозга, карточка владельцу).
