@@ -34,6 +34,13 @@ PARENT = r"D:\claude_profile_2"          # только строка: профи
 SHIM = r"C:\Users\u\.local\bin\claude.exe"
 DOCTOR_OK = "Remote Control\n- Connected\n\n0 warnings found\n"
 CHILDREN = ["doctor", "named-channel", "rc-server"]
+# Перебивки входа профиля (16.10.2026, `rc_supervisor._drop_login_overrides`): CLI ставит их выше
+# `/login` профиля, поэтому при ЯВНОМ пути они ребёнку не наследуются. Имена — литералом, а не из
+# модуля: тест обязан поймать и правку самого перечня. Значения синтетические, не токены.
+OVERRIDES = ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+PROBE = "TB_RC_WIRING_KEEP_PROBE"        # посторонний ключ: обязан дойти до ребёнка как есть
+SYNTH = {OVERRIDES[0]: "synthetic-bearer-rc-wiring", OVERRIDES[1]: "synthetic-oauth-rc-wiring",
+         PROBE: "keep-rc-wiring"}
 
 
 class _Proc:
@@ -146,12 +153,21 @@ class TestChoiceFileReachesLiveWiring(unittest.TestCase):
                 self.assertEqual(_diff_keys(env, dict(os.environ)), [KEY])   # снят ровно он
 
     def test_path_sets_key_in_every_child(self):
-        self._choice(self.profile + "\n")
-        for who, kw in self._children().items():
-            with self.subTest(who):
-                env = self._effective(kw)
-                self.assertTrue(env.get(KEY) == self.profile, "ключ не равен пути из файла")
-                self.assertEqual(_diff_keys(env, dict(os.environ)), [KEY])
+        # Путь назван явно → ключ поставлен И перебивки входа сняты, всё прочее — как у родителя.
+        # Перебивки ставятся в СВОЁ окружение теста: без этого исход зависел бы от того, унаследовал
+        # ли процесс теста токен (чистое окружение не проверяло снятие вовсе, грязное — роняло тест).
+        with mock.patch.dict(os.environ, SYNTH):
+            self._choice(self.profile + "\n")
+            kids = self._children()
+            self.assertEqual(sorted(kids), CHILDREN)
+            for who, kw in kids.items():
+                with self.subTest(who):
+                    env = self._effective(kw)
+                    self.assertTrue(env.get(KEY) == self.profile, "ключ не равен пути из файла")
+                    for name in OVERRIDES:
+                        self.assertFalse(name in env, "перебивка входа %s дошла до ребёнка" % name)
+                    self.assertTrue(env.get(PROBE) == SYNTH[PROBE], "посторонний ключ не сохранён")
+                    self.assertEqual(_diff_keys(env, dict(os.environ)), sorted((KEY,) + OVERRIDES))
 
     def test_third_outcome_children_get_exactly_child_env_decision(self):
         # политика третьего исхода не судится; судится, что ребёнок получает ИМЕННО её

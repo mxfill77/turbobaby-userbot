@@ -327,6 +327,32 @@ RC_BLOCKERS = (
     "subscription auth not active",
 )
 
+# ── ВХОД ВЫБРАННОГО ПРОФИЛЯ НЕ ПЕРЕБИВАЕТСЯ УНАСЛЕДОВАННЫМ ТОКЕНОМ (16.10.2026) ──────────────
+# Зеркало правки строителей (`pc_orchestrator._drop_login_overrides`, та же дата). Файл выбора RC
+# решает профиль детей ключом CLAUDE_CONFIG_DIR, а в каталоге профиля лежит вход `/login`. CLI
+# ставит ANTHROPIC_AUTH_TOKEN и CLAUDE_CODE_OAUTH_TOKEN ВЫШЕ такого входа (справка CLI
+# «Authentication precedence», code.claude.com/docs/en/authentication). Значит токен, застрявший в
+# окружении супервизора, увёл бы обе ветки И doctor пре-флайта с профиля, названного файлом, МОЛЧА —
+# при честной строке журнала «путь … — ключ поставлен». Поэтому: путь назван явно (ACT_SET и ключ
+# поставлен) → имена снимаются из окружения ДЕТЕЙ; ОСНОВНОЙ, RC-страховка и env=None → окружение не
+# тронуто, байт-в-байт как до правки. Значения не читаются ни одной строкой (только `in` и `del` по
+# имени), в журнал уходят только ИМЕНА; окружение самого супервизора (`os.environ`) не трогается —
+# правится копия, которую собрал child_env.
+_PROFILE_LOGIN_OVERRIDES = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN")
+
+
+def _drop_login_overrides(env, choice, act_set="set"):
+    """Путь выбран явно (action == act_set и ключ в env равен выбору) → снять из env детей
+    перебивки входа → кортеж СНЯТЫХ ИМЁН. Иначе → () и env не тронут. Значений не касается.
+    act_set — константа ACT_SET выбиральщика, давшего решение (у profile_choice это "set")."""
+    if not (env is not None and choice is not None and getattr(choice, "action", None) == act_set
+            and getattr(choice, "value", "") and env.get(PROFILE_KEY) == choice.value):
+        return ()
+    gone = tuple(k for k in _PROFILE_LOGIN_OVERRIDES if k in env)
+    for k in gone:
+        del env[k]
+    return gone
+
 
 def child_env(chooser=None, base=None, repo=None):
     """Окружение детей супервизора (обе ветки И doctor пре-флайта) → (env | None, строка журнала).
@@ -355,6 +381,11 @@ def child_env(chooser=None, base=None, repo=None):
         return _rc_fallback(src, "рычаг сорвался (%s)" % type(e).__name__)
     if d.action == _pc.ACT_KEEP:
         return _rc_fallback(src, d.reason + bridge)
+    # путь назван явно → токен-перебивка входа детям (обеим веткам И doctor) не наследуется
+    gone = _drop_login_overrides(env, d, getattr(_pc, "ACT_SET", "set"))
+    if gone:
+        log.warning("учётка RC: в окружении супервизора перебивки входа %s — у детей (ветки и "
+                    "doctor) сняты (значения не читались)", ",".join(gone))
     return env, why
 
 
