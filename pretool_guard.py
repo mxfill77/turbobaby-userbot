@@ -15,9 +15,12 @@ pretool_guard.py — PreToolUse-хук Claude Code для ПК (D:\\turbobaby-bo
   КРАСНОЕ  (доктринальный список `_stays_red`) → ask (карточка в сессии) + 🔔 dispatch_notify.
   НЕИЗВЕСТНОЕ → defer с логом (доктрина VPS: незнакомая команда сама по себе НЕ красная);
   ошибка анализа самого гарда → ask (FAIL-SAFE, в сторону подтверждения, В ЛЮБОЙ роли).
-  ВЛАДЕЛЬЦА НЕТ У ЭКРАНА (12.10.2026): interactive + `permission_mode` bypassPermissions/dontAsk
-  во входе хука → любой ask уходит ОТКАЗОМ без пуша (`owner_away`). Разрешений это не добавляет:
-  «ждать человека» меняется на «отказ сейчас», allow гард не выдаёт по-прежнему.
+  ВЛАДЕЛЬЦА НЕТ У ЭКРАНА (12.10.2026): interactive + `permission_mode` dontAsk во входе хука →
+  любой ask уходит ОТКАЗОМ без пуша (`owner_away`; bypass снят из набора 16.10, d993ffaa).
+  POLICY-1610 (16.10.2026, воля владельца «вам — ни одного запроса»): interactive + bypass —
+  ЖЁСТКИЙ вид (`BYPASS_HARD_KINDS`) → отказ `deny_hard`, субагент (`agent_id`) → `deny_agent`,
+  основная сессия на нежёстком виде → пропуск без вывода (`pass_bypass`, defer). Блок у
+  `BYPASS_POLICY_ON`. allow гард не выдаёт ни одной веткой — как и было.
 
 КРАСНЫЙ список (НЕ смягчать): правка/чтение .env и секретов; удаление файлов
 (del/rm/rmdir/Remove-Item); правка КОНФИГА .claude (settings*.json / hooks / agents / commands /
@@ -389,6 +392,15 @@ _RED_CMD = [
          verbs={"systemctl"}),
     _red(r"(?i)\bschtasks\b", "schtasks", verbs={"schtasks"}),
     _red(r"(?i)git\s+push\b.*(--force|(?<![\w-])-f(?![\w]))", "git_force", verbs={"git"}),
+    # ПРИНУДИТЕЛЬНЫЙ PUSH БЕЗ СЛОВА force (16.10.2026, матрица POLICY-1610 G6–G8): refspec с `+`
+    # (`git push origin +main`, `+HEAD:main`) — та же перезапись удалённой истории, что
+    # `--force`, только для одной ссылки; `--mirror` переписывает и удаляет на удалённом ВСЕ
+    # ссылки. До правки все три формы шли `defer` во всех режимах и у агента — мимо слова
+    # владельца «принудительная перезапись кода на GitHub — всегда отказ». Ищем в ОДНОМ сегменте
+    # (`[^;&|\n]`): `git push origin main; echo +1` не краснеет; `+` — в начале слова (после
+    # пробела или кавычки), а не внутри (`refs/x+y`, `--push-option=+x` — не refspec).
+    _red(r"(?i)git\s+push\b[^;&|\n]*?(?:--mirror\b|(?<![^\s'\"])\+[^\s'\";&|])", "git_force",
+         verbs={"git"}),
     _red(r"(?i)git\s+reset\s+--hard", "git_force", verbs={"git"}),
     _red(r"(?i)git\s+clean(\s|$)", "git_force", verbs={"git"}),
     # `sqlite3` — ПОВОД РАЗОБРАТЬ, а не приговор: вид определяет `_sqlite_decide` по оператору
@@ -544,6 +556,9 @@ def _human(kind, obj=""):
         "read_secret": "Хочу прочитать секретный файл " + (o or ".env/сессия") + " (секреты/токен)",
         "edit_claude": "Хочу изменить конфиг Claude Code (.claude): " + (o or "*"),
         "edit_git": "Хочу изменить служебный файл git (.git — хуки и настройки исполняются следующей git-командой): " + (o or "*"),
+        # Правка исходника САМОГО гарда фоновым агентом (POLICY-1610): основной сессии такая
+        # запись зелёная (`_decide_write`), субагенту — нет, и фраза говорит, КТО правит.
+        KIND_EDIT_GUARD: "Хочу изменить исходник самого гарда (правит фоновый агент): " + (o or "*"),
         "write_outside": "Хочу записать за пределами проекта: " + (o or "вне D:\\turbobaby-bot"),
         "unknown": "Требуется подтверждение: команда не распознана как безопасная",
         # Канал вне реестра. Фраза называет ОБЪЕКТ — имя инструмента: это единственное, что гард
@@ -2287,8 +2302,18 @@ def _is_workflow_script(path):
 # Исключение 09.10.2026 (решение владельца в чате): ровно папка результатов аудита T27 — каждая
 # запись туда в двустороннем аудите приходила владельцу запросом. Остальной `C:/Users`, включая
 # соседние папки `Documents/Codex`, по-прежнему спрашивает.
+#
+# Исключение 16.10.2026, слово владельца дословно: «Запросы на разрешения всё приходят а я их
+# автоматом разрешаю решить бы этот момент». Замер журнала гарда с 15.10 10:14: 99 вопросов
+# `apply_patch` (Codex), из них 91 — запись в ровно эту папку результатов (81 Add, 10 Update);
+# перезамер по 16.10 19:49:03 — 100 и 93. Тот же прецедент, что 09.10: внесена ОДНА папка
+# `outputs`, не `new-chat` и не `Documents/Codex` — соседние папки (в т.ч. `2026-10-15`, ещё
+# 3 операции замера) и остальной `C:/Users` спрашивают как спрашивали. Порядок в `_decide_write`
+# не тронут: секреты, `.claude`, `.git` и вынос значения стоят ДО доверенных корней и внутри
+# этой папки краснеют как везде.
 _TRUSTED_ROOTS = ("D:/turbobaby-bike-bot", "D:/t27-apex", "D:/t27work", "D:/tmp",
-                  "C:/Users/mxfill1/Documents/Codex/2026-10-07/t27-migration-review/outputs")
+                  "C:/Users/mxfill1/Documents/Codex/2026-10-07/t27-migration-review/outputs",
+                  "C:/Users/mxfill1/Documents/Codex/2026-10-02/new-chat/outputs")
 _TRUSTED_ROOTS_N = tuple(os.path.normcase(os.path.normpath(p)) for p in _TRUSTED_ROOTS)
 
 
@@ -4014,7 +4039,10 @@ def _write_payload(ti):
     return "\n".join(parts)
 
 
-def _decide_write(ti, cwd):
+def _decide_write(ti, cwd, agent=False):
+    """Цель записи инструментом → решение. `agent` — вызов пришёл от СУБАГЕНТА (`is_agent_call`):
+    он меняет ровно одну ветку — исходник самого гарда (POLICY-1610, блок у `_is_guard_source`
+    ниже); всё прочее судится одинаково для основной сессии и для агента."""
     path = ti.get("file_path") or ti.get("notebook_path") or ""
     # `missing_is_secret=False`: цель инструмента — АБСОЛЮТНЫЙ путь, и «файла нет» тут значит
     # ровно «хранилища по этому пути нет», а не «не смогли разрешить». Портить нечего; вынос
@@ -4045,7 +4073,14 @@ def _decide_write(ti, cwd):
     # Исходники самого гарда — запись инструментом, она НИЧЕГО НЕ ИСПОЛНЯЕТ. Стоит СТРОГО ПОСЛЕ
     # секретов и конфига `.claude` (те спрашивают всегда, карве-аут их не обходит) и ДО проверки
     # «вне проекта» — иначе два файла гарда в клоне сервера так и остались бы `write_outside`.
+    # POLICY-1610 (16.10.2026, воля владельца): «основная сессия гард править может, иначе его
+    # нельзя будет чинить; фоновый агент — нет». Запись СУБАГЕНТА в исходник гарда — свой вид
+    # `edit_guard` (ЖЁСТКИЙ: в bypass отказ без вопроса). Основной сессии — прежний `defer`.
+    # ГРАНИЦА ЧЕСТНО: правка гарда ОБОЛОЧКОЙ (sed -i / cp / > поверх файла) этим видом НЕ
+    # ловится — Bash судится `_decide_bash`, и там исходник гарда своего вида не имеет (остаток).
     if _is_guard_source(path):
+        if agent:
+            return ("ask", KIND_EDIT_GUARD, path)
         return ("defer", "", "")
     if not _inside_project(path) and not _sanctioned_outside(path):
         return ("ask", "write_outside", path)
@@ -4059,6 +4094,208 @@ def _decide_read(ti, cwd):
     if _is_secret_path(path, missing_is_secret=False):
         return ("ask", "read_secret", os.path.basename(path))
     return ("defer", "", "")
+
+
+# ══ КАНАЛ apply_patch (Codex) СУДИТСЯ КАК ЗАПИСЬ, А НЕ КАК «НЕИЗВЕСТНЫЙ» (16.10.2026) ══════════
+# Живой класс: Codex правит файлы своим инструментом `apply_patch`, хук зовёт этот же гард, а
+# `decide` имени не знал → `unknown_tool`, карточка на КАЖДУЮ правку. Замер журнала гарда
+# с 15.10 10:14: 99 вопросов `apply_patch`, все `ask | unknown_tool` (по 16.10 19:49:03 — 100).
+# Слово владельца 16.10: «Запросы на разрешения всё приходят а я их автоматом разрешаю решить бы
+# этот момент» — карточка, которую подтверждают не читая, не защищает ничего.
+#
+# ПРАВИЛО. Патч разбирается, и КАЖДАЯ цель записи (Add File / Update File / Move to) судится
+# РОВНО как Write: `_decide_write` с абсолютным путём (относительный — от `cwd` хука) и
+# ДОБАВЛЯЕМЫМ текстом (строки `+`). Поэтому секреты, конфиг `.claude`, нутро `.git`, вынос
+# значения и «вне проекта» спрашивают тем же видом, что у Write, — своего списка у канала нет.
+# Файл, который ИСЧЕЗАЕТ (Delete File и источник Move), — `delete`. Сводятся операции по
+# правилу у `AP_MIXED` ниже (с 16.10 вечера — уже не «первый не-defer побеждает»).
+#
+# ГРАНИЦЫ, каждая fail-closed (→ `unknown_tool` с причиной в объекте): нет `*** Begin Patch`
+# первой строкой или `*** End Patch` последней; ноль операций; пустой путь; путь без корня
+# (`D:docs/x`, относительный от cwd хука без корня — см. `_ap_abs`); строка `***` вне
+# известного набора; `*** Move to` не сразу после `*** Update File`; строка, которая на своём
+# месте не тело и не заголовок. Заголовок — ТОЛЬКО строка, начинающаяся маркером с НУЛЕВОЙ
+# колонки: тело (`+`/`-`/` `/`@@`) им не бывает, и `+*** Delete File: x` внутри содержимого
+# операции не рождает. Обратная сторона тоже закрыта: вне Update строка с отступом не разобрана
+# и спрашивает — если парсер Codex обрезает пробелы вокруг заголовка (так в исходнике
+# `codex-rs/apply-patch`; с установленной версией не сверено), ` *** Delete File: x` после тела
+# Add для него заголовок, и молча пройти она не должна.
+_AP_BEGIN, _AP_END, _AP_EOF = "*** Begin Patch", "*** End Patch", "*** End of File"
+_AP_HEADS = (("*** Add File: ", "add"), ("*** Delete File: ", "delete"),
+             ("*** Update File: ", "update"))
+_AP_MOVE = "*** Move to: "
+AP_FAIL = "apply_patch: разбор не удался — "
+
+
+def _ap_snip(line):
+    """Начало строки патча для причины отказа: одной строкой и коротко (объект карточки)."""
+    s = " ".join((line or "").split())
+    return s if len(s) <= 40 else s[:40] + "…"
+
+
+def _apply_patch_texts(ti):
+    """Тексты патча из входа инструмента. `command`, если в нём патч, ПЛЮС каждое другое строковое
+    поле с `*** Begin Patch`: какое из них применит Codex, вход не говорит — судим все."""
+    if isinstance(ti, str):
+        return [ti] if _AP_BEGIN in ti else []
+    if not isinstance(ti, dict):
+        return []
+    cmd = ti.get("command")
+    out = [cmd] if isinstance(cmd, str) and _AP_BEGIN in cmd else []
+    out += [v for k, v in ti.items()
+            if k != "command" and isinstance(v, str) and _AP_BEGIN in v]
+    return out
+
+
+def _apply_patch_ops(text):
+    """Разбор ОДНОГО патча → (операции, причина отказа | ""). Операция — [вид, путь, добавленные
+    строки, путь назначения Move]; вид ∈ add | delete | update. Строки делятся по `\\n` с
+    отсечением `\\r` в конце — как `str::lines` у Codex, а не `splitlines` с его десятком
+    разделителей."""
+    lines = [ln[:-1] if ln.endswith("\r") else ln for ln in (text or "").strip().split("\n")]
+    if lines[0].strip() != _AP_BEGIN:
+        return [], "первая строка не «%s»" % _AP_BEGIN
+    if len(lines) < 2 or lines[-1].strip() != _AP_END:
+        return [], "последняя строка не «%s»" % _AP_END
+    ops, state = [], "top"           # top | add | update_head (Move ещё можно) | update
+    for no, line in enumerate(lines[1:-1], 2):
+        head = next(((m, k) for m, k in _AP_HEADS if line.startswith(m)), None)
+        if head:
+            path = line[len(head[0]):].strip()
+            if not path:
+                return [], "строка %d: пустой путь у «%s»" % (no, head[0].strip())
+            ops.append([head[1], path, [], ""])
+            state = {"add": "add", "delete": "top", "update": "update_head"}[head[1]]
+            continue
+        if line.startswith(_AP_MOVE):
+            if state != "update_head":
+                return [], "строка %d: «*** Move to» не сразу после «*** Update File»" % no
+            dest = line[len(_AP_MOVE):].strip()
+            if not dest:
+                return [], "строка %d: пустой путь у «*** Move to»" % no
+            ops[-1][3] = dest
+            state = "update"
+            continue
+        if line.startswith("***"):
+            if line.strip() == _AP_EOF:
+                state = "update" if state == "update_head" else state
+                continue
+            if line.strip() == _AP_END:
+                return [], "строка %d: «%s» не последней строкой" % (no, _AP_END)
+            return [], "строка %d: незнакомая строка «%s»" % (no, _ap_snip(line))
+        if state == "add":
+            if line.startswith("+"):
+                ops[-1][2].append(line[1:])
+                continue
+            state = "top"            # тело Add кончается первой строкой не с `+`, как у Codex
+        if state in ("update_head", "update"):
+            if not line.strip() or line[0] in "+- " or line.startswith("@@"):
+                if line.startswith("+"):
+                    ops[-1][2].append(line[1:])
+                state = "update"
+                continue
+            return [], "строка %d: в «*** Update File» строка не с «+», «-», « » или «@@»" % no
+        if not line.strip():
+            continue                 # пустая строка между операциями операции не несёт
+        return [], "строка %d: ждали заголовок операции, а не «%s»" % (no, _ap_snip(line))
+    if not ops:
+        return [], "в патче ни одной операции"
+    return ops, ""
+
+
+_AP_SEPS = ("/", "\\")
+
+
+def _ap_abs(path, base):
+    """Цель патча → путь С КОРНЕМ, либо '' — где ляжет файл, по входу не определить.
+
+    Путь `D:docs/x` (диск назван, корня нет) Windows кладёт от ТЕКУЩЕГО КАТАЛОГА ПРОЦЕССА Codex на
+    этом диске — его гард не видит. `os.path.join` такой путь склеивал с cwd хука (тот же диск)
+    или отдавал голым (другой диск), и голый `_decide_write` судил ОТ PROJECT, а за «d:» не видно
+    сегмента `.claude`/`.git`: из чата Codex на C: `Update File: D:.claude/settings.json` и
+    `Add File: D:.git/hooks/pre-commit` давали `defer` (круг правок 16.10, тесты
+    `test_drive_relative_target_*`). Канал Write такой путь не носит — его цель абсолютная."""
+    drv, rest = os.path.splitdrive(path)
+    if drv and rest[:1] not in _AP_SEPS:
+        return ""
+    p = path if os.path.isabs(path) else os.path.join(base, path)
+    return p if os.path.splitdrive(p)[1][:1] in _AP_SEPS else ""
+
+
+# ── НЕСКОЛЬКО КРАСНЫХ ОПЕРАЦИЙ В ОДНОМ ПАТЧЕ (находка приёмки APPLY_PATCH, 16.10.2026) ────────
+# Было «первая красная операция побеждает». Замер приёмки: патч «Add вне проекта + Update
+# `.claude/settings.json`» давал `write_outside`, карточка не называла settings.json, а талон
+# демона на `write_outside` освобождал и правку конфига, которую гард не показал. С POLICY-1610
+# цена выросла: нежёсткий первый вид в bypass основной сессии — ПРОПУСК без вопроса, и жёсткая
+# операция за ним исполнилась бы молча. Правило теперь (каждая операция судится прежним
+# правилом, `_ap_op_verdict`; сводится ВСЁ множество красных):
+#   • все красные одного вида — первая из них, как было;
+#   • среди красных ровно ОДИН ЖЁСТКИЙ вид (`BYPASS_HARD_KINDS`) — он, где бы ни стоял;
+#   • иначе (два разных жёстких, или разные нежёсткие) — fail-closed `unknown_tool` с перечнем
+#     видов в объекте: назвать одну операцию карточкой значило бы спрятать остальные.
+#
+# ОДНА ОПЕРАЦИЯ Move — ТРИ ДЕЙСТВИЯ, и тот же принцип внутри неё (второй круг POLICY-1610, находка
+# матрицы D6): источник переписан, назначение записано, источник ИСЧЕЗАЕТ. Было «первый не-defer
+# побеждает», и `Update suggest.py` + `Move to C:\Users\Public\…` давал `write_outside`
+# назначения: с POLICY-1610 это ПРОПУСК в bypass основной сессии — файл молча уходил из проекта,
+# хотя тот же Move в `tmp/` давал `delete` (отказ). Теперь: жёсткий вид источника или назначения
+# называет операцию сам, как было (`.claude`, секрет, `.git`, гард агента); иначе — `delete`
+# источника, даже если запись дала нежёсткий `write_outside` (жёсткое не прячется за нежёстким).
+AP_MIXED = "разные красные виды в одном патче: "
+
+
+def _ap_op_verdict(kind, src, body, dst, cwd, agent=False):
+    """Приговор ОДНОЙ операции патча. Delete → `delete`; Add/Update — цель как Write; Move —
+    жёсткий вид правки источника, затем жёсткий вид назначения, иначе `delete` источника (он
+    исчезает): нежёсткий `write_outside` у Move приговором не бывает (блок выше)."""
+    if kind == "delete":
+        return ("ask", "delete", src)
+    res = _decide_write({"file_path": src, "content": body}, cwd, agent)
+    if not dst:
+        return res
+    if res[0] != "defer" and res[1] in BYPASS_HARD_KINDS:
+        return res
+    res = _decide_write({"file_path": dst, "content": body}, cwd, agent)
+    if res[0] != "defer" and res[1] in BYPASS_HARD_KINDS:
+        return res
+    return ("ask", "delete", src)         # источник Move исчезает
+
+
+def _decide_apply_patch(ti, cwd, agent=False):
+    """Канал `apply_patch` Codex → решение по ЦЕЛЯМ патча (правило и границы — блок выше).
+
+    Сначала разбор ВСЕГО входа и пути всех целей, потом приговор: неопределимый путь — сбой
+    разбора, как пустой, а не очередная операция. Иначе красная операция перед ним назвала бы
+    карточку своим видом, и «да» на этот вид освободило бы запись, которую гард не судил.
+    Приговор — по МНОЖЕСТВУ красных операций (блок у `AP_MIXED`), а не по первой."""
+    texts = _apply_patch_texts(ti)
+    if not texts:
+        return ("ask", KIND_UNKNOWN_TOOL, AP_FAIL + "нет «%s» ни в одном поле" % _AP_BEGIN)
+    base = cwd or PROJECT
+    plan = []
+    for text in texts:
+        ops, why = _apply_patch_ops(text)
+        if why:
+            return ("ask", KIND_UNKNOWN_TOOL, AP_FAIL + why)
+        for kind, path, added, dest in ops:
+            src, dst = _ap_abs(path, base), (_ap_abs(dest, base) if dest else "")
+            bad = path if not src else (dest if dest and not dst else "")
+            if bad:
+                return ("ask", KIND_UNKNOWN_TOOL,
+                        AP_FAIL + "путь «%s» без корня — куда он ляжет, решает текущий каталог "
+                                  "процесса Codex, а не вход" % _ap_snip(bad))
+            plan.append((kind, src, "\n".join(added), dst))
+    reds = [v for v in (_ap_op_verdict(k, s, b, d, cwd, agent) for k, s, b, d in plan)
+            if v[0] != "defer"]
+    if not reds:
+        return ("defer", "", "")
+    kinds = list(dict.fromkeys(v[1] for v in reds))      # виды в порядке патча, без повторов
+    if len(kinds) == 1:
+        return reds[0]                                   # один вид — первая операция, как было
+    hard = [k for k in kinds if k in BYPASS_HARD_KINDS]
+    if len(hard) == 1:
+        return next(v for v in reds if v[1] == hard[0])  # жёсткий вид не прячется за первым
+    return ("ask", KIND_UNKNOWN_TOOL, AP_FAIL + AP_MIXED + ", ".join(kinds))
 
 
 # ══ ОБЁРТКА git_serial_pc.py СУДИТСЯ КАК ТА git-КОМАНДА, КОТОРУЮ ОНА ИСПОЛНЯЕТ (03.10.2026) ════
@@ -4607,13 +4844,45 @@ _TOOL_CHANNELS = {
     "Glob":         (CHANNEL_GREEN, "поиск по ИМЕНАМ файлов, только чтение"),
 }
 
+# Каналы CODEX (16.10.2026) — ОТДЕЛЬНЫЙ словарь, потому что живого matcher, с которым их можно
+# сверить, нет: `.codex/hooks.json` держит matcher `Bash|PowerShell|Edit|Write|Read|MultiEdit|
+# NotebookEdit`, имени `apply_patch` в нём НЕТ, а хук под этим именем ПРИХОДИТ — по замеру журнала
+# гарда (100 вызовов 15.10 10:14 – 16.10 19:49:03, `tool_name` = `apply_patch`, патч в
+# `tool_input["command"]`). Как Codex сводит своё имя к matcher, из репозитория не видно; держатель
+# — замер, а не догадка. Сторож (`TestChannelRegistry`) сверяет `_TOOL_CHANNELS` с matcher
+# `.claude/*`, а имена `decide` — с объединением обоих словарей; пересекаться словари не смеют.
+_CODEX_CHANNELS = {
+    "apply_patch":  (CHANNEL_GUARD, "_decide_apply_patch — каждая цель патча судится как Write, "
+                                    "исчезающий файл — delete; хук приходит под этим именем "
+                                    "мимо matcher .codex/hooks.json — по замеру журнала 15–16.10"),
+}
+
 KIND_UNKNOWN_TOOL = "unknown_tool"   # канал вне реестра: гард про него не знает ничего
 UNNAMED_TOOL = "имя инструмента не названо"
+KIND_EDIT_GUARD = "edit_guard"       # запись СУБАГЕНТА в исходник гарда (POLICY-1610, `_decide_write`)
+
+
+def is_agent_call(data):
+    """True ⇔ инструмент зовёт СУБАГЕНТ: во входе хука `agent_id` — непустая строка (так поле
+    описано в справке хуков Claude Code: у вызова субагента во входе есть `agent_id`).
+
+    ОСОЗНАННЫЙ ВЫБОР POLICY-1610: `agent_id` пустой, не строка, отсутствует, вход не dict →
+    ОСНОВНАЯ СЕССИЯ. Довод: основную сессию от субагента отличает только это поле, и выдумывать
+    агента из мусора значило бы отказывать владельцу в его же сессии. Цена названа: клиент,
+    который поле не шлёт (Codex), читается основной сессией — но и режим bypass он в хук не
+    передаёт (замер журнала 12.10–16.10), так что правило bypass его не касается. Строка из
+    одних пробелов — НЕпустая строка, то есть агент: сомнение здесь уходит в сторону отказа.
+    Без исключений по построению (isinstance, а не try)."""
+    if not isinstance(data, dict):
+        return False
+    a = data.get("agent_id")
+    return isinstance(a, str) and a != ""
 
 
 def channel_status(tool):
     """Статус канала по имени инструмента → CHANNEL_GUARD | CHANNEL_GREEN | '' (нет в реестре)."""
-    return (_TOOL_CHANNELS.get((tool or "").strip()) or ("", ""))[0]
+    t = (tool or "").strip()
+    return (_TOOL_CHANNELS.get(t) or _CODEX_CHANNELS.get(t) or ("", ""))[0]
 
 
 def decide(data):
@@ -4621,8 +4890,9 @@ def decide(data):
     tool = data.get("tool_name") or ""
     ti = data.get("tool_input") or {}
     cwd = data.get("cwd") or PROJECT
+    agent = is_agent_call(data)            # субагент: исходник гарда для него — `edit_guard`
     if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
-        return _decide_write(ti, cwd)
+        return _decide_write(ti, cwd, agent)
     if tool == "Read":
         return _decide_read(ti, cwd)
     # PowerShell — ОТДЕЛЬНЫЙ инструмент от Bash, и на этом ПК он основной. До правки он не
@@ -4631,6 +4901,9 @@ def decide(data):
     # Invoke-WebRequest / .env) уже описаны в _RED_CMD в PowerShell-форме — переиспользуем их.
     if tool in ("Bash", "PowerShell"):
         return _decide_bash(ti.get("command") or "", cwd)
+    # Codex правит файлы патчем (16.10.2026): цели судятся как Write, см. `_decide_apply_patch`.
+    if tool == "apply_patch":
+        return _decide_apply_patch(ti, cwd, agent)
     if channel_status(tool) == CHANNEL_GREEN:
         return ("defer", "", "")          # держатель НАЗВАН в реестре, см. `_TOOL_CHANNELS`
     # Канала нет в реестре: не «read-only по умолчанию», а неизвестный канал → fail-closed.
@@ -4740,10 +5013,21 @@ def _is_stamp_place(lines, i):
 # ВОЗВРАЩАТЬ НЕЛЬЗЯ: `op=` — признак ВИДА СТРОКИ, а класс операции обязан иметь происхождение.
 # Виды, которые вообще могут быть одобрены. Список ЗАКРЫТЫЙ: незнакомое слово в карточке
 # одобрением не становится (`op=other` — честное «класс не назван» → одобрения нет).
+# 16.10.2026 (POLICY-1610): + `edit_guard` — двадцать второе имя.
 _KIND_VOCAB = ("delete", "kill", "schtasks", "git_force", "sqlite", "clasp", "clasp_push",
                "clasp_deploy", "clasp_run", "live_sheet", "network", "env", "outside",
                "write_outside", "py_write", "edit_secret", "read_secret", "edit_claude",
-               "edit_git", "unknown", KIND_UNKNOWN_TOOL)
+               "edit_git", KIND_EDIT_GUARD, "unknown", KIND_UNKNOWN_TOOL)
+
+# ЖЁСТКИЕ ВИДЫ POLICY-1610 — список владельца 16.10 дословно по смыслу («самое опасное — всегда
+# отказ: пароли и ключи, удаление важных файлов, принудительная перезапись кода на GitHub, правка
+# самого гарда и настроек») плюс два имени НЕЗНАНИЯ гарда (fail-closed: `unknown` — сбой разбора
+# самого гарда, `unknown_tool` — канал вне реестра; иначе сбой гарда в bypass стал бы тихим
+# пропуском). Читают: правило bypass (`bypass_verdict`) и сводка многооперационного патча
+# (`_decide_apply_patch`). Это НЕ `_HARD_CARD` (тот — «не молчать даже без объекта») и НЕ
+# `_TOP_TIER` (тот — «необратимо», вид карточки): у трёх списков разные вопросы.
+BYPASS_HARD_KINDS = ("env", "read_secret", "edit_secret", "delete", "git_force", "edit_claude",
+                     "edit_git", KIND_EDIT_GUARD, "unknown", KIND_UNKNOWN_TOOL)
 
 
 def owner_approved_kinds(env=None):
@@ -5302,6 +5586,7 @@ def _stays_red(kind, obj, cmd):
                 "outside", "write_outside",               # требование п.1: правки ТОЛЬКО внутри репо
                 "edit_claude",                            # иначе сессия молча расширит собственные права
                 "edit_git",                               # хук/настройка .git = код на следующем зелёном git
+                KIND_EDIT_GUARD,                          # субагент правит сам гард (POLICY-1610)
                 KIND_UNKNOWN_TOOL):                       # канал вне реестра (02.08.2026)
         # ПОЧЕМУ КАНАЛ ВНЕ РЕЕСТРА СТОИТ ИМЕННО ЗДЕСЬ. Без этой строки fail-closed из `decide`
         # умер бы прямо ниже: последняя строка функции («незнакомое САМО ПО СЕБЕ не красное»)
@@ -5381,19 +5666,56 @@ _RE_SECRET_VALUE = re.compile(
     r"(?i)([A-Za-z_]*(?:token|api_?key|secret|password|passwd|pwd)[A-Za-z_]*)(\s*[=:]\s*)(\S+)")
 
 
-def _log_line(role, tool, action, kind, detail):
+def _log_line(role, tool, action, kind, detail, tail=""):
     """Одна строка лога. Значения токенов/паролей маскируем: лог обязан быть безопасным
-    артефактом (сам файл под *.log в .gitignore, но печатать секреты нельзя и локально)."""
+    артефактом (сам файл под *.log в .gitignore, но печатать секреты нельзя и локально).
+    `tail` — хвост наблюдаемости POLICY-1610 (`log_tail`), ставится ПОСЛЕ команды отдельным
+    полем: все прежние поля стоят на своих местах, а пустой хвост даёт строку байт-в-байт прежнюю."""
     d = _RE_SECRET_VALUE.sub(lambda m: m.group(1) + m.group(2) + "***", (detail or "").replace("\n", " "))
     if len(d) > 300:
         d = d[:300] + "…"
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return f"{ts} | {role} | {tool or '-'} | {action} | {kind or '-'} | {d}"
+    line = f"{ts} | {role} | {tool or '-'} | {action} | {kind or '-'} | {d}"
+    return line + " | " + tail if tail else line
+
+
+# ── ХВОСТ НАБЛЮДАЕМОСТИ POLICY-1610: `mode=<режим|-> agent=<1|0>` НА КАЖДОЙ СТРОКЕ ЛОГА ─────────
+# Зачем: правило bypass судит по двум полям входа хука, которых в логе не было вовсе, — и замер
+# «как приходят Codex, субагенты и основная сессия» без них невозможен. Значение `agent_id` НЕ
+# печатается — только наличие. Режим печатается безопасной формой: не строка/пусто → `-`, знаки
+# вне `[A-Za-z0-9_.-]` → `_` (мусор вида «bypassPermissions » виден как `bypassPermissions_` и с
+# настоящим режимом не путается), длина ≤ 40. Контекст взводится в `main` ОДИН раз, до первой
+# строки лога, — латчем, как признак пробы: строк лога в прогоне несколько (`card`, `marker`), и
+# каждая обязана нести хвост без протаскивания параметра. Вне `main` (тесты, чужие вызовы) —
+# `mode=- agent=0`.
+_LOG_CTX_NONE = ("-", "0")
+_LOG_CTX = _LOG_CTX_NONE
+_LOG_MODE_BAD = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def log_ctx_of(data):
+    """(режим, агент) для хвоста лога из входа хука. Без исключений по построению."""
+    if not isinstance(data, dict):
+        return _LOG_CTX_NONE
+    m = data.get("permission_mode")
+    mode = _LOG_MODE_BAD.sub("_", m)[:40] if isinstance(m, str) and m else "-"
+    return (mode, "1" if is_agent_call(data) else "0")
+
+
+def set_log_ctx(data):
+    """Взвести контекст хвоста лога на прогон хука (None → сброс к `mode=- agent=0`)."""
+    global _LOG_CTX
+    _LOG_CTX = log_ctx_of(data) if data is not None else _LOG_CTX_NONE
+
+
+def log_tail():
+    return "mode=%s agent=%s" % _LOG_CTX
 
 
 def _log(role, tool, action, kind, detail, path=None):
     """Дописать решение в лог. Смягчение не должно стоить прозрачности: пишем ОБЕ роли и ОБА
-    решения (defer и ask). Лог вторичен — никогда не роняет решение гарда."""
+    решения (defer и ask). Лог вторичен — никогда не роняет решение гарда. Каждая строка несёт
+    хвост `log_tail()` (POLICY-1610)."""
     p = path or os.getenv("PRETOOL_GUARD_LOG")
     if not p:
         # Под тестом лог уезжает в temp: фикстуры прогона (clasp push / sqlite3 / пустая
@@ -5412,7 +5734,7 @@ def _log(role, tool, action, kind, detail, path=None):
             except Exception:
                 pass
         with open(p, "a", encoding="utf-8") as f:
-            f.write(_log_line(role, tool, action, kind, detail) + "\n")
+            f.write(_log_line(role, tool, action, kind, detail, log_tail()) + "\n")
     except Exception:
         pass
 
@@ -5441,6 +5763,9 @@ _ROLLBACK = {
     # Названный объект уводит разбор в `_rollback` → `_claude_cfg_tracked`.
     "edit_claude": "Откат: вернуть прежний файл конфига — из git, если он под git; иначе из бэкапа",
     "edit_git": "Откат: .git в истории не хранится — прежнее вернуть вручную, подложенный хук удалить",
+    # Без имени файла НАМЕРЕННО: объект — один из четырёх исходников гарда (`_GUARD_SOURCES`), и
+    # строка, назвавшая другой, рождала бы отказ замка `_rollback_conflicts`, а не карточку.
+    KIND_EDIT_GUARD: "Откат: вернуть прежний текст исходника гарда из git (git checkout -- <путь>)",
     "outside": "Откат: удалить созданное вручную — это вне репозитория",
     "write_outside": "Откат: удалить созданное вручную — это вне репозитория",
     "py_write": "Откат: боевую запись Bridge снимает только обратная операция (void_last/…)",
@@ -5851,6 +6176,7 @@ _CONSEQ = {
     "read_secret": "файл %s будет прочитан целиком, и его содержимое ляжет в контекст сессии",
     "edit_claude": "команда исполнится, и конфиг Claude Code %s станет другим",
     "edit_git": "команда исполнится, и служебный файл git %s станет другим — сработает на следующей git-команде",
+    KIND_EDIT_GUARD: "фоновый агент перепишет исходник гарда %s — со следующего вызова гард решает по новому тексту",
     # Гард не разобрал команду — и честная фраза говорит ИМЕННО ЭТО, а не выдумывает эффект.
     # Отказывать здесь нельзя: вид `unknown` держит hard-блок, и «карточки нет» у него означало
     # бы, что владелец не может подтвердить НИ ОДНУ неразобранную команду.
@@ -6119,7 +6445,7 @@ def card_gate(kind, obj, num=""):
           спрашивают как спрашивали; без объекта получают в `card_decision` `deny` наравне со
           всеми. Требование списка («молчать нельзя») отказ удовлетворяет строже вопроса.
         • ОБЪЕКТ: решать, что делать при его отсутствии, обязан `card_decision`, а не эта
-          функция. Без названного объекта ЛЮБОЙ из 21 вида (с 23.09.2026 — вместе с edit_git) получит там `deny` (17.08.2026;
+          функция. Без названного объекта ЛЮБОЙ из 22 видов (с 23.09.2026 — вместе с edit_git, с 16.10.2026 — с edit_guard) получит там `deny` (17.08.2026;
           до этого — только 8 видов `_TOP_TIER`). Разбор — ниже.
 
     ПОЧЕМУ ФУНКЦИЯ ОСТАЛАСЬ, А НЕ СНЯТА ВМЕСТЕ С ВЕТКОЙ. Это ЕДИНСТВЕННОЕ названное место
@@ -6196,7 +6522,7 @@ def card_decision(kind, obj="", raw_cmd=""):
         ask     — карточка как была (обычный вид; высший вид — с шапкой);
         journal — НЕДОСТИЖИМО с 02.08.2026 (класс Д-3): `card_gate` безусловна. Ветка оставлена
                   единственной точкой, где правило спрашивают, и снимется вместе с ним;
-        deny    — ОБЪЕКТ НЕ НАЗВАН, у ЛЮБОГО из 21 вида: карточку не выписываем ВОВСЕ.
+        deny    — ОБЪЕКТ НЕ НАЗВАН, у ЛЮБОГО из 22 видов: карточку не выписываем ВОВСЕ.
 
     Про `deny` отдельно, потому что это единственное место, где гард ЗАПРЕЩАЕТ, а не спрашивает.
     Позиция «хук только добавляет подтверждения» не нарушена: `deny` строже `ask`, новых
@@ -6240,6 +6566,14 @@ def card_decision(kind, obj="", raw_cmd=""):
     подтвердить вслепую нельзя (ровно так прошла карточка «лист не определён» 31.07), а
     молчаливого исполнения не было и нет. `_HARD_CARD` от этого не ослаб — он требует, чтобы
     вид НЕ МОЛЧАЛ, и `deny` это требование удовлетворяет строже, чем `ask`."""
+    return _card_decision_ex(kind, obj, raw_cmd)[:2]
+
+
+def _card_decision_ex(kind, obj="", raw_cmd=""):
+    """`card_decision` + третий элемент: True ⇔ ответ родился на ЗАПАСНОЙ ветке (сбой разбора
+    ВНУТРИ карточки → except → прежний ask). Нужен ровно `main` (POLICY-1610): сбой гарда в
+    bypass не имеет права стать тихим пропуском, а снаружи запасной ask неотличим от штатного.
+    Решение и текст — байт-в-байт прежние."""
     try:
         o, n = _card_fields(kind, obj, raw_cmd)
         # ПОРЯДОК ЗНАЧИМ И ПЕРЕСТАВЛЕН 17.08.2026 вместе с расширением: отказ считается ДО
@@ -6251,16 +6585,16 @@ def card_decision(kind, obj="", raw_cmd=""):
             # Подсказка отказа — `o or obj`: у `py_write` цель не извлеклась и `o` пуст, но
             # ИМЯ операции гард знает. Без него модель не поймёт, что именно назвать в команде,
             # и обучающий текст перестанет обучать.
-            return ("deny", _deny_text(kind, o or obj, raw_cmd))
+            return ("deny", _deny_text(kind, o or obj, raw_cmd), False)
         blocked = _card_blocked(kind, o, raw_cmd, obj)
         if blocked:
             _log("guard", "card", "deny", kind, blocked)
-            return ("deny", _deny_text(kind, o, raw_cmd, blocked))
+            return ("deny", _deny_text(kind, o, raw_cmd, blocked), False)
         if not card_gate(kind, o, n):
-            return ("journal", "")
+            return ("journal", "", False)
     except Exception:
-        pass
-    return ("ask", _card(kind, obj, raw_cmd))
+        return ("ask", _card(kind, obj, raw_cmd), True)
+    return ("ask", _card(kind, obj, raw_cmd), False)
 
 
 def card_or_journal(kind, obj="", raw_cmd=""):
@@ -6714,11 +7048,172 @@ def unattended_text(card, kind, mode):
     return UNATTENDED_NOTE % (label, kind or "-", label, PROBE_CARD_SEP, card)
 
 
+# ══ POLICY-1610: «ВАМ — НИ ОДНОГО ЗАПРОСА» (16.10.2026, воля владельца) ═══════════════════════
+# Слово владельца (native-чат К3 Рок): «Запросы на разрешения всё приходят а я их автоматом
+# разрешаю решить бы этот момент», «Я не знаю что от чего отличается всегда опзрешаю всё», и
+# «Да» на предложение: вам — ни одного запроса; основная сессия делает нужное сама; фоновые
+# агенты на опасное получают отказ; самое опасное — всегда отказ (пароли и ключи, удаление
+# важных файлов, принудительная перезапись кода на GitHub, правка самого гарда и настроек).
+# Спецификация — `tmp/k3_0910/rok1610/guardpatch/POLICY_1610_SPEC.md`.
+#
+# ПРАВИЛО (только interactive; headless — карточка в маркер, как была). Применяется, когда гард
+# уже решил «карточка» (`card is not None` в `main`), и к СБОЮ разбора самого гарда:
+#   dontAsk ............................ любой вид ...... отказ, как был ...... `deny_unattended`
+#   bypassPermissions .................. ЖЁСТКИЙ вид ..... отказ без вопроса .. `deny_hard`
+#   bypassPermissions, субагент ........ любой вид ...... отказ без вопроса .. `deny_agent`
+#   bypassPermissions, основная сессия . не жёсткий ..... пропуск (defer) .... `pass_bypass`
+#   прочие режимы и режим не назван .... любой вид ...... вопрос, как был .... `ask`
+# ЖЁСТКИЙ вид — `BYPASS_HARD_KINDS`; сверх него жёстким считается: сбой разбора гарда (except в
+# `main` и запасной ask `card_decision`), вид вне `_KIND_VOCAB`, жёсткий вид, СПРЯТАННЫЙ в той же
+# команде оболочки за первым красным видом карточки (`hidden_hard_kinds`), и УДАЛЕНИЕ ФАЙЛОВ
+# ПИТОНОМ (`py_fs_delete_hard`: вид `py_write` с файловым токеном — «удаление важных файлов» из
+# слова владельца, хотя вид у карточки не `delete`). Субагент — `agent_id` непустой строкой
+# (`is_agent_call`; пустой/не строка/нет поля — основная сессия, осознанно).
+#
+# ПОЧЕМУ ПРОПУСК — ЭТО НЕ allow. `pass_bypass` — тот же `defer` без вывода: гард решения не
+# принимает и отдаёт вызов штатному потоку, а в bypass штатный поток пропускает без вопроса. Это
+# воля владельца для ОСНОВНОЙ сессии на НЕжёстком виде — и только для неё. allow гард не выдаёт
+# ни одной веткой; deny блокирует и в bypass (справка хуков Claude Code), причину видит модель.
+#
+# ЧЕГО ПРАВИЛО НЕ МЕНЯЕТ: dontAsk (`UNATTENDED_MODES`) и headless — байт-в-байт; Codex режим
+# bypass в хук не передаёт (99 вопросов `apply_patch` и в окне 12.10–16.10 остались `ask`), и
+# его редкие оставшиеся вопросы остаются вопросами, пока замер по хвосту лога (`log_tail`) не
+# покажет, как его опознать. Обычный `deny` (объект не назван) и `journal` не трогаются.
+#
+# ОТКАТ одной строкой: `BYPASS_POLICY_ON = False` — bypass снова означает прежний ask (как с
+# d993ffaa), хвост лога при этом остаётся.
+BYPASS_POLICY_ON = True
+BYPASS_MODE = "bypassPermissions"
+DECISION_HARD = "deny_hard"          # метки лога — `\w+` (опись шума), ≠ ask, ≠ «| deny |»
+DECISION_AGENT = "deny_agent"
+DECISION_PASS_BYPASS = "pass_bypass"
+BYPASS_HARD_NOTE = ("Самое опасное — всегда отказ без вопроса (воля владельца 16.10). Нужно — "
+                    "объясни владельцу в чате простыми словами и дай ему готовую команду; сам не "
+                    "обходи и не дроби.")
+BYPASS_AGENT_NOTE = ("Фоновый агент: опасное — отказ без вопроса (воля владельца 16.10). Обойди "
+                     "безопасным путём или запиши остаток для основной сессии; не дроби и не "
+                     "маскируй.")
+BYPASS_DENY_FMT = "⛔ %s\nВид операции: %s. Операция НЕ выполнена.\n%s\n%s"
+
+
+def bash_red_kinds_all(cmd, cwd):
+    """ВСЕ доктринально красные виды команды Bash/PowerShell → кортеж (вид, объект).
+
+    Сестра `red_kinds_bash` с тремя отличиями, и каждое — ради правила bypass, где первый вид
+    карточки решает «пропуск или отказ»: заходов не 3, а сколько видов в словаре (цикл кончается
+    на первом повторе — видов конечное число); у `clasp_*` гасится и общее правило `clasp`
+    (иначе второй заход вернул бы тот же `clasp_push` и сбор встал бы, не дойдя до `.env` за
+    ним); и сверху — вынос значения секрета (`_secret_value_leak_bodies`/`_env_value_out`),
+    который `_decide_bash` проверяет только у команды, НЕ красной иначе. Фильтр `_stays_red` —
+    тот же, что у карточки. ГРАНИЦА: второй вид из ОДНОГО тела python-скрипта (`_scan_python`
+    отдаёт первый) не перечисляется — остаток, названный у `red_kinds_bash`."""
+    if not cmd:
+        return ()
+    cmd = _git_serial_unwrap(cmd, cwd)
+    scan = _scan_text(cmd)
+    probe = (_env_reach(cmd) if _RE_ENV.search(scan) else None) is not None
+    found, skip = [], set()
+    for _ in range(len(_KIND_VOCAB) + 2):
+        action, kind, obj = _decide_bash_body(cmd, cwd, scan, probe, skip_kinds=frozenset(skip))
+        if action != "ask" or not kind or kind in skip:
+            break
+        if _stays_red(kind, obj, cmd):
+            found.append((kind, obj))
+        skip.add(kind)
+        if kind.startswith("clasp"):
+            skip.add("clasp")
+    leak = _secret_value_leak_bodies(cmd) or _env_value_out(cmd)
+    if leak:
+        found.append(("env", leak))
+    return tuple(found)
+
+
+def hidden_hard_kinds(data):
+    """ЖЁСТКИЕ виды в ТОЙ ЖЕ команде оболочки, что и карточка, → кортеж (пусто — нет).
+
+    Класс тот же, что у многооперационного патча (`AP_MIXED`): `_decide_bash_body` отдаёт ПЕРВОЕ
+    совпавшее правило, и `taskkill /PID 1 /F; git push --force` давал карточку `kill`. Пока
+    bypass означал вопрос, карточка спрашивала про всю строку (и называла вторую операцию,
+    `SECOND_OP_MARK`); с POLICY-1610 нежёсткий первый вид основной сессии — ПРОПУСК, и
+    принудительный push за ним исполнился бы молча. Прочие каналы: одна цель на вызов, патч
+    сводит свои операции сам (`_decide_apply_patch`)."""
+    tool = (data.get("tool_name") or "").strip()
+    if tool not in ("Bash", "PowerShell"):
+        return ()
+    ti = data.get("tool_input") or {}
+    cmd = ti.get("command") or ""
+    cwd = data.get("cwd") or PROJECT
+    return tuple(k for k, o in bash_red_kinds_all(cmd, cwd)
+                 if k in BYPASS_HARD_KINDS or py_fs_delete_hard(cmd, k, o))
+
+
+def py_fs_delete_hard(cmd, kind, obj):
+    """УДАЛЕНИЕ ФАЙЛОВ ПИТОНОМ — жёсткое для правила bypass (второй круг POLICY-1610, находка
+    приёмки): `python -c "import os; os.remove('D:/turbobaby-bot/suggest.py')"` и
+    `shutil.rmtree('D:/turbobaby-bot/docs')` — вид `py_write`, не `delete`, и в bypass основной
+    сессии шли ПРОПУСКОМ (живой гард спрашивал), мимо слова владельца «удаление важных файлов —
+    всегда отказ». Вид карточки НЕ меняется (вне bypass вопрос прежний байт-в-байт) — меняется
+    только ответ правила bypass.
+
+    True ⇔ вид `py_write` с файловым токеном (`_PY_FS_TOKENS`) и НЕ ДОКАЗАНО, что все цели
+    временные. Доказательство — только литералы в тексте команды: каждый вызов каждого файлового
+    токена называет цель литералом, и цель во временной зоне — тем же прибором, что у `rm`
+    (`_is_temp_zone` / `_is_posix_tmp_target`, `_delete_targets_all_temp`). Токен из тела скрипта
+    (в команде вызова нет), цель переменной, вызов под псевдонимом — не доказано, жёстко.
+    ГРАНИЦА: файловый токен ВТОРЫМ за боевым токеном Bridge в одном теле (`_scan_python` отдаёт
+    первый) и удаление формами вне `_PY_FS_TOKENS` (`Path.unlink`, `os.removedirs`) здесь не
+    видны — остаток того же класса, что второй вид одного тела python у `bash_red_kinds_all`."""
+    if kind != "py_write" or obj not in _PY_FS_TOKENS:
+        return False
+    targets = [_py_literal_target(a) for tok in _PY_FS_TOKENS for a in _py_call_args(cmd, tok)]
+    return not (targets and all(
+        t and (_is_temp_zone(t) or _is_posix_tmp_target(t)) for t in targets))
+
+
+def bypass_hard(data, kind, obj=""):
+    """Жёсткий ли случай для правила bypass. Fail-closed: вид вне словаря и любой сбой разбора
+    спрятанных видов — жёсткий (сомнение уходит в отказ, а не в пропуск). `obj` — объект разбора
+    (у `py_write` — токен операции): по нему узнаётся удаление файлов питоном."""
+    k = (kind or "").strip()
+    if k in BYPASS_HARD_KINDS or k not in _KIND_VOCAB:
+        return True
+    try:
+        cmd = (data.get("tool_input") or {}).get("command") or ""
+        return py_fs_delete_hard(cmd, k, obj) or bool(hidden_hard_kinds(data))
+    except Exception:
+        return True
+
+
+def bypass_verdict(data, headless, kind, failsafe=False, obj=""):
+    """Метка POLICY-1610 → `DECISION_HARD` | `DECISION_AGENT` | `DECISION_PASS_BYPASS`, либо None
+    (правило молчит — прежний путь). Порядок строк таблицы: жёсткое раньше агента, агент раньше
+    пропуска. Режим сверяется ТОЧНО (`== "bypassPermissions"`): мусор, регистр, пробел — не bypass,
+    то есть прежний вопрос. Без исключений до разбора спрятанных видов (isinstance, а не try)."""
+    if not BYPASS_POLICY_ON or headless or not isinstance(data, dict):
+        return None
+    mode = data.get("permission_mode")
+    if not (isinstance(mode, str) and mode == BYPASS_MODE):
+        return None
+    if failsafe or bypass_hard(data, kind, obj):
+        return DECISION_HARD
+    if is_agent_call(data):
+        return DECISION_AGENT
+    return DECISION_PASS_BYPASS
+
+
+def bypass_text(verdict, inner, kind):
+    """Текст отказа POLICY-1610 модели: приписка (дословно из спецификации), вид, затем ДОСЛОВНО
+    то, что гард собирался показать, — после `PROBE_CARD_SEP`, как у `unattended_text`."""
+    note = BYPASS_HARD_NOTE if verdict == DECISION_HARD else BYPASS_AGENT_NOTE
+    return BYPASS_DENY_FMT % (note, kind or "-", PROBE_CARD_SEP, inner or "")
+
+
 def main():
     try:
         data = json.load(sys.stdin)
     except Exception:
         sys.exit(0)  # вход не распарсили → штатный flow (defer)
+    set_log_ctx(data)       # хвост `mode=… agent=…` — на КАЖДУЮ строку лога этого прогона
     headless = is_headless()
     role = "headless" if headless else "interactive"
     tool, detail = "", ""
@@ -6728,18 +7223,38 @@ def main():
         detail = ti.get("command") or ti.get("file_path") or ti.get("notebook_path") or ""
     except Exception:
         pass
+    # НЕ СТРОКА (число/список в `command`/`file_path`) — разбору показать нечего. Без этой строки
+    # `is_probe(123)` падал ВНЕ try ниже, `main` выходил кодом 1, а его CLI считает НЕблокирующей
+    # ошибкой хука — то есть исполнением, мимо fail-safe (матрица POLICY-1610 F3, приёмка: Bash с
+    # числом в `command`). Теперь сбой ловит `decide_for_role` ниже → `unknown` (в bypass —
+    # `deny_hard`, в прочих режимах — прежний отказ без объекта).
+    if not isinstance(detail, str):
+        detail = ""
     # ЕДИНЫЙ ПРИЗНАК ПРОБЫ считается ОДИН раз и ДО первой записи в любой канал владельца: ниже
     # к ним ведут три места, и все три обязаны быть изолированы, не сговариваясь между собой.
     set_probe(is_probe(detail))
+    failsafe = False
     try:
         action, kind, obj = decide_for_role(data, headless)
     except Exception:
         # FAIL-SAFE в ЛЮБОЙ роли: ошибку анализа НЕ смягчаем (иначе сбой гарда = тихий пропуск,
         # а permissions.allow здесь широкий — гард единственный красный гейт).
         action, kind, obj = ("ask", "unknown", "")
+        failsafe = True
+    # ПРАВКА ИСХОДНИКА ГАРДА — НЕ ПРОБА (второй круг POLICY-1610, находка приёмки: 32 клетки).
+    # Признак пробы ПО МЕСТУ (`_is_probe_script`) судит ЗАПУСКАЕМЫЙ скрипт, а у записи в
+    # `test_pretool_guard.py` / `tests/test_guard_card_min.py` имя `test_*.py` — ЦЕЛЬ записи:
+    # карточка `edit_guard` агента гасилась как проба — без пуша, а в headless маркер уходил в
+    # пробный файл, которого демон не видит (спецификация: «карточка в маркер, как была»). Вид
+    # новый, прежнего поведения у него нет; у прочих видов латч прежний байт-в-байт. Изоляция
+    # тест-прогона (окружение) и env-префикс команды остаются в силе.
+    if kind == KIND_EDIT_GUARD:
+        set_probe(is_test_run() or _cmd_declares_probe(detail))
     card, deny = None, None
     if action == "ask":
-        decision, text = card_decision(kind, obj, detail if tool in ("Bash", "PowerShell") else "")
+        decision, text, failed = _card_decision_ex(
+            kind, obj, detail if tool in ("Bash", "PowerShell") else "")
+        failsafe = failsafe or failed   # запасной ask карточки — тоже сбой гарда (POLICY-1610)
         action = decision          # ask → карточка; journal → строка в лог; deny → отказ
         card = text if decision == "ask" else None
         deny = text if decision == "deny" else None
@@ -6748,6 +7263,15 @@ def main():
     if card is not None and owner_away(data, headless):
         deny = unattended_text(card, kind, data.get("permission_mode"))
         card, action = None, DECISION_UNATTENDED
+    # POLICY-1610 (16.10.2026): bypass — жёсткое и агент отказ, основная сессия без вопроса. ДО
+    # лога и ДО `_emit_ask`: ни пуша, ни маркера по построению. Таблица — у `BYPASS_POLICY_ON`.
+    if card is not None or failsafe:
+        verdict = bypass_verdict(data, headless, kind, failsafe, obj)
+        if verdict == DECISION_PASS_BYPASS:
+            card, action = None, verdict            # defer: без вывода, штатный поток
+        elif verdict is not None:
+            deny = bypass_text(verdict, card if card is not None else deny, kind)
+            card, action = None, verdict
     _log(role, tool, action, kind, detail)
     if deny is not None:
         _emit_deny(deny)

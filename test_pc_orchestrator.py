@@ -127,8 +127,396 @@ class FakeBridge:
         return {"ok": True, "id": self._id}
 
 
+# ═══ ЗАКРЫТЫЙ BASE ПО УМОЛЧАНИЮ (r2, 16.10.2026; остаток проверки TB-PROCWATCH-ISOLATION-1610-1942) ═══
+# Блок r1 в начале Base.setUp закрыл четыре двери fire-and-forget и три пути. Проверка назвала ещё
+# восемь выходов наружу, достижимых из process_new/poll_once, и общий корень: Base НЕ ЗАКРЫТ ПО
+# УМОЛЧАНИЮ — тест, забывший подменить дверь, уходит наружу молча. Здесь каждая такая дверь стоит
+# РЕГИСТРАТОРОМ С ОТКАЗОМ: попытка ложится в self.door_hits и поднимает BaseDoorClosed с текстом
+# «дверь X … закрыта в Base; подмени в тесте явно». Тест, подменяющий дверь сам, делает это ПОСЛЕ
+# setUp — его подмена перекрывает регистратор, поведение у него прежнее.
+#
+# ОТКАЗ СТОИТ НА ГРАНИЦЕ, КОТОРУЮ ТЕСТЫ УЖЕ ПОДМЕНЯЮТ САМИ, а не поверх функций демона: тесты зовут
+# НАСТОЯЩИЕ run_claude/_gate_test_modules/_git_out/_moderation_reply_send, подменив под ними
+# o.subprocess.Popen/run или o.urllib.request.urlopen (34 места o.subprocess), и регистратор поверх
+# функции сломал бы их все. Поэтому:
+#   • ПОДПРОЦЕСС (двери 2, 3, 5, 6 и всё прочее): Popen._execute_child — точка, где Popen создаёт
+#     процесс. Отказ — только когда в стеке есть кадр pc_orchestrator (запускает КОД ДЕМОНА, в том
+#     числе через pc_agent/shtab_box_run/git_serial_pc); собственные подпроцессы теста (python -c …,
+#     selfupdate_gate.code_gate) идут как прежде. Подмена o.subprocess.Popen/run тестом стоит выше
+#     этой точки и до неё не доходит. PermissionError — тот же класс, каким ОС отвечает на
+#     запрещённый запуск: ветки демона, ловящие OSError, видят обычный отказ, а не новый вид сбоя.
+#   • СЕТЬ (дверь 4): urllib.request.urlopen и socket (create_connection/connect/connect_ex/
+#     getaddrinfo), то же условие «зовёт код демона»; петля 127.0.0.1/::1 разрешена (socketpair asyncio).
+#   • ДВЕРЬ 1 — функцией: o._restart_via_pc_agent. Ниже неё `import pc_agent`, а сам импорт грузит
+#     файл окружения и открывает журнал агента в корне (pc_agent.py:116, :127); настоящую функцию не
+#     зовёт ни один тест (все места подменяют её целиком). maybe_update_bots закрыт ЧЕРЕЗ свои
+#     двери (git, гейт unittest, рестарт): его зовут напрямую 13 тестов с инъекциями.
+#   • ПУТИ (двери 7, 8): result_spill.REPORTS_DIR, client_contour.TRAINER_GREEN_FILE (живое состояние
+#     ворот) — во временный каталог; TRAINER_CASES_FILE (корпус в git) — на байтовую копию, снятую
+#     один раз на процесс (corpus_sha тот же, вердикты голденов не меняются).
+#   • МАРКЕР pc_ask_<tid>.marker и tmp/pc_report строятся в _run_task_impl из глобального REPO (шва
+#     нет, :3526/:3550). Их уводит ВИД ПУТИ: open/io.open/os.remove/os.unlink/os.path.exists|isfile|
+#     isdir|lexists/os.makedirs|mkdir для ровно этих двух семейств путей БОЕВОГО корня работают в
+#     каталоге теста. Строка пути не меняется (env ребёнка, сравнения в тестах) — меняется место.
+#   • GIT ВО ВРЕМЕННОМ КАТАЛОГЕ ТЕСТА (r3, 16.10.2026) — ЕДИНСТВЕННОЕ исключение двери 2/5: git кода
+#     демона идёт, только когда его репозиторий — временный каталог теста (_iso_git_temp_refusal):
+#     cwd внутри tempfile.gettempdir(), ни одного аргумента-пути вне его (значит и в REPO), ни одной
+#     GIT_*-переменной с путём, и git найдёт репозиторий ВНУТРИ temp (настоящий каталог .git) — либо
+#     не найдёт никакого, потому что temp лежит вне REPO и выше него .git нет. git в живом REPO
+#     (а у _plain это cwd=REPO всегда, когда тест REPO не увёл) — отказ, как в r2.
+import builtins as _iso_builtins            # noqa: E402
+import socket as _iso_socket                # noqa: E402
+import subprocess as _iso_subprocess        # noqa: E402
+import urllib.parse as _iso_urlparse        # noqa: E402
+import urllib.request as _iso_urlreq        # noqa: E402
+
+
+class BaseDoorClosed(PermissionError):
+    """Дверь наружу закрыта в Base: тест дошёл до неё, не подменив явно."""
+
+
+_ISO_O_GLOBALS = vars(o)
+_ISO_LIVE_REPO = os.path.normcase(os.path.abspath(o.REPO))
+_ISO_PC_REPORT = os.path.join(_ISO_LIVE_REPO, "tmp", "pc_report")
+_ISO_POPEN = _iso_subprocess.Popen                    # настоящий класс, снят до любой подмены тестом
+_ISO_GIT_WRITE = frozenset((
+    "add", "commit", "checkout", "reset", "restore", "rm", "mv", "merge", "pull", "push", "fetch",
+    "stash", "switch", "rebase", "cherry-pick", "revert", "tag", "branch", "apply", "am", "clean",
+    "update-index", "worktree", "gc"))
+_ISO_LOOPBACK = frozenset(("127.0.0.1", "::1", "localhost", "", "None"))
+
+
+def _iso_cases_copy():
+    """Байтовая копия корпуса тренажёра — одна на процесс. Нечитаем → копии нет, и corpus_sha
+    ответит '' — тем же исходом, что у нечитаемого живого файла."""
+    dst = os.path.join(tempfile.mkdtemp(prefix="iso_cases_"), "trainer_cases.json")
+    try:
+        shutil.copyfile(o.client_contour.TRAINER_CASES_FILE, dst)
+    except OSError:
+        pass
+    return dst
+
+
+_ISO_CASES = _iso_cases_copy()
+
+
+def _iso_demon_chain(depth=3):
+    """Имена функций КОДА ДЕМОНА в текущем стеке (ближняя первой) | [] — запускает не демон."""
+    names, f = [], sys._getframe(1)
+    while f is not None and len(names) < depth:
+        if f.f_globals is _ISO_O_GLOBALS:
+            names.append(f.f_code.co_name)
+        f = f.f_back
+    return names
+
+
+def _iso_spawn_door(args):
+    """argv подпроцесса → (дверь, что это словами). Значения аргументов в текст не идут."""
+    if isinstance(args, (str, bytes)):
+        toks = (args.decode("utf-8", "replace") if isinstance(args, bytes) else args).replace('"', " ").split()
+    else:
+        toks = [str(x) for x in args]
+    exe = os.path.basename(toks[0]).lower() if toks else ""
+    stem = exe[:-4] if exe.endswith(".exe") else exe
+    if stem == "git":
+        rest = toks[1:]
+        while len(rest) >= 2 and rest[0] in ("-C", "-c"):
+            rest = rest[2:]
+        sub = rest[0] if rest else "?"
+        return ("5" if sub in _ISO_GIT_WRITE else "2"), "git %s в REPO" % sub
+    if stem == "ssh":
+        return "3", "ssh на VPS"
+    if "claude" in stem:
+        return "6", "claude -p"
+    if stem in ("taskkill", "schtasks"):
+        return "1", "%s: живые процессы и задачи ПК" % stem
+    if stem in ("powershell", "pwsh", "tasklist", "wmic"):
+        return "П", "%s: опрос процессов ПК" % stem
+    if "-m" in toks and "unittest" in toks:
+        return "2", "гейт unittest в REPO"
+    scripts = [os.path.basename(t) for t in toks[1:] if t.lower().endswith(".py")]
+    return "0", "подпроцесс %s %s" % (stem or "?", scripts[0] if scripts else "")
+
+
+_ISO_GIT_PATH_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+                     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES")
+
+
+def _iso_under(p, root):
+    return p == root or p.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _iso_git_temp_refusal(args, cwd, env):
+    """git кода демона → None (репозиторий — временный каталог теста, пускаем) | причина отказа.
+
+    Правило r3 (решение по остатку r2): git разрешён ТОЛЬКО когда cwd/репозиторий — временный
+    каталог теста и среди аргументов нет пути в REPO. «Временный» — внутри tempfile.gettempdir(),
+    но не сам корень temp. Какой репозиторий git возьмёт, решает ПОИСК ВВЕРХ от cwd, поэтому:
+      • .git нашёлся внутри temp — он обязан быть настоящим каталогом без commondir/alternates
+        (файл «gitdir: …» или ссылка увели бы git куда угодно, в том числе в живой REPO);
+      • не нашёлся — пускаем, только если temp лежит ВНЕ REPO и выше temp нет ни одного .git:
+        иначе поиск дошёл бы до живого репозитория (так под пробой, где temp внутри дерева)."""
+    if isinstance(args, (str, bytes)):
+        toks = (args.decode("utf-8", "replace") if isinstance(args, bytes) else args).replace('"', " ").split()
+    else:
+        toks = [str(x) for x in args]
+    if cwd is None:
+        return "cwd не задан — git искал бы репозиторий от каталога процесса"
+    t_root = os.path.normcase(os.path.abspath(tempfile.gettempdir()))
+    if _iso_under(_ISO_LIVE_REPO, t_root):
+        return "корень temp содержит REPO"
+    eff = os.path.normcase(os.path.abspath(os.fspath(cwd)))
+    rest = toks[1:]
+    while len(rest) >= 2 and rest[0] in ("-C", "-c"):
+        if rest[0] == "-C":
+            eff = os.path.normcase(os.path.abspath(os.path.join(eff, rest[1])))
+        rest = rest[2:]
+    if eff == t_root or not _iso_under(eff, t_root):
+        return "cwd вне временного каталога теста"
+    for tok in toks[1:]:
+        for val in ([tok, tok.split("=", 1)[1]] if "=" in tok else [tok]):
+            low = os.path.normcase(val)
+            if _ISO_LIVE_REPO in low and not _iso_under(os.path.normcase(os.path.abspath(val)), t_root):
+                return "аргумент с путём в REPO"
+            if os.path.isabs(val) or os.sep in low or "/" in val or ".." in val:
+                if not _iso_under(os.path.normcase(os.path.abspath(os.path.join(eff, val))), t_root):
+                    return "аргумент-путь вне временного каталога"
+    e = os.environ if env is None else env
+    for k in _ISO_GIT_PATH_ENV:
+        if str(e.get(k) or "").strip():
+            return "задан %s" % k
+    for k, v in e.items():
+        if str(k).upper().startswith("GIT_") and _ISO_LIVE_REPO in os.path.normcase(str(v)):
+            return "%s указывает в REPO" % k
+    d = eff
+    while True:
+        g = os.path.join(d, ".git")
+        if os.path.lexists(g):
+            if (not os.path.isdir(g) or os.path.islink(g)
+                    or getattr(os.path, "isjunction", lambda _p: False)(g)):
+                return ".git временного дерева не каталог (указатель gitdir/ссылка)"
+            if (os.path.lexists(os.path.join(g, "commondir"))
+                    or os.path.lexists(os.path.join(g, "objects", "info", "alternates"))):
+                return ".git временного дерева ссылается наружу (commondir/alternates)"
+            return None                       # репозиторий внутри temp: git не выйдет из него
+        if d == t_root:
+            break
+        up = os.path.dirname(d)
+        if up == d:
+            break
+        d = up
+    if _iso_under(t_root, _ISO_LIVE_REPO):
+        return "репозитория в temp нет, а temp внутри REPO — поиск вверх нашёл бы живой репозиторий"
+    up = os.path.dirname(t_root)
+    while True:                               # выше temp: ни одного чужого .git
+        if os.path.lexists(os.path.join(up, ".git")):
+            return "выше temp лежит .git — git взял бы чужой репозиторий"
+        nxt = os.path.dirname(up)
+        if nxt == up:
+            return None                       # репозитория нет нигде: git ответит «not a git repository»
+        up = nxt
+
+
+def _iso_close_doors(test, tmp):
+    """Поставить двери Base (см. шапку блока). Каждая подмена — с addCleanup сразу за собой."""
+    hits = test.door_hits = []           # (дверь, что, цепочка функций демона) — отказы
+    moved = test.iso_paths = []          # (семейство, операция) — уведённые в каталог теста пути
+    let = test.git_let = []              # (дверь, что, цепочка) — git, пущенный во временный каталог (r3)
+
+    def refuse(key, what, chain):
+        hits.append((key, what, " ← ".join(chain)))
+        raise BaseDoorClosed("дверь %s (%s ← o.%s) закрыта в Base; подмени в тесте явно"
+                             % (key, what, " ← ".join(chain) or "?"))
+
+    def put(owner, name, value):
+        had = name in getattr(owner, "__dict__", {})
+        prev = getattr(owner, name)
+        setattr(owner, name, value)
+        if had:
+            test.addCleanup(setattr, owner, name, prev)
+        else:
+            test.addCleanup(delattr, owner, name)
+        return prev
+
+    # ── подпроцессы кода демона: двери 2, 3, 5, 6 и прочие ─────────────────────────────────────
+    prev_exec = getattr(_ISO_POPEN, "_execute_child", None)
+
+    def _execute_child(self_p, args, *rest, **kw):
+        chain = _iso_demon_chain()
+        if chain:
+            key, what = _iso_spawn_door(args)
+            if what.startswith("git "):          # двери 2/5: исключение r3 — репозиторий в temp
+                why = _iso_git_temp_refusal(args, rest[4] if len(rest) > 4 else kw.get("cwd"),
+                                            rest[5] if len(rest) > 5 else kw.get("env"))
+                if why is None:
+                    let.append((key, what.replace(" в REPO", " во временном каталоге"), " ← ".join(chain)))
+                    return prev_exec(self_p, args, *rest, **kw)
+                what = "%s (%s)" % (what, why)
+            refuse(key, what, chain)
+        return prev_exec(self_p, args, *rest, **kw)
+    if prev_exec is not None:            # Popen подменён целиком ещё до импорта — его дверь чужая
+        put(_ISO_POPEN, "_execute_child", _execute_child)
+
+    # ── сеть кода демона: дверь 4 ──────────────────────────────────────────────────────────────
+    def _far(host):
+        return str(host) not in _ISO_LOOPBACK
+
+    def _addr_host(address):
+        try:
+            return address[0]
+        except Exception:                 # noqa: BLE001 — форма адреса не наша забота, отказ по стеку
+            return "?"
+    prev_uo = _iso_urlreq.urlopen
+
+    def urlopen(url, *a, **k):
+        chain = _iso_demon_chain()
+        if chain:
+            host = (_iso_urlparse.urlsplit(str(getattr(url, "full_url", url))).hostname or "?").lower()
+            refuse("4", "HTTP %s" % ("Telegram Bot API" if host == "api.telegram.org" else "<хост скрыт>"),
+                   chain)
+        return prev_uo(url, *a, **k)
+    put(_iso_urlreq, "urlopen", urlopen)
+    prev_cc = _iso_socket.create_connection
+
+    def create_connection(address, *a, **k):
+        if _far(_addr_host(address)):
+            chain = _iso_demon_chain()
+            if chain:
+                refuse("4", "сеть: соединение <хост скрыт>", chain)
+        return prev_cc(address, *a, **k)
+    put(_iso_socket, "create_connection", create_connection)
+    prev_gai = _iso_socket.getaddrinfo
+
+    def getaddrinfo(host, *a, **k):
+        if _far(host):
+            chain = _iso_demon_chain()
+            if chain:
+                refuse("4", "сеть: разрешение имени <хост скрыт>", chain)
+        return prev_gai(host, *a, **k)
+    put(_iso_socket, "getaddrinfo", getaddrinfo)
+    for _nm in ("connect", "connect_ex"):
+        _prev_c = getattr(_iso_socket.socket, _nm)
+
+        def _conn(sock, address, _prev_c=_prev_c):
+            if _far(_addr_host(address)):
+                chain = _iso_demon_chain()
+                if chain:
+                    refuse("4", "сеть: сокет <хост скрыт>", chain)
+            return _prev_c(sock, address)
+        put(_iso_socket.socket, _nm, _conn)
+
+    # ── дверь 1: рестарт живых ботов механикой pc_agent ────────────────────────────────────────
+    def _restart_via_pc_agent(kind, *a, **k):
+        refuse("1", "pc_agent stop/start: taskkill и подъём живого %s" % kind,
+               ["_restart_via_pc_agent"] + _iso_demon_chain())
+    put(o, "_restart_via_pc_agent", _restart_via_pc_agent)
+
+    # ── двери 7 и 8: пути мимо log_setup.state_path ────────────────────────────────────────────
+    put(o.result_spill, "REPORTS_DIR", os.path.join(tmp, "reports"))
+    put(o.client_contour, "TRAINER_GREEN_FILE", os.path.join(tmp, "pc_orchestrator.client_trainer_green.json"))
+    put(o.client_contour, "TRAINER_CASES_FILE", _ISO_CASES)
+
+    # ── маркер и черновик доклада: вид пути боевого корня → каталог теста ─────────────────────
+    view = os.path.join(tmp, "repo_view")
+    os.makedirs(view, exist_ok=True)     # маркер открывают на «a» — каталог обязан быть
+
+    def m(p, op):
+        if isinstance(p, int):
+            return p
+        try:
+            s = os.fspath(p)
+        except TypeError:
+            return p
+        if not isinstance(s, str) or ("pc_ask_" not in s and "pc_report" not in s):
+            return p
+        sa = os.path.abspath(s)
+        a = os.path.normcase(sa)
+        if (os.path.dirname(a) == _ISO_LIVE_REPO and os.path.basename(a).startswith("pc_ask_")
+                and a.endswith(".marker")):
+            moved.append(("marker", op))
+            return os.path.join(view, os.path.basename(sa))
+        if a == _ISO_PC_REPORT or a.startswith(_ISO_PC_REPORT + os.sep):
+            moved.append(("pc_report", op))
+            return os.path.join(view, "tmp", "pc_report") + sa[len(_ISO_PC_REPORT):]
+        return p
+    def _viewed(prev, op, kw):
+        """Обёртка «первый довод — путь»: позиционный или по имени (file/path/name)."""
+        def fn(*a, **k):
+            if a:
+                a = (m(a[0], op),) + a[1:]
+            elif kw in k:
+                k[kw] = m(k[kw], op)
+            return prev(*a, **k)
+        return fn
+    put(_iso_builtins, "open", _viewed(_iso_builtins.open, "open", "file"))
+    put(io, "open", _viewed(io.open, "open", "file"))
+    for _mod, _nm, _kw in ((os, "remove", "path"), (os, "unlink", "path"), (os, "makedirs", "name"),
+                           (os, "mkdir", "path"), (os.path, "exists", "path"), (os.path, "isfile", "path"),
+                           (os.path, "isdir", "s"), (os.path, "lexists", "path")):
+        put(_mod, _nm, _viewed(getattr(_mod, _nm), _nm, _kw))
+
+
 class Base(unittest.TestCase):
     def setUp(self):
+        # ── ИЗОЛЯЦИЯ ДЕТЕЙ И ПУТЕЙ БОЕВОГО КОРНЯ (16.10.2026, TB-PROCWATCH-ISOLATION-1610-1942) ──
+        # Живой инцидент 16.10 ~19:15: тесты этого Base через process_new/poll_once дёргали
+        # fire-and-forget Popen `queue_snapshot_pc.py --tick` (o._queue_snapshot, :1183) и
+        # `srv_delivery.py --tick` (o._srv_delivery, :1208) — cwd=REPO, БЕЗ env=. Ребёнок — новый
+        # интерпретатор: FakeBridge и прочие подмены этого процесса до него не доезжают, и он с
+        # боевыми доступами переписал док мозга queue_state_pc и сходил на VPS. Там же второй класс:
+        # decision_waits.STORE считается от __file__ модуля (decision_waits.py:39), мимо
+        # log_setup.state_path, и process_approval_timeouts → _park_expired_approval (:5595)
+        # дописывал фикстурные поводы в ЖИВОЙ pc_orchestrator.decision_waits.json.
+        # Образец — test_pc_local_dec.LocBase (:143-150, тот же дефект слепка). Подмены стоят
+        # ПЕРВЫМИ в setUp — раньше любого process_new/poll_once (и в setUp наследников), каждая с
+        # addCleanup сразу за собой (снимется и при сбое setUp). Вызовы дверей копятся в
+        # self.child_calls (имя двери + довод) — наружу не уходит ничего, проверить можно.
+        # Боевого поведения правка не меняет: подменяются ссылки модуля на время теста.
+        self.child_calls = []
+        # Дети fire-and-forget в путях process_new/poll_once (поиск по pc_orchestrator.py):
+        #   _queue_snapshot → queue_snapshot_pc.py --tick (:1183), _srv_delivery → srv_delivery.py
+        #   --tick (:1208) — НЕ были подменены нигде в Base; _chatlog_capture → chatlog_ingest.py /
+        #   chatlog_servicing_tick.py (:1255/:1262) — сам молчит при «unittest» в sys.modules, здесь
+        #   закрыт по построению, а не по признаку. _cowork/_notify/_notify_chain_card — ниже, как были.
+        for _nm in ("_queue_snapshot", "_srv_delivery", "_chatlog_capture"):
+            _orig_door = getattr(o, _nm)
+            setattr(o, _nm, lambda *a, _nm=_nm, **k: self.child_calls.append((_nm, a)))
+            self.addCleanup(setattr, o, _nm, _orig_door)
+        # Дверь dispatch_notify (_notify_gate_card/_notify_critical/_notify_topic и суточный список
+        # ревизора, :1618-1630): под тестом её закрывает замок пробы (_live_send_allowed → False).
+        # Здесь — тем же исходом False («не отправлено») по построению, без импорта dispatch_notify.
+        _orig_dn = o._dnotify_spawn
+        o._dnotify_spawn = lambda tail, what="": (self.child_calls.append(("_dnotify_spawn", (what,))),
+                                                  False)[1]
+        self.addCleanup(setattr, o, "_dnotify_spawn", _orig_dn)
+        # Пути боевого корня, которых НЕТ в log_setup.state_path, — в свой каталог на тест:
+        #   decision_waits.STORE (decision_waits.py:39, парковка поводов);
+        #   HEARTBEAT_FILE (:350, пишет _write_heartbeat — ПОСЛЕДНЯЯ строка poll_once; на нём стоят
+        #     О2/О4 и вотчдог; тесты витка глушили его каждый сам — здесь страховка за забывшего);
+        #   git_serial_pc.LOCK_DIR (git_serial_pc.py:51, замок «одна рука» — run_task создаёт его
+        #     каталог; тест не должен делить замок с живым демоном).
+        _tmp_iso = tempfile.mkdtemp(prefix="iso_base_")
+        for _mod, _attr, _name in ((o.decision_waits, "STORE", "pc_orchestrator.decision_waits.json"),
+                                   (o, "HEARTBEAT_FILE", "pc_orchestrator.heartbeat"),
+                                   (o.git_serial_pc, "LOCK_DIR", "git_serial_pc")):
+            _save_path = getattr(_mod, _attr)
+            setattr(_mod, _attr, os.path.join(_tmp_iso, _name))
+            self.addCleanup(setattr, _mod, _attr, _save_path)
+        # Реестр учёток строителей (accounts_registry.json вне git, корень репо) и прежний файл выбора:
+        # run_task зовёт accounts.apply_builders(env, REPO) с ЯВНЫМ корнем (:3578), поэтому путь
+        # уводится аргументом: реестра нет, прежний файл молчит → ОСНОВНОЙ с WARNING. Живые файлы
+        # корня тест не читает, и окружение ребёнка-мока не зависит от того, что лежит на диске.
+        _orig_ab = o.accounts.apply_builders
+        _reg_tmp = os.path.join(_tmp_iso, "accounts_registry.json")
+        o.accounts.apply_builders = (
+            lambda env, repo=None, path=None, isdir=None, reader=None, legacy_reader=None:
+            _orig_ab(env, repo, path or _reg_tmp, isdir, reader,
+                     legacy_reader or (lambda *a, **k: (None, ""))))
+        self.addCleanup(setattr, o.accounts, "apply_builders", _orig_ab)
+        # ЗАКРЫТЫЙ ПО УМОЛЧАНИЮ (r2): двери 1–8, маркер и черновик доклада — см. блок над классом.
+        # Отказы копятся в self.door_hits, уведённые пути — в self.iso_paths, git, пущенный во
+        # временный каталог теста (r3), — в self.git_let.
+        _iso_close_doors(self, os.path.join(_tmp_iso, "doors"))
         self._save = (o.bc, o.run_claude, o._notify, o._cowork, o._stopped, o._selfheal_on,
                       o._notify_chain_card, o._loc_mark_chain_final)
         # бюджет claude (инцидент-каскад 22.07): в тестах НЕ считаем реальные процессы ПК
@@ -10805,6 +11193,19 @@ class TestClientContourGate(Base):
         o.client_contour.release_reason = lambda *a, **k: None       # оснований пропуска нет
         self.addCleanup(lambda: setattr(o.client_contour, "release_reason", self._save_rr))
         o._apply_restart_at.clear()
+        # «ЕСТЬ ЛИ КОММИТ В РЕПОЗИТОРИИ» (r3, 16.10.2026): `_gate_commit_known` спрашивает
+        # `git cat-file -e <c>^{commit}` в ЖИВОМ REPO — дверь 2 закрытого Base, отказ. Коммиты
+        # голденов здесь НАСТОЯЩИЕ коммиты истории (4528917 — живой инцидент 30.07; четыре коммита
+        # ряда test_v_bez_ruchki), и живой гейт их знал. Поэтому ответ git подан ЯВНО и fail-closed:
+        # «есть» — только у них, у любой другой метки — «нет», как ответил бы git на чужую. Тот же
+        # приём, что в `_dve_dorogi` ниже; саму проверку входа по существу держит
+        # test_no_test_cards.TestNesushchestvuyushchiiKommit.
+        _golden = frozenset(("4528917", "3b85c06", "ce464ee", "c8b0d09", "e081ba4"))
+        _save_known = o._gate_commit_known
+        o._gate_commit_known = lambda c, git_out=None: bool(
+            re.match(r"^[0-9a-f]{7,40}$", str(c or "").strip().lower())
+            and str(c).strip().lower()[:7] in _golden)
+        self.addCleanup(setattr, o, "_gate_commit_known", _save_known)
 
     def _restart(self, kind):
         self.restarts.append(kind)
@@ -11976,10 +12377,46 @@ class TestSelfUpdateDepClosure(Base):
 
     def test_ls_tree_fixture_matches_live_git(self):
         """Правило репозитория: мок обязан копировать ЖИВОЙ формат. Снимаем ls-tree с настоящего
-        git этого дерева и парсим ТЕМ ЖЕ разбором, что и в бою."""
-        blobs = o._dep_blobs()
+        git и парсим ТЕМ ЖЕ разбором, что и в бою.
+
+        r3 (16.10.2026): git в ЖИВОМ REPO — дверь 2 закрытого Base, поэтому дерево здесь —
+        ВРЕМЕННЫЙ репозиторий с теми же файлами замыкания (байтовая копия), а git настоящий: вывод
+        ls-tree и разбор `_dep_blobs` боевой дорогой (`_git_out` → `_plain`, cwd=REPO) те же. Свои
+        вызовы git теста — без хуков, fsmonitor и подписи, поиск репозитория не выходит из temp."""
+        import subprocess
+        files = o._dep_files()
+        repo, hooks = os.path.join(self.tmp, "lstree_repo"), os.path.join(self.tmp, "no_hooks")
+        os.makedirs(hooks)
+
+        def _rm_ro(fn, p, _exc):             # объекты git на Windows — только для чтения;
+            try:                             # уборка — по возможности: сбой её не красит гейт
+                os.chmod(p, 0o600)
+                fn(p)
+            except OSError:
+                pass
+        self.addCleanup(shutil.rmtree, repo,   # копия замыкания ~9 МБ: каждый гейт не мусорит в temp
+                        **({"onexc": _rm_ro} if sys.version_info >= (3, 12) else {"onerror": _rm_ro}))
+        for rel in files:
+            parts = rel.replace("\\", "/").split("/")
+            os.makedirs(os.path.join(repo, *parts[:-1]), exist_ok=True)
+            with open(os.path.join(o.REPO, *parts), "rb") as src, \
+                    open(os.path.join(repo, *parts), "wb") as dst:
+                dst.write(src.read())
+        env = {k: v for k, v in os.environ.items() if k not in _ISO_GIT_PATH_ENV}
+        env["GIT_CEILING_DIRECTORIES"] = self.tmp
+        git = ["git", "-c", "core.hooksPath=" + hooks, "-c", "core.fsmonitor=false",
+               "-c", "commit.gpgsign=false", "-c", "user.name=test", "-c", "user.email=test@invalid"]
+        try:
+            for argv in (["init", "-q", "--object-format=sha1"], ["add", "--"] + files,   # формат живого
+                         ["commit", "-q", "--no-verify", "-m", "ls-tree живого формата"]):
+                subprocess.run(git + argv, cwd=repo, env=env, check=True, capture_output=True,
+                               timeout=120)
+        except (OSError, subprocess.SubprocessError) as e:
+            self.skipTest("git недоступен: %s" % type(e).__name__)
+        with mock.patch.object(o, "REPO", repo):
+            blobs = o._dep_blobs()
         if blobs is None:
-            self.skipTest("git недоступен")
+            self.skipTest("git недоступен (отказы Base: %s)" % getattr(self, "door_hits", None))
         self.assertIn("pc_orchestrator.py", blobs)
         self.assertRegex(blobs["pc_orchestrator.py"], r"^[0-9a-f]{40}$")
         self.assertTrue(set(blobs) <= set(o._dep_files()))

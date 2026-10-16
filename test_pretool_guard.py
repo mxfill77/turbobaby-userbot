@@ -3631,14 +3631,15 @@ class TestTwoTiersOfCards(unittest.TestCase):
         8 видов из 20. Тест держит границу на СЛОВАРЕ, а не на списке из восьми: любой новый вид
         приезжает под замок сам, и забыть его нельзя — иначе повторится ровно census-дефект
         «замок есть, входа в него у этого вида нет»."""
-        self.assertEqual(len(g._KIND_VOCAB), 21, "словарь видов изменился — замок пересчитать")
+        # Пересчитан 16.10.2026: + `edit_guard` (POLICY-1610) — 22 вида; замок прежний.
+        self.assertEqual(len(g._KIND_VOCAB), 22, "словарь видов изменился — замок пересчитать")
         denied = [k for k in g._KIND_VOCAB if g.card_decision(k, "", "")[0] == "deny"]
         self.assertEqual(sorted(denied), sorted(g._KIND_VOCAB),
                          "без объекта отказ обязан быть у КАЖДОГО вида, а не у высших")
         # Поимённо — те, что в восьмёрку НЕ входили и ради которых заход делался.
         for kind in ("env", "sqlite", "schtasks", "network", "outside", "write_outside",
-                     "git_force", "edit_secret", "read_secret", "edit_claude", "unknown",
-                     g.KIND_UNKNOWN_TOOL):
+                     "git_force", "edit_secret", "read_secret", "edit_claude", "edit_git",
+                     g.KIND_EDIT_GUARD, "unknown", g.KIND_UNKNOWN_TOOL):
             with self.subTest(kind):
                 self.assertFalse(g.is_top_tier(kind), kind + ": фикстура обязана быть ОБЫЧНОЙ")
                 self.assertEqual(g.card_decision(kind, "", "")[0], "deny", kind)
@@ -4489,6 +4490,7 @@ class TestChannelRegistry(unittest.TestCase):
                 self.assertTrue(text.strip(), "карточка пуста")
                 # проба протухнет, если имя однажды заведут в реестр законно
                 self.assertNotIn(tool, getattr(g, "_TOOL_CHANNELS", {}))
+                self.assertNotIn(tool, getattr(g, "_CODEX_CHANNELS", {}))
 
     def test_unknown_channel_kind_stays_red_on_both_belts(self):
         """Два пояса — ровно два места, где fail-closed мог бы утечь обратно в тишину:
@@ -4546,19 +4548,52 @@ class TestChannelRegistry(unittest.TestCase):
 
     def test_registry_covers_every_name_decide_distinguishes(self):
         """Вторая сторона того же замка: имена берутся из ИСХОДНИКА `decide` через `ast`.
-        Новая ветка `if tool == "X"` без записи в реестр падает здесь."""
+        Новая ветка `if tool == "X"` без записи в реестр падает здесь.
+
+        С 16.10.2026 реестров ДВА: `_TOOL_CHANNELS` (Claude, сверяется с matcher `.claude/*`
+        выше) и `_CODEX_CHANNELS` (Codex: живого matcher с его именами нет, держатель — замер
+        журнала). Имена `decide` обязаны совпасть с ОБЪЕДИНЕНИЕМ гардованных обоих — ветка мимо
+        обоих словарей падает так же, как падала мимо одного."""
         known = self._tool_names_decide_distinguishes()
         self.assertTrue(known, "разбор `decide` по ast перестал находить имена инструментов")
         guarded = {t for t, st in self._statuses().items() if st == g.CHANNEL_GUARD}
-        self.assertEqual(known, guarded,
+        codex = {t for t, v in g._CODEX_CHANNELS.items() if v[0] == g.CHANNEL_GUARD}
+        self.assertEqual(known, guarded | codex,
                          "`decide` различает имя мимо реестра %s / реестр обещает гард имени, "
                          "которого `decide` не знает %s"
-                         % (sorted(known - guarded), sorted(guarded - known)))
+                         % (sorted(known - guarded - codex), sorted((guarded | codex) - known)))
+
+    def test_codex_registry_is_separate_and_not_a_claude_channel(self):
+        """Два словаря не пересекаются, и имя Codex не стоит в matcher `.claude/*`: иначе оно
+        Claude-канал и обязано жить в `_TOOL_CHANNELS`, где его сверяет `test_registry_equals_live_
+        matcher`. Отдельный словарь — не способ спрятать имя от сторожа matcher."""
+        self.assertTrue(g._CODEX_CHANNELS, "словарь каналов Codex пуст — сторожить нечего")
+        self.assertEqual(set(g._CODEX_CHANNELS) & set(g._TOOL_CHANNELS), set())
+        self.assertEqual(set(g._CODEX_CHANNELS) & self._live_matcher_tools(), set(),
+                         "имя Codex стоит в matcher .claude — это Claude-канал, его место в "
+                         "_TOOL_CHANNELS")
+        for tool in g._CODEX_CHANNELS:
+            with self.subTest(tool):
+                self.assertEqual(g.channel_status(tool), g._CODEX_CHANNELS[tool][0])
+
+    def test_codex_hook_matcher_names_are_all_guarded(self):
+        """Живой хук Codex (`.codex/hooks.json` основного дерева, вне git) зовёт этот же гард.
+        Каждое имя его matcher обязано вести к решающей функции, а не в `unknown_tool`; файла
+        нет — проверять нечего (skip, а не зелёный)."""
+        path = os.path.join(PROJ, ".codex", "hooks.json")
+        names = self._matcher_tools_from(path)
+        if not names:
+            self.skipTest("нет matcher гарда в %s" % path)
+        guarded = ({t for t, st in self._statuses().items() if st == g.CHANNEL_GUARD}
+                   | {t for t, v in g._CODEX_CHANNELS.items() if v[0] == g.CHANNEL_GUARD})
+        self.assertEqual(names - guarded, set(),
+                         "имя matcher Codex уходит в unknown_tool: %s" % sorted(names - guarded))
 
     def test_every_channel_names_its_holder(self):
         """Форма `_ACTION_CHECK`: пустой держатель — это запись «канал есть, гейта нет»,
         то есть опись, которая ничего не описывает."""
-        for tool, (status, holder) in g._TOOL_CHANNELS.items():
+        for tool, (status, holder) in list(g._TOOL_CHANNELS.items()) + list(
+                g._CODEX_CHANNELS.items()):
             with self.subTest(tool):
                 self.assertIn(status, (g.CHANNEL_GUARD, g.CHANNEL_GREEN))
                 self.assertTrue(str(holder).strip(), "канал %s не назвал держателя" % tool)
@@ -4577,6 +4612,481 @@ class TestChannelRegistry(unittest.TestCase):
                 self.assertEqual(g.decide({"tool_name": tool, "cwd": PROJ,
                                            "tool_input": {"pattern": "x"}})[0], "defer",
                                  "объявленный зелёным канал перестал быть зелёным: " + tool)
+
+
+class TestApplyPatchChannel(unittest.TestCase):
+    """КАНАЛ apply_patch (Codex) СУДИТСЯ, А НЕ «НЕИЗВЕСТНЫЙ» (16.10.2026). Слово владельца:
+    «Запросы на разрешения всё приходят а я их автоматом разрешаю решить бы этот момент». Замер
+    журнала гарда с 15.10 10:14: 99 вопросов `apply_patch`, все `unknown_tool`; цели — 91 в папке
+    результатов Codex `2026-10-02/new-chat/outputs` (81 Add, 10 Update), 3 Update в
+    `D:/turbobaby-bot/docs`, 2 в `D:/turbobaby-bot/tmp`, 3 в `Documents/Codex/2026-10-15`
+    (перезамер по 16.10 19:49:03 — 100 вопросов, 93 в `outputs`).
+
+    Правило: каждая цель Add/Update/Move-to судится РОВНО как Write (`_decide_write`), исчезающий
+    файл — `delete`, битый патч — fail-closed `unknown_tool`. Гард только классифицирует: файлы по
+    путям фикстур не создаются и не читаются (кроме проверки имени-подсказки секрета)."""
+
+    OUT = "C:/Users/mxfill1/Documents/Codex/2026-10-02/new-chat/outputs"
+    NEIGHBOUR = "C:/Users/mxfill1/Documents/Codex/2026-10-15"
+    E = "." + "env"                      # имя хранилища секретов — сборкой, не литералом
+    REAL = "8x2Kd91mQpZ4vLr7Ts3Nb6Yw"     # вид боевого токена (та же фикстура, что у вынос-тестов)
+
+    @staticmethod
+    def _patch(*body, nl="\n"):
+        return nl.join(("*** Begin Patch",) + body + ("*** End Patch",))
+
+    @staticmethod
+    def _data(patch, cwd=PROJ, field="command"):
+        return {"tool_name": "apply_patch", "tool_input": {field: patch}, "cwd": cwd}
+
+    def _decide(self, *body, cwd=PROJ):
+        return g.decide(self._data(self._patch(*body), cwd=cwd))
+
+    def _broken(self, res, msg=""):
+        self.assertEqual(res[:2], ("ask", g.KIND_UNKNOWN_TOOL), msg)
+        self.assertTrue(res[2].startswith(g.AP_FAIL), res[2])
+
+    # ── живые формы из журнала ──────────────────────────────────────────────────────────────
+    def test_live_add_into_codex_outputs_defers(self):
+        self.assertEqual(self._decide(
+            "*** Add File: " + self.OUT + "/k3-file-channel-1510-1000-review.json",
+            "+{", '+  "schema": "k3-file-channel-1510-1000-v1",', "+}"), ("defer", "", ""))
+        self.assertEqual(self._decide(
+            "*** Add File: " + self.OUT + "/k3-file-channel-1510-1000/automation.reason.txt",
+            "+Основание обновления: передача К3"), ("defer", "", ""))
+
+    def test_live_update_in_codex_outputs_defers(self):
+        self.assertEqual(self._decide(
+            "*** Update File: " + self.OUT + "/heartbeat-1510-1142-casestate-review.json",
+            "@@", '-      "3009-3051"', '+      "3009-3035",', '+      "3038-3051"'),
+            ("defer", "", ""))
+
+    def test_live_update_in_repo_docs_and_tmp_defers(self):
+        self.assertEqual(self._decide(
+            "*** Update File: D:/turbobaby-bot/docs/artifacts/2026-10-14-awake-toggle.md",
+            "@@ ## Итог", "-старое", "+новое", " контекст"), ("defer", "", ""))
+        self.assertEqual(self._decide(
+            "*** Add File: D:/turbobaby-bot/tmp/disable-auto-sleep-20261016.ps1",
+            "+powercfg /query"), ("defer", "", ""))
+
+    def test_neighbour_codex_folders_and_users_still_ask(self):
+        for path in (self.NEIGHBOUR + "/review.md",
+                     "C:/Users/mxfill1/Documents/Codex/2026-10-02/new-chat/x.md",
+                     "C:/Users/mxfill1/Documents/Codex/2026-10-02/new-chat/outputs2/x.md",
+                     "C:/Users/mxfill1/Documents/Codex/x.md",
+                     "C:/Users/mxfill1/x.txt"):
+            with self.subTest(path):
+                self.assertEqual(self._decide("*** Add File: " + path, "+x"),
+                                 ("ask", "write_outside", path))
+        self.assertEqual(self._decide("*** Update File: " + self.NEIGHBOUR + "/a.md", "@@", "+x"),
+                         ("ask", "write_outside", self.NEIGHBOUR + "/a.md"))
+
+    # ── исчезающий файл ─────────────────────────────────────────────────────────────────────
+    def test_delete_asks_delete_even_in_trusted_root(self):
+        for path in ("D:/turbobaby-bot/docs/x.md", self.OUT + "/old.json",
+                     "D:/turbobaby-bot/tmp/x.ps1"):
+            with self.subTest(path):
+                self.assertEqual(self._decide("*** Delete File: " + path),
+                                 ("ask", "delete", path))
+
+    def test_move_asks_delete_of_the_source(self):
+        self.assertEqual(self._decide("*** Update File: " + self.OUT + "/a.md",
+                                      "*** Move to: " + self.OUT + "/b.md", "@@", "-a", "+b"),
+                         ("ask", "delete", self.OUT + "/a.md"))
+
+    def test_move_target_is_judged_as_write(self):
+        """Назначение Move — запись: в конфиг `.claude` оно краснеет своим видом (жёстким), а не
+        `delete`. Вне проекта — `delete` ИСТОЧНИКА (второй круг POLICY-1610, матрица D6): было
+        `write_outside` назначения, и в bypass основной сессии файл молча уходил из проекта
+        пропуском, хотя тот же Move в `tmp/` давал `delete` (отказ). Нежёсткая запись источника
+        вне проекта жёсткое исчезновение тоже не прячет."""
+        self.assertEqual(self._decide("*** Update File: D:/turbobaby-bot/docs/a.md",
+                                      "*** Move to: D:/turbobaby-bot/.claude/settings.json",
+                                      "@@", "+x")[:2], ("ask", "edit_claude"))
+        self.assertEqual(self._decide("*** Update File: D:/turbobaby-bot/docs/a.md",
+                                      "*** Move to: " + self.NEIGHBOUR + "/a.md", "@@", "+x"),
+                         ("ask", "delete", "D:/turbobaby-bot/docs/a.md"))
+        self.assertEqual(self._decide("*** Update File: D:/turbobaby-bot/suggest.py",
+                                      "*** Move to: C:/Users/Public/guard_mv.py", "@@", "-a", "+b"),
+                         ("ask", "delete", "D:/turbobaby-bot/suggest.py"))
+        self.assertEqual(self._decide("*** Update File: " + self.NEIGHBOUR + "/a.md",
+                                      "*** Move to: D:/turbobaby-bot/tmp/a.md", "@@", "+x"),
+                         ("ask", "delete", self.NEIGHBOUR + "/a.md"))
+        # жёсткий вид ИСТОЧНИКА по-прежнему называет операцию сам
+        self.assertEqual(self._decide("*** Update File: D:/turbobaby-bot/.claude/settings.json",
+                                      "*** Move to: D:/turbobaby-bot/tmp/s.json", "@@", "+x")[:2],
+                         ("ask", "edit_claude"))
+        # запись вне проекта БЕЗ Move — прежний `write_outside`
+        self.assertEqual(self._decide("*** Update File: " + self.NEIGHBOUR + "/a.md", "@@", "+x"),
+                         ("ask", "write_outside", self.NEIGHBOUR + "/a.md"))
+
+    # ── то, что стоит ДО доверенных корней, краснеет и внутри них ───────────────────────────
+    def test_secret_claude_and_git_targets_ask_their_own_kind(self):
+        nofile = os.path.join(PROJ, "tmp", "guard_apply_patch_nofile")
+        cases = (
+            (os.path.join(nofile, self.E), "edit_secret"),
+            (self.OUT + "/" + self.E, "edit_secret"),
+            (self.OUT + "/bot" + ".session", "edit_secret"),
+            ("D:/turbobaby-bot/.claude/settings.json", "edit_claude"),
+            ("D:/turbobaby-bot/.claude/hooks/x.py", "edit_claude"),
+            (self.OUT + "/.claude/settings.local.json", "edit_claude"),
+            ("D:/turbobaby-bot/.git/hooks/pre-commit", "edit_git"),
+            (self.OUT + "/.git/config", "edit_git"),
+        )
+        for path, kind in cases:
+            for head in ("*** Add File: ", "*** Update File: "):
+                with self.subTest(path=path, head=head):
+                    body = ("+x",) if head.startswith("*** Add") else ("@@", "+x")
+                    self.assertEqual(self._decide(head + path, *body)[:2], ("ask", kind))
+
+    def test_secret_value_in_added_lines_is_env(self):
+        leak = "+BRIDGE_TOKEN=" + self.REAL
+        for path in (self.OUT + "/notes.md", "D:/turbobaby-bot/docs/x.md"):
+            with self.subTest(path):
+                self.assertEqual(self._decide("*** Add File: " + path, "+отчёт", leak),
+                                 ("ask", "env", "BRIDGE_TOKEN" + g.ENV_LEAK_MARK))
+                self.assertEqual(self._decide("*** Update File: " + path, "@@", leak)[:2],
+                                 ("ask", "env"))
+
+    def test_removed_and_context_lines_are_not_a_write(self):
+        """Вынос — это ДОБАВЛЯЕМЫЙ текст. Строка `-` уже лежит в файле и уходит из него, строка
+        ` ` — контекст; ни та, ни другая в файл не пишется (как `old_string` у Edit)."""
+        val = "BRIDGE_TOKEN=" + self.REAL
+        self.assertEqual(self._decide("*** Update File: " + self.OUT + "/n.md",
+                                      "@@", "-" + val, " " + val, "+BRIDGE_TOKEN=<masked>"),
+                         ("defer", "", ""))
+
+    # ── заголовок не подделывается телом ────────────────────────────────────────────────────
+    def test_forged_header_inside_body_is_not_an_operation(self):
+        for body in (("+*** Delete File: D:/turbobaby-bot/suggest.py",),
+                     ("+*** Add File: D:/turbobaby-bot/.claude/settings.json", "+x"),
+                     ("+*** Move to: C:/Users/mxfill1/x.txt",)):
+            with self.subTest(body=body):
+                self.assertEqual(self._decide("*** Add File: " + self.OUT + "/a.md", *body),
+                                 ("defer", "", ""))
+                self.assertEqual(self._decide("*** Update File: " + self.OUT + "/a.md",
+                                              "@@", *body), ("defer", "", ""))
+        # контекстная строка Update — тоже тело, а не заголовок
+        self.assertEqual(self._decide("*** Update File: " + self.OUT + "/a.md", "@@",
+                                      " *** Delete File: D:/turbobaby-bot/suggest.py", "+x"),
+                         ("defer", "", ""))
+
+    def test_indented_header_outside_update_is_not_silent(self):
+        """Строка с отступом после тела Add — не тело Add (оно только `+`) и не наш заголовок;
+        парсер, обрезающий пробелы, увидел бы в ней удаление. Молча не проходит."""
+        for line in (" *** Delete File: D:/turbobaby-bot/suggest.py",
+                     "\t*** Add File: D:/turbobaby-bot/.claude/settings.json"):
+            with self.subTest(line=line):
+                self._broken(self._decide("*** Add File: " + self.OUT + "/a.md", "+x", line))
+                self._broken(self._decide(line))
+
+    def test_real_header_after_add_body_is_an_operation(self):
+        self.assertEqual(self._decide("*** Add File: " + self.OUT + "/a.md", "+x",
+                                      "*** Delete File: D:/turbobaby-bot/suggest.py"),
+                         ("ask", "delete", "D:/turbobaby-bot/suggest.py"))
+
+    # ── пути ────────────────────────────────────────────────────────────────────────────────
+    def test_relative_path_resolves_from_hook_cwd(self):
+        self.assertEqual(self._decide("*** Add File: docs/x.md", "+x"), ("defer", "", ""))
+        self.assertEqual(self._decide("*** Add File: x.json", "+x", cwd=self.OUT),
+                         ("defer", "", ""))
+        self.assertEqual(self._decide("*** Add File: x.md", "+x", cwd=self.NEIGHBOUR),
+                         ("ask", "write_outside", os.path.join(self.NEIGHBOUR, "x.md")))
+        self.assertEqual(self._decide("*** Update File: .claude/settings.json", "@@", "+x")[:2],
+                         ("ask", "edit_claude"))
+        self.assertEqual(self._decide("*** Add File: .git/hooks/pre-commit", "+x")[:2],
+                         ("ask", "edit_git"))
+        self.assertEqual(self._decide("*** Delete File: docs/x.md"),
+                         ("ask", "delete", os.path.join(PROJ, "docs/x.md")))
+        self.assertEqual(self._decide("*** Add File: ../outside.md", "+x")[:2],
+                         ("ask", "write_outside"))
+
+    def test_dotdot_out_of_trusted_root_is_not_trusted(self):
+        for path in (self.OUT + "/../escaped.md", self.OUT + "/../../2026-10-15/x.md",
+                     self.OUT + "/sub/../../escaped.md"):
+            with self.subTest(path):
+                self.assertEqual(self._decide("*** Add File: " + path, "+x"),
+                                 ("ask", "write_outside", path))
+        self.assertEqual(self._decide("*** Add File: " + self.OUT + "/sub/../ok.md", "+x"),
+                         ("defer", "", ""))
+        self.assertEqual(self._decide("*** Add File: x.md", "+x", cwd=self.OUT + "/..")[:2],
+                         ("ask", "write_outside"))
+
+    def test_case_and_backslashes(self):
+        out_win = r"c:\users\MXFILL1\documents\codex\2026-10-02\NEW-CHAT\outputs"
+        self.assertEqual(self._decide("*** Add File: " + out_win + r"\x.json", "+x"),
+                         ("defer", "", ""))
+        self.assertEqual(self._decide(r"*** Update File: D:\turbobaby-bot\docs\x.md", "@@", "+x"),
+                         ("defer", "", ""))
+        self.assertEqual(self._decide(r"*** Add File: D:\TURBOBABY-BOT\.CLAUDE\settings.json",
+                                      "+x")[:2], ("ask", "edit_claude"))
+        self.assertEqual(self._decide(r"*** Add File: D:\turbobaby-bot\.GIT\hooks\pre-commit",
+                                      "+x")[:2], ("ask", "edit_git"))
+        self.assertEqual(self._decide(r"*** Add File: C:\USERS\mxfill1\Documents\Codex"
+                                      r"\2026-10-15\x.md", "+x")[:2], ("ask", "write_outside"))
+
+    def test_crlf_patch_parses_the_same(self):
+        p = self._patch("*** Add File: " + self.OUT + "/a.md", "+x",
+                        "*** Delete File: D:/turbobaby-bot/docs/y.md", nl="\r\n")
+        self.assertEqual(g.decide(self._data(p)), ("ask", "delete", "D:/turbobaby-bot/docs/y.md"))
+        p = self._patch("*** Update File: " + self.OUT + "/a.md", "@@", "-a", "+b", nl="\r\n")
+        self.assertEqual(g.decide(self._data(p)), ("defer", "", ""))
+
+    # ── несколько операций (правило переставлено 16.10.2026 вечером, находка приёмки) ────────
+    GREEN_OP = ("*** Add File: C:/Users/mxfill1/Documents/Codex/2026-10-02/new-chat/outputs/a.md",
+                "+x")
+    OUTSIDE_OP = ("*** Add File: C:/Users/mxfill1/Documents/Codex/2026-10-15/x.md", "+x")
+    DELETE_OP = ("*** Delete File: D:/turbobaby-bot/docs/y.md",)
+    CLAUDE_OP = ("*** Update File: D:/turbobaby-bot/.claude/settings.json", "@@", "+x")
+
+    def test_first_red_operation_wins_only_within_one_kind(self):
+        """Было `test_first_red_operation_wins`: «первая красная побеждает» на ЛЮБОМ наборе. Оно
+        осталось ровно там, где не прячет ничего, — все красные операции одного вида."""
+        green, outside = self.GREEN_OP, self.OUTSIDE_OP
+        other = ("*** Add File: C:/Users/Public/z.md", "+x")
+        self.assertEqual(self._decide(*(green + outside + other)),
+                         ("ask", "write_outside", self.NEIGHBOUR + "/x.md"))
+        self.assertEqual(self._decide(*(green + self.DELETE_OP
+                                        + ("*** Delete File: D:/turbobaby-bot/docs/z.md",))),
+                         ("ask", "delete", "D:/turbobaby-bot/docs/y.md"))
+        self.assertEqual(self._decide(*(green + green)), ("defer", "", ""))
+
+    def test_hard_operation_is_not_hidden_behind_the_first(self):
+        """НАХОДКА ПРИЁМКИ APPLY_PATCH: нежёсткая первая операция называла карточку своим видом, а
+        жёсткая за ней в карточку не попадала — и талон демона на первый вид её освобождал. С
+        POLICY-1610 цена выше: нежёсткий вид основной сессии в bypass — пропуск без вопроса. Теперь
+        ровно один жёсткий вид среди красных побеждает ГДЕ БЫ НИ СТОЯЛ."""
+        green, outside, delete = self.GREEN_OP, self.OUTSIDE_OP, self.DELETE_OP
+        for body in (green + outside + delete, green + delete + outside, delete + outside):
+            with self.subTest(body=body):
+                self.assertEqual(self._decide(*body),
+                                 ("ask", "delete", "D:/turbobaby-bot/docs/y.md"))
+        self.assertEqual(self._decide(*(outside + self.CLAUDE_OP))[:2], ("ask", "edit_claude"))
+        leak = ("*** Add File: " + self.OUT + "/n.md", "+BRIDGE_TOKEN=" + self.REAL)
+        self.assertEqual(self._decide(*(outside + leak)),
+                         ("ask", "env", "BRIDGE_TOKEN" + g.ENV_LEAK_MARK))
+        # два одинаковых жёстких — по-прежнему ПЕРВЫЙ из них, плюс нежёсткий где угодно
+        self.assertEqual(self._decide(*(outside + delete
+                                        + ("*** Delete File: D:/turbobaby-bot/docs/z.md",))),
+                         ("ask", "delete", "D:/turbobaby-bot/docs/y.md"))
+
+    def test_acceptance_case_outside_then_claude_config(self):
+        """ДОСЛОВНО случай приёмки (`T12Info.test_multi_op_card_and_headless_approval_info`):
+        «Add вне проекта + Update settings.json» давал `write_outside`, карточка не называла
+        settings.json, а талон `write_outside` в headless пропускал ВЕСЬ патч."""
+        data = self._data(self._patch(*(self.OUTSIDE_OP + self.CLAUDE_OP)))
+        self.assertEqual(g.decide(data)[:2], ("ask", "edit_claude"))
+        env = {g.APPROVED_KINDS_ENV: "write_outside"}
+        self.assertEqual(g.decide_for_role(data, headless=True, env=env)[:2],
+                         ("ask", "edit_claude"), "талон чужого вида освободил правку конфига")
+        decision, text = g.card_decision(*g.decide(data)[1:])
+        self.assertEqual(decision, "ask", text)
+        self.assertIn("settings.json", text)
+
+    def test_two_different_hard_kinds_fail_closed(self):
+        """Два РАЗНЫХ жёстких вида — назвать карточку одним из них значило бы спрятать другой:
+        fail-closed `unknown_tool`, перечень видов в объекте (в порядке патча)."""
+        res = self._decide(*(self.GREEN_OP + self.CLAUDE_OP + self.DELETE_OP))
+        self._broken(res)
+        self.assertEqual(res[2], g.AP_FAIL + g.AP_MIXED + "edit_claude, delete")
+        secret = ("*** Add File: " + os.path.join(PROJ, "tmp", "guard_apply_patch_nofile", self.E),
+                  "+A=1")
+        res = self._decide(*(self.DELETE_OP + self.OUTSIDE_OP + secret))
+        self.assertEqual(res, ("ask", g.KIND_UNKNOWN_TOOL,
+                               g.AP_FAIL + g.AP_MIXED + "delete, write_outside, edit_secret"))
+        # карточка рождается (объект назван), а не отказ без объекта
+        decision, text = g.card_decision(*res[1:])
+        self.assertEqual(decision, "ask", text)
+        self.assertIn(g.AP_MIXED.strip(), text)
+        # и тот же патч по двум полям входа сводится ЦЕЛИКОМ, а не поле за полем
+        self._broken(g.decide({"tool_name": "apply_patch", "cwd": PROJ, "tool_input": {
+            "command": self._patch(*self.CLAUDE_OP), "patch": self._patch(*self.DELETE_OP)}}))
+
+    def test_agent_guard_edit_wins_over_outside_in_one_patch(self):
+        """`edit_guard` (POLICY-1610) — жёсткий вид и в патче: субагент не прячет правку гарда за
+        записью вне проекта; основной сессии та же правка гарда — зелёная, и остаётся вид записи."""
+        guard = ("*** Update File: " + os.path.join(PROJ, "pretool_guard.py"), "@@", "+x")
+        data = self._data(self._patch(*(self.OUTSIDE_OP + guard)))
+        self.assertEqual(g.decide(dict(data, agent_id="agent-ap-1610")),
+                         ("ask", g.KIND_EDIT_GUARD, os.path.join(PROJ, "pretool_guard.py")))
+        self.assertEqual(g.decide(data), ("ask", "write_outside", self.NEIGHBOUR + "/x.md"))
+
+    # ── битый патч: fail-closed ─────────────────────────────────────────────────────────────
+    def test_broken_patch_is_unknown_tool(self):
+        add = "*** Add File: " + self.OUT + "/a.md"
+        cases = {
+            "нет Begin": "*** Add File: " + self.OUT + "/a.md\n+x\n*** End Patch",
+            "нет End": "*** Begin Patch\n" + add + "\n+x",
+            "ноль операций": self._patch(),
+            "только пустые строки": self._patch("", "  "),
+            "пустой путь Add": self._patch("*** Add File: ", "+x"),
+            "пустой путь Delete": self._patch("*** Delete File:   "),
+            "пустой путь Move": self._patch("*** Update File: " + self.OUT + "/a.md",
+                                            "*** Move to: ", "@@", "+x"),
+            "незнакомый маркер": self._patch(add, "+x", "*** Frobnicate File: x"),
+            "маркер без пробела": self._patch("***Add File: " + self.OUT + "/a.md", "+x"),
+            "регистр маркера": self._patch("*** add file: " + self.OUT + "/a.md", "+x"),
+            "Begin внутри": self._patch(add, "+x", "*** Begin Patch"),
+            "End посреди": self._patch(add, "+x", "*** End Patch",
+                                       "*** Delete File: D:/turbobaby-bot/suggest.py"),
+            "Move без Update": self._patch(add, "+x", "*** Move to: " + self.OUT + "/b.md"),
+            "Move не сразу": self._patch("*** Update File: " + self.OUT + "/a.md", "@@", "+x",
+                                         "*** Move to: " + self.OUT + "/b.md"),
+            "тело до заголовка": self._patch("+x", add, "+y"),
+            "строка Update без префикса": self._patch("*** Update File: " + self.OUT + "/a.md",
+                                                      "@@", "голая строка"),
+            "строка Add не с плюса": self._patch(add, "+x", "-y"),
+        }
+        for why, patch in cases.items():
+            with self.subTest(why):
+                self._broken(g.decide(self._data(patch)), why)
+        for ti in ({}, {"command": ""}, {"command": ["apply_patch", "x"]}, {"path": "x"}, "x"):
+            with self.subTest(ti=ti):
+                self._broken(g.decide({"tool_name": "apply_patch", "tool_input": ti,
+                                       "cwd": PROJ}), repr(ti))
+
+    def test_end_of_file_marker_and_blank_lines_are_known(self):
+        self.assertEqual(self._decide("*** Update File: " + self.OUT + "/a.md", "@@", "-a",
+                                      "+b", "*** End of File", "",
+                                      "*** Add File: " + self.OUT + "/c.md", "+c"),
+                         ("defer", "", ""))
+
+    def test_patch_in_another_string_field_is_judged_too(self):
+        """Не в `command` — судится любое строковое поле с патчем; при патче в `command` прочие
+        поля с патчем судятся ТОЖЕ: какое применит Codex, вход не говорит."""
+        green = self._patch("*** Add File: " + self.OUT + "/a.md", "+x")
+        red = self._patch("*** Delete File: D:/turbobaby-bot/suggest.py")
+        self.assertEqual(g.decide(self._data(green, field="input")), ("defer", "", ""))
+        self.assertEqual(g.decide(self._data(red, field="patch"))[:2], ("ask", "delete"))
+        self.assertEqual(g.decide({"tool_name": "apply_patch", "cwd": PROJ,
+                                   "tool_input": {"command": green, "patch": red}})[:2],
+                         ("ask", "delete"))
+        self.assertEqual(g.decide({"tool_name": "apply_patch", "cwd": PROJ,
+                                   "tool_input": {"command": "x", "patch": red}})[:2],
+                         ("ask", "delete"))
+        self.assertEqual(g.decide({"tool_name": "apply_patch", "cwd": PROJ,
+                                   "tool_input": green}), ("defer", "", ""))
+
+    # ── полный конвейер, как в `test_tool_outside_the_registry_is_not_silent` ───────────────
+    def test_full_pipeline_red_stays_a_question_green_stays_silent(self):
+        """`decide` → `decide_for_role` → `card_decision`: тихий проход живёт в трёх слоях, и
+        каждый вид, которым канал теперь краснеет, обязан дойти до КАРТОЧКИ с объектом."""
+        red = {
+            "delete": self._patch("*** Delete File: D:/turbobaby-bot/docs/y.md"),
+            "write_outside": self._patch("*** Add File: " + self.NEIGHBOUR + "/x.md", "+x"),
+            "edit_secret": self._patch("*** Add File: " + self.OUT + "/" + self.E, "+A=1"),
+            "edit_claude": self._patch("*** Update File: D:/turbobaby-bot/.claude/settings.json",
+                                       "@@", "+x"),
+            "edit_git": self._patch("*** Add File: D:/turbobaby-bot/.git/hooks/pre-commit",
+                                    "+echo x"),
+            "env": self._patch("*** Add File: " + self.OUT + "/n.md",
+                               "+BRIDGE_TOKEN=" + self.REAL),
+            g.KIND_UNKNOWN_TOOL: "*** Begin Patch\n*** Add File: x",
+        }
+        for kind, patch in red.items():
+            for headless in (True, False):
+                with self.subTest(kind=kind, headless=headless):
+                    data = self._data(patch)
+                    self.assertEqual(g.decide(data)[:2], ("ask", kind))
+                    action, k, obj = g.decide_for_role(data, headless=headless, env={})
+                    self.assertEqual((action, k), ("ask", kind), "доктрина пропустила " + kind)
+                    decision, text = g.card_decision(k, obj, "")
+                    self.assertEqual(decision, "ask", "карточка %s не родилась: %s" % (kind, text))
+                    self.assertTrue(text.strip())
+        green = self._data(self._patch("*** Add File: " + self.OUT + "/a.md", "+x",
+                                       "*** Update File: D:/turbobaby-bot/docs/b.md", "@@", "+y"))
+        for headless in (True, False):
+            with self.subTest(green=True, headless=headless):
+                self.assertEqual(g.decide_for_role(green, headless=headless, env={})[0], "defer")
+
+    def test_channel_is_registered_for_codex_not_claude(self):
+        self.assertEqual(g._CODEX_CHANNELS["apply_patch"][0], g.CHANNEL_GUARD)
+        self.assertIn("замеру журнала", g._CODEX_CHANNELS["apply_patch"][1])
+        self.assertNotIn("apply_patch", g._TOOL_CHANNELS)
+        self.assertEqual(g.channel_status("apply_patch"), g.CHANNEL_GUARD)
+
+    def test_trusted_root_is_exactly_the_outputs_folder(self):
+        self.assertIn(self.OUT, g._TRUSTED_ROOTS)
+        self.assertTrue(g._is_trusted_root(self.OUT + "/x.json"))
+        for path in (self.NEIGHBOUR + "/x.md", "C:/Users/mxfill1/Documents/Codex/2026-10-02/x",
+                     self.OUT + "2/x", self.OUT + "/../x"):
+            with self.subTest(path):
+                self.assertFalse(g._is_trusted_root(path))
+        # Write и apply_patch судят одну и ту же цель одинаково
+        for path in (self.OUT + "/x.json", self.NEIGHBOUR + "/x.md", self.OUT + "/" + self.E):
+            with self.subTest(write=path):
+                w = g.decide({"tool_name": "Write", "cwd": PROJ,
+                              "tool_input": {"file_path": path, "content": "x"}})
+                self.assertEqual(self._decide("*** Add File: " + path, "+x"), w)
+
+    # ── круг правок 16.10: путь БЕЗ КОРНЯ не судится «от PROJECT» ───────────────────────────
+    def test_drive_relative_target_is_unknown_not_project_relative(self):
+        """`D:docs/x` — диск назван, корня нет: Windows кладёт такой путь от ТЕКУЩЕГО КАТАЛОГА
+        ПРОЦЕССА Codex на этом диске, которого гард не видит. До правки он судился от PROJECT, и
+        за «d:» сегмента `.claude`/`.git` видно не было: `Update File: D:.claude/settings.json`
+        давал `defer` — тихая правка конфига. Канал Write такой путь не носит (его цель —
+        абсолютный путь), значит дыра родилась вместе с каналом и закрыта на нём."""
+        cases = (
+            # живая форма дыры: чат Codex живёт на C:, цель названа на D: без корня
+            (("*** Update File: D:.claude/settings.json", "@@", "+x"), self.OUT),
+            (("*** Add File: D:.git/hooks/pre-commit", "+echo x"), self.OUT),
+            (("*** Update File: D:.claude/settings.json", "@@", "+x"), PROJ),
+            (("*** Add File: D:.claude/hooks/x.py", "+x"), PROJ),
+            (("*** Add File: D:.git/hooks/pre-commit", "+echo x"), PROJ),
+            (("*** Add File: d:docs/x.md", "+x"), PROJ),
+            (("*** Add File: D:docs/x.md", "+x"), self.NEIGHBOUR),
+            (("*** Add File: C:x.json", "+x"), self.OUT),
+            (("*** Add File: C:", "+x"), self.OUT),
+            (("*** Delete File: D:suggest.py",), PROJ),
+            (("*** Update File: " + self.OUT + "/a.md", "*** Move to: D:.claude/settings.json",
+              "@@", "+x"), PROJ),
+            (("*** Update File: D:docs/a.md", "*** Move to: " + self.OUT + "/b.md", "@@", "+x"),
+             PROJ),
+        )
+        for body, cwd in cases:
+            with self.subTest(body=body[:2], cwd=cwd):
+                self._broken(self._decide(*body, cwd=cwd))
+
+    def test_unrooted_hook_cwd_does_not_resolve_relative_paths(self):
+        """cwd хука без корня (`D:docs`, `docs`, `C:`): относительный путь от него — тоже без
+        корня, судить его не от чего. Абсолютная цель от cwd не зависит и судится как была."""
+        for cwd in ("D:docs", "docs", "C:"):
+            with self.subTest(cwd=cwd):
+                self._broken(self._decide("*** Add File: x.md", "+x", cwd=cwd))
+                self.assertEqual(self._decide("*** Add File: " + self.OUT + "/a.md", "+x",
+                                              cwd=cwd), ("defer", "", ""))
+
+    def test_unrooted_path_fails_the_whole_patch_before_any_verdict(self):
+        """Неопределимый путь — сбой разбора ВСЕГО входа, как пустой путь, а не «ещё одна
+        операция в очереди»: иначе красная операция ПЕРЕД ним назвала бы карточку своим видом, и
+        талон демона на этот вид освободил бы и запись, которую гард не судил вовсе."""
+        data = self._data(self._patch("*** Add File: " + self.NEIGHBOUR + "/x.md", "+x",
+                                      "*** Update File: D:.claude/settings.json", "@@", "+x"))
+        self._broken(g.decide(data))
+        env = {g.APPROVED_KINDS_ENV: "write_outside"}
+        self.assertEqual(g.decide_for_role(data, headless=True, env=env)[:2],
+                         ("ask", g.KIND_UNKNOWN_TOOL))
+        _, kind, obj = g.decide_for_role(data, headless=False, env={})
+        decision, text = g.card_decision(kind, obj, "")
+        self.assertEqual(decision, "ask", text)
+        # тот же сбой во ВТОРОМ поле с патчем валит весь вход, а не ждёт своей очереди
+        self._broken(g.decide({"tool_name": "apply_patch", "cwd": PROJ, "tool_input": {
+            "command": self._patch("*** Add File: " + self.NEIGHBOUR + "/x.md", "+x"),
+            "patch": self._patch("*** Add File: D:.git/hooks/pre-commit", "+x")}}))
+
+    def test_rooted_forms_keep_their_verdict(self):
+        """Граница правки: путь С КОРНЕМ судится как был — от корня диска (`/x`), UNC, обычный
+        абсолютный, относительный от cwd с корнем."""
+        self.assertEqual(self._decide("*** Update File: /turbobaby-bot/.claude/settings.json",
+                                      "@@", "+x")[:2], ("ask", "edit_claude"))
+        self.assertEqual(self._decide("*** Add File: /turbobaby-bot/.git/hooks/pre-commit",
+                                      "+x")[:2], ("ask", "edit_git"))
+        self.assertEqual(self._decide(r"*** Add File: \\srv\share\x.md", "+x")[:2],
+                         ("ask", "write_outside"))
+        self.assertEqual(self._decide("*** Add File: " + self.OUT + "/a.md", "+x"),
+                         ("defer", "", ""))
+        self.assertEqual(self._decide("*** Add File: x.json", "+x", cwd=self.OUT),
+                         ("defer", "", ""))
 
 
 class TestConfigMentionAndRollbackObject(unittest.TestCase):
@@ -5262,48 +5772,72 @@ class TestSecretValueLeakIsTheReplacement(unittest.TestCase):
 # С 16.10.2026 (решение владельца) bypass из правила СНЯТ: в bypass ask — ПРЕЖНИЙ вопрос с карточкой.
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 class TestOwnerAwayNoQuestion(unittest.TestCase):
-    """Живой факт ночи 12.10 (pretool_guard.log, роль interactive): ask вида `env` в 07:51:38 и
-    08:03:13 остановили двух агентов workflow на 3 ч 41 мин — сессия стояла в bypass, владелец
-    спал, вопрос хука ждал человека до 11:44. Слово владельца: «надо что бы не спрашивал вообще».
+    """ПРАВИЛО ВОПРОСА ПО РЕЖИМУ СЕССИИ — POLICY-1610 (16.10.2026), переписан под таблицу.
 
-    Правило (`owner_away`): роль interactive и `permission_mode` ∈ `UNATTENDED_MODES` во входе
-    хука → всё, что стало бы ask, уходит `deny` с текстом исполнителю, без пуша и без маркера, с
-    меткой лога `DECISION_UNATTENDED`. Ни разу не allow. headless и прочие режимы — как было.
+    ИСТОРИЯ. Ночь 12.10: ask вида `env` в 07:51:38 и 08:03:13 (роль interactive, сессия в bypass)
+    остановили двух агентов workflow на 3 ч 41 мин — владелец спал. Слово владельца: «надо что бы
+    не спрашивал вообще» → bypass и dontAsk стали отказом «владельца нет». 16.10 днём (d993ffaa,
+    «исправь это я настаиваю что бы байпас работал») bypass из набора снят — снова вопрос. 16.10
+    вечером (POLICY-1610): «Запросы на разрешения всё приходят а я их автоматом разрешаю», «Я не
+    знаю что от чего отличается всегда опзрешаю всё» и «Да» на предложение К3: вам — ни одного
+    запроса; основная сессия делает нужное сама; фоновые агенты на опасное — отказ; самое опасное —
+    всегда отказ.
 
-    ПОПРАВКА 16.10.2026 (решение владельца: «исправь это я настаиваю что бы байпас работал»;
-    в гарде `UNATTENDED_MODES = ("dontAsk",)`). bypass из набора снят: в bypass красное снова идёт
-    ТЕМ ЖЕ решением, что в обычном интерактиве без поля режима, — тот же ask, ДОСЛОВНО та же
-    карточка, тот же счёт пушей, та же строка лога `ask`, и это сторожится на КАЖДОМ спрашивающем
-    виде и инструменте `ASK_INPUTS`. dontAsk остаётся отказом «владельца нет» с текстом. «Байпас
-    работает» значит «вопрос как обычно», а не «красное без да»: allow не выдаёт НИ ОДНА ветка —
-    ни в каком режиме, ни в какой роли (`test_no_branch_returns_allow`).
+    ТАБЛИЦА (только interactive; headless — карточка в маркер, как была, при любом режиме и
+    `agent_id`), применяется к решению «карточка» и к сбою разбора гарда:
+        dontAsk ............................. любой вид .... отказ «владельца нет» .. deny_unattended
+        bypassPermissions ................... ЖЁСТКИЙ ...... отказ без вопроса ...... deny_hard
+        bypassPermissions + субагент ........ любой ........ отказ без вопроса ...... deny_agent
+        bypassPermissions + основная сессия . не жёсткий ... пропуск без вывода ..... pass_bypass
+        прочие режимы, режим не назван, мусор любой ........ вопрос, как был ........ ask
+    ЖЁСТКИЕ — литерал `HARD` ниже (сверяется с `g.BYPASS_HARD_KINDS`). Вид `edit_guard` рождается
+    ТОЛЬКО у субагента: основной сессии правка исходника гарда — `defer` в любой клетке.
+    ПРОЧТЕНИЕ СПЕЦИФИКАЦИИ, названное честно: строка «edit_guard: … основная сессия default → ask»
+    противоречит определению вида («когда в данных есть agent_id») и сторожу
+    `TestGuardSourcesWriteIsNotExecution`; исполнено по определению — у основной сессии `defer`,
+    у агента в default — вопрос `edit_guard`.
 
-    Гард гоняется ПОДПРОЦЕССОМ ТОГО ФАЙЛА, что импортирован как `g` (на копии — копия, после
-    переноса — живой), а не по пути PROJ: иначе тест судил бы не ту версию. Окружение — как у
-    живого интерактива: тест-флаги `_TEST_RUN_ENVS` сняты (иначе пуш гасится изоляцией, и счёт
-    пушей ничего не доказывает), канал 1 уведён в счётчик `NOTIFY_COUNT_FILE` — он стоит в `_push`
-    ДО спавна отправителя, сеть не трогается; лог — во временный файл, не в боевой."""
+    КАК МЕРИТСЯ. Полная матрица (все виды `_KIND_VOCAB` × {основная, агент} × режимы × роли) — в
+    процессе теста через `main()` (`_inproc`): каналы владельца подменены (пуш — счётчик, маркер и
+    лог — файлы прогона), тест-флаги сняты, как у живого интерактива. Сквозной прогон ПРОЦЕССОМ
+    ТОГО ФАЙЛА, что импортирован как `g` (`_run`), — на каждом входе в ключевых клетках. Каталог
+    прогонов — во ВРЕМЕННОМ каталоге системы (`setUpClass`), не в `D:/turbobaby-bot/tmp`; лог —
+    файл прогона (`PRETOOL_GUARD_LOG`), боевой `pretool_guard.log` не трогается (сторож ниже).
+    Каталоги прогонов НЕ удаляются: запрет уборки задания 16.10."""
 
     GUARD = os.path.join(os.path.dirname(os.path.abspath(g.__file__)), "pretool_guard.py")
-    RUNS = os.environ.get("GUARD_BYPASS_RUNS") or os.path.join(PROJ, "tmp", "guard_bypass_runs")
+    RUNS = ""                     # ставит setUpClass: env GUARD_BYPASS_RUNS или новый temp-каталог
     NO_FIELD = object()
     BYPASS = "bypassPermissions"
+    AGENT = "agent-1610-probe-id"           # значение agent_id: в лог попадать НЕ смеет
     KILL = {"tool_name": "Bash", "tool_input": {"command": "taskkill /PID 47121 /F"}}
+    ENV_IN = {"tool_name": "Bash", "tool_input": {"command": "cat .env"}}
+    # Список владельца 16.10 + два имени незнания гарда — НЕЗАВИСИМЫЙ литерал спецификации.
+    HARD = frozenset(("env", "read_secret", "edit_secret", "delete", "git_force", "edit_claude",
+                      "edit_git", "edit_guard", "unknown", "unknown_tool"))
+    LABELS = ("ask", "deny_unattended", "deny_hard", "deny_agent", "pass_bypass")
+    # Режимы матрицы: все названные справкой Claude Code + «нет поля» + мусор (мусор — НЕ bypass).
+    NAMED_MODES = ("default", "plan", "acceptEdits", "auto", "dontAsk", "bypassPermissions")
+    GARBAGE = ("", None, 123, ["bypassPermissions"], {"mode": "bypassPermissions"},
+               "BypassPermissions", "bypassPermissions ", "dontask", ["dontAsk"], "dontAsk ",
+               "allow")
+    MATRIX_MODES = NAMED_MODES + (NO_FIELD, "BypassPermissions", "bypassPermissions ",
+                                  ["bypassPermissions"], 123, "")
 
-    # Входы, на которых БЕЗ поля режима рождается карточка (ask), — по видам. Ночной вид `env`
-    # двумя инструментами; `unknown_tool` — канал вне реестра (fail-closed гарда).
-    #
-    # ДОБРАНО 12.10.2026 (Д1 проверки review_escape): первые восемь входов покрывали 7 видов из 20
-    # спрашивающих и ни одного Edit/MultiEdit/NotebookEdit — пять мутантов правила («инструменты
-    # правки оставляют ask», «8 видов оставляют ask», «12 видов / инструменты правки → молчаливый
-    # defer», «правило молчит при тест-флаге») проходили класс целиком, 12 из 12. Теперь вход есть
-    # на КАЖДЫЙ спрашивающий вид `_KIND_VOCAB` (20 из 21: `unknown` вопроса не рождает — объект у
-    # него пуст по построению, `card_decision` отказывает на месте) и на каждый инструмент, которым
-    # ask приходит. Полноту держит сторож `test_ask_inputs_cover_every_asking_kind_and_tool`,
-    # посылку «без поля → ask ЭТОГО вида, пуш 1» — каждый прогон заново (замер 12.10: 35 из 35).
+    # Входы, на которых БЕЗ поля режима рождается карточка (ask), — по видам и инструментам
+    # (Д1 review_escape 12.10: вход на КАЖДЫЙ спрашивающий вид `_KIND_VOCAB` и каждый инструмент,
+    # которым ask приходит; полноту держит `test_ask_inputs_cover_every_asking_kind_and_tool`).
     # Пути секретов — в НЕСУЩЕСТВУЮЩЕМ каталоге: гард только классифицирует, ничего не исполняется.
     NOFILE = os.path.join(PROJ, "tmp", "guard_bypass_nofile")
     PUB = r"C:\Users\Public"
+    GUARD_SRC = os.path.join(PROJ, "pretool_guard.py")
+    # Второй исходник — гард в КЛОНЕ сервера (тоже `_GUARD_SOURCES`). Третий — `test_pretool_guard.py`:
+    # его имя `test_*.py` взводило латч пробы (`_is_probe_script`), и карточка `edit_guard` гасилась
+    # как проба (приёмка 16.10, 32 клетки). Со второго круга у `edit_guard` латч по месту снят
+    # (`main`), и посылка «без поля режима — ask и пуш» обязана держаться и на этом имени.
+    GUARD_CLONE_SRC = os.path.join(r"D:\foreign\turbobaby-manager-bot", "pretool_guard.py")
+    GUARD_TEST_SRC = os.path.join(PROJ, "test_pretool_guard.py")
+    PY_DEL = "python -c \"import os; os.remove('D:/turbobaby-bot/suggest.py')\""
     ASK_INPUTS = (
         ("env", {"tool_name": "Bash", "tool_input": {"command": "cat .env"}}),
         ("env", {"tool_name": "PowerShell", "tool_input": {"command": "Get-Content .env"}}),
@@ -5317,7 +5851,6 @@ class TestOwnerAwayNoQuestion(unittest.TestCase):
         ("kill", KILL),
         ("read_secret", {"tool_name": "Read",
                          "tool_input": {"file_path": os.path.join(PROJ, ".env")}}),
-        # ── добрано 12.10 (Д1): остальные 13 видов и инструменты правки ─────────────────────
         ("delete", {"tool_name": "PowerShell",
                     "tool_input": {"command": r"Remove-Item D:\turbobaby-bot\suggest.py"}}),
         ("kill", {"tool_name": "PowerShell",
@@ -5327,6 +5860,11 @@ class TestOwnerAwayNoQuestion(unittest.TestCase):
         ("git_force", {"tool_name": "Bash", "tool_input": {"command": "git reset --hard HEAD~1"}}),
         ("git_force", {"tool_name": "PowerShell",
                        "tool_input": {"command": "git push --force origin main"}}),
+        # второй круг POLICY-1610 (матрица G6–G8): принудительный push БЕЗ слова force
+        ("git_force", {"tool_name": "Bash", "tool_input": {"command": "git push origin +main"}}),
+        ("git_force", {"tool_name": "PowerShell",
+                       "tool_input": {"command": "git push origin '+HEAD:main'"}}),
+        ("git_force", {"tool_name": "Bash", "tool_input": {"command": "git push --mirror origin"}}),
         ("clasp", {"tool_name": "Bash",
                    "tool_input": {"command": "clasp create --title guard_bypass_probe"}}),
         ("clasp_push", {"tool_name": "Bash", "tool_input": {"command": "clasp push"}}),
@@ -5374,13 +5912,76 @@ class TestOwnerAwayNoQuestion(unittest.TestCase):
         ("edit_git", {"tool_name": "Bash",
                       "tool_input": {"command": "echo x > .git/hooks/pre-commit"}}),
         ("unknown_tool", {"tool_name": "mcp__drive__upload_file", "tool_input": {"path": "x"}}),
+        # ── 16.10.2026: канал `apply_patch` (Codex) спрашивает СВОИМИ видами ─────────────────
+        ("delete", {"tool_name": "apply_patch", "tool_input": {"command": (
+            "*** Begin Patch\n*** Delete File: D:/turbobaby-bot/suggest.py\n*** End Patch")}}),
+        ("write_outside", {"tool_name": "apply_patch", "tool_input": {"command": (
+            "*** Begin Patch\n*** Add File: " + PUB + "\\guard_bypass_x.txt\n+x\n"
+            "*** End Patch")}}),
+        # второй круг POLICY-1610 (матрица D6): Move из проекта наружу — `delete` источника
+        ("delete", {"tool_name": "apply_patch", "tool_input": {"command": (
+            "*** Begin Patch\n*** Update File: D:/turbobaby-bot/suggest.py\n*** Move to: " + PUB
+            + "\\guard_bypass_mv.py\n@@\n-a\n+b\n*** End Patch")}}),
+        # ── POLICY-1610: `edit_guard` — правка исходника гарда СУБАГЕНТОМ, пятью каналами ────
+        ("edit_guard", {"tool_name": "Edit", "agent_id": AGENT, "tool_input": {
+            "file_path": GUARD_SRC, "old_string": "a", "new_string": "b"}}),
+        ("edit_guard", {"tool_name": "Write", "agent_id": AGENT, "tool_input": {
+            "file_path": GUARD_SRC, "content": "x"}}),
+        ("edit_guard", {"tool_name": "MultiEdit", "agent_id": AGENT, "tool_input": {
+            "file_path": GUARD_CLONE_SRC, "edits": [{"old_string": "a", "new_string": "b"}]}}),
+        ("edit_guard", {"tool_name": "NotebookEdit", "agent_id": AGENT, "tool_input": {
+            "notebook_path": GUARD_SRC, "new_source": "x"}}),
+        ("edit_guard", {"tool_name": "apply_patch", "agent_id": AGENT, "tool_input": {
+            "command": "*** Begin Patch\n*** Update File: " + GUARD_SRC + "\n@@\n+x\n"
+                       "*** End Patch"}}),
+        # второй круг: исходник с именем `test_*.py` — карточка, а не проба (латч снят у вида)
+        ("edit_guard", {"tool_name": "Write", "agent_id": AGENT, "tool_input": {
+            "file_path": GUARD_TEST_SRC, "content": "x"}}),
     )
 
-    def _run(self, data=None, mode=NO_FIELD, headless=False, raw=None, env_extra=None):
-        """Один вызов хука процессом → dict(rc, dec, reason, pushes, log, marker, stderr).
-        `env_extra` — переменные окружения ХУКА поверх снятых (Д2: тест-флаг как предмет проверки);
-        замок ниже не даёт им увести канал 1 или лог мимо файлов прогона."""
-        os.makedirs(self.RUNS, exist_ok=True)
+    @classmethod
+    def setUpClass(cls):
+        cls.RUNS = os.environ.get("GUARD_BYPASS_RUNS") or tempfile.mkdtemp(
+            prefix="guard_bypass_runs_")
+        os.makedirs(cls.RUNS, exist_ok=True)
+
+    # ── обвязка ────────────────────────────────────────────────────────────────────────────
+    def _payload(self, data, mode=NO_FIELD, who=None):
+        """Вход хука: `who` None — как во входе, "main" — без `agent_id`, "agent" — с ним."""
+        p = dict(data, cwd=PROJ)
+        if who == "main":
+            p.pop("agent_id", None)
+        elif who == "agent":
+            p["agent_id"] = self.AGENT
+        if mode is not self.NO_FIELD:
+            p["permission_mode"] = mode
+        return p
+
+    @staticmethod
+    def _who_of(data):
+        return "agent" if g.is_agent_call(data) else "main"
+
+    def _want(self, kind, who, mode, headless):
+        """ТАБЛИЦА СПЕЦИФИКАЦИИ → (решение хука, метка лога, пушей, маркер). Пишется НЕЗАВИСИМО
+        от гарда: литералы режимов и `HARD`, а не функции модуля."""
+        if kind == "edit_guard" and who == "main":
+            return (None, "defer", 0, False)       # основная сессия гард править может
+        if headless:
+            return ("ask", "ask", 1, True)
+        if isinstance(mode, str) and mode == "dontAsk":
+            return ("deny", "deny_unattended", 0, False)
+        if isinstance(mode, str) and mode == "bypassPermissions":
+            if kind in self.HARD:
+                return ("deny", "deny_hard", 0, False)
+            if who == "agent":
+                return ("deny", "deny_agent", 0, False)
+            return (None, "pass_bypass", 0, False)
+        return ("ask", "ask", 1, False)
+
+    def _run(self, data=None, mode=NO_FIELD, headless=False, raw=None, env_extra=None, who=None):
+        """Один вызов хука ПРОЦЕССОМ → dict(rc, dec, reason, pushes, log, marker, stderr, payload).
+        `env_extra` — переменные окружения ХУКА поверх снятых; замок ниже не даёт им увести канал 1
+        или лог мимо файлов прогона."""
         d = tempfile.mkdtemp(prefix="run_", dir=self.RUNS)
         marker = os.path.join(d, "pc_ask_9001.marker")
         pushes = os.path.join(d, "pushes.txt")
@@ -5394,16 +5995,13 @@ class TestOwnerAwayNoQuestion(unittest.TestCase):
                     "PRETOOL_GUARD_LOG": logp, g.NOTIFY_COUNT_ENV: pushes,
                     "PYTHONPATH": PROJ + os.pathsep + env.get("PYTHONPATH", "")})
         if headless:
-            env.update({"PRETOOL_ASK_MARKER": marker, "PRETOOL_MARKER_TOKEN": "bypass-1210-run"})
+            env.update({"PRETOOL_ASK_MARKER": marker, "PRETOOL_MARKER_TOKEN": "bypass-1610-run"})
         env.update(env_extra or {})
-        # ЗАМОК ИЗОЛЯЦИИ (12.10, к Д2): что бы ни добавил вызывающий, пуш уходит в счётчик, а лог —
-        # в файл прогона; иначе процесс не запускается вовсе.
         self.assertEqual((env.get(g.NOTIFY_COUNT_ENV), env.get("PRETOOL_GUARD_LOG")),
                          (pushes, logp), "изоляция каналов владельца сломана — прогона нет")
+        payload = None
         if raw is None:
-            payload = dict(data, cwd=PROJ)
-            if mode is not self.NO_FIELD:
-                payload["permission_mode"] = mode
+            payload = self._payload(data, mode, who)
             raw = json.dumps(payload, ensure_ascii=False)
         p = subprocess.run([sys.executable, self.GUARD], input=raw, capture_output=True,
                            text=True, encoding="utf-8", errors="replace", env=env, timeout=60)
@@ -5421,98 +6019,236 @@ class TestOwnerAwayNoQuestion(unittest.TestCase):
             with io.open(logp, encoding="utf-8") as f:
                 log = f.read()
         return {"rc": p.returncode, "dec": dec, "reason": reason, "pushes": n_push, "log": log,
-                "marker": os.path.isfile(marker), "stderr": p.stderr}
+                "marker": os.path.isfile(marker), "stderr": p.stderr, "payload": payload}
 
-    def _assert_unattended(self, r, kind, tool, ctl, mode_word="dontAsk"):
-        """Отказ «владельца нет»: deny, приписка, ДОСЛОВНАЯ карточка контроля, 0 пушей, метка.
-        Молчание (пустой вывод, `defer` в логе) называется своим именем, а не «не deny»: для
-        красной операции оно хуже вопроса — это исполнение без «да» (мутанты m7/m8 Д1, 12.10).
-        С 16.10.2026 этот исход у interactive даёт ТОЛЬКО dontAsk — отсюда и умолчание."""
-        self.assertEqual(r["rc"], 0, r["stderr"])
-        self.assertNotEqual(ctl["dec"], "allow", "контроль без поля режима стал разрешением")
-        self.assertNotEqual(r["dec"], "allow", "режим сессии стал разрешением")
-        self.assertIsNotNone(r["dec"], "МОЛЧАНИЕ в режиме %s: вид %s исполнился бы без вопроса и "
-                             "без отказа" % (mode_word, kind))
-        self.assertNotIn("| defer |", r["log"], "правило пропустило красную операцию молча")
-        self.assertEqual(r["dec"], "deny", r["reason"])
-        for part in ("БЕЗ ВОПРОСА", "сессия в режиме %s" % mode_word, "владелец не у экрана",
-                     "Операция НЕ выполнена", "ни переделанной формой",
-                     "ЖДЁТ ВЛАДЕЛЬЦА: <команда>, вид %s" % kind):
-            self.assertIn(part, r["reason"])
-        self.assertEqual(g.card_from_decision(r["reason"]), g.card_from_decision(ctl["reason"]),
-                         "в отказе нет ДОСЛОВНОЙ карточки, которая собиралась уйти")
-        self.assertEqual(r["pushes"], 0, "пуш владельцу в режиме %s — владельца нет" % mode_word)
-        self.assertFalse(r["marker"])
-        self.assertIn("| interactive | %s | %s | %s |" % (tool, g.DECISION_UNATTENDED, kind),
-                      r["log"])
-        self.assertNotIn("| ask |", r["log"])
+    def _inproc(self, data, mode=NO_FIELD, who=None, headless=False, patches=None):
+        """`main()` в процессе теста — тот же dict, что у `_run`. Каналы владельца подменены: пуш —
+        список, маркер и лог — файлы каталога ЭТОГО теста (лог читается с отступа, маркер узнаётся
+        по уникальному токену вызова). Тест-флаги и талоны одобрения сняты на время вызова."""
+        from unittest import mock
+        import contextlib
+        if not getattr(self, "_dir", None):
+            self._dir = tempfile.mkdtemp(prefix="inproc_", dir=self.RUNS)
+        self._calls = getattr(self, "_calls", 0) + 1
+        tok = "inproc-1610-%d" % self._calls
+        logp = os.path.join(self._dir, "guard.log")
+        mk = os.path.join(self._dir, "pc_ask_9001.marker")
+        before = os.path.getsize(logp) if os.path.isfile(logp) else 0
+        payload = self._payload(data, mode, who)
+        pushed, out = [], io.StringIO()
+        env = {"PRETOOL_GUARD_LOG": logp, "PRETOOL_ASK_MARKER": mk if headless else "",
+               "PRETOOL_MARKER_TOKEN": tok if headless else ""}
+        with contextlib.ExitStack() as st:
+            st.enter_context(mock.patch.dict(os.environ, env))
+            for k in g._TEST_RUN_ENVS + ("PRETOOL_APPROVED_KINDS", "PRETOOL_APPROVED_OBJECT",
+                                         "PRETOOL_APPROVED_TASK"):
+                os.environ.pop(k, None)      # patch.dict вернёт их на выходе
+            # Пуш считается так же, как его отправил бы живой `_push`: изоляция (проба/тест-флаг)
+            # гасит его ВНУТРИ отправителя — значит и здесь он не считается.
+            st.enter_context(mock.patch.object(
+                g, "_push", lambda c, k="": None if g.isolated() else pushed.append(k)))
+            for name, fn in (patches or {}).items():
+                st.enter_context(mock.patch.object(g, name, fn))
+            st.enter_context(mock.patch.object(
+                sys, "stdin", io.StringIO(json.dumps(payload, ensure_ascii=False))))
+            st.enter_context(contextlib.redirect_stdout(out))
+            try:
+                with self.assertRaises(SystemExit) as ex:
+                    g.main()
+            finally:
+                g.set_probe(False)               # латч пробы и хвост лога — глобалы модуля
+                g.set_log_ctx(None)
+        dec, reason = None, None
+        if out.getvalue().strip():
+            hso = json.loads(out.getvalue().strip().splitlines()[-1])["hookSpecificOutput"]
+            dec, reason = hso["permissionDecision"], hso["permissionDecisionReason"]
+        log = ""
+        if os.path.isfile(logp):
+            with io.open(logp, "rb") as f:
+                f.seek(before)
+                log = f.read().decode("utf-8", "replace")
+        marker = False
+        for path in (mk, os.path.join(self._dir, g.PROBE_MARKER_PREFIX + "pc_ask_9001.marker")):
+            if os.path.isfile(path):
+                with io.open(path, encoding="utf-8", errors="replace") as f:
+                    marker = marker or (tok + g.MARKER_SEP) in f.read()
+        return {"rc": ex.exception.code, "dec": dec, "reason": reason, "pushes": len(pushed),
+                "log": log, "marker": marker, "stderr": "", "payload": payload}
 
-    def _assert_same_as_interactive(self, r, ctl, kind, tool, mode_word="bypass"):
-        """Решение в режиме `mode_word` = решение обычного интерактива (`ctl`, без поля режима),
-        и ДОСЛОВНО: тот же ask, та же карточка (весь текст решения, а не только её хвост), тот же
-        счёт пушей, маркера нет, в логе `ask` этого вида, метки «владельца нет» нет. Allow и
-        молчание называются своими именами: для красной операции оба — исполнение без «да».
-        Ловит мутантов 16.10: bypass вернулся в `UNATTENDED_MODES` (deny), bypass → allow,
-        bypass → молчаливый defer, bypass задавил пуш или переписал карточку."""
-        self.assertEqual(r["rc"], 0, r["stderr"])
-        self.assertNotEqual(ctl["dec"], "allow", "контроль без поля режима стал разрешением")
-        self.assertNotEqual(r["dec"], "allow", "режим %s стал разрешением на красное" % mode_word)
-        self.assertIsNotNone(r["dec"], "МОЛЧАНИЕ в режиме %s: вид %s исполнился бы без вопроса"
-                             % (mode_word, kind))
-        self.assertNotIn("| defer |", r["log"], "режим %s пропустил красную операцию молча"
-                         % mode_word)
-        self.assertEqual(ctl["dec"], "ask", "посылка: без поля режима вид %s спрашивает" % kind)
-        self.assertEqual(r["dec"], ctl["dec"], "режим %s: решение разошлось с обычным "
-                         "интерактивом: %s" % (mode_word, r["reason"]))
-        self.assertEqual(r["reason"], ctl["reason"], "режим %s: карточка не та, что в обычном "
-                         "интерактиве" % mode_word)
-        self.assertNotIn("БЕЗ ВОПРОСА", r["reason"])
-        self.assertEqual(r["pushes"], ctl["pushes"], "режим %s: счёт пушей разошёлся с обычным "
-                         "интерактивом" % mode_word)
-        self.assertFalse(ctl["marker"])
-        self.assertFalse(r["marker"], "interactive не пишет маркер демону ни в каком режиме")
-        self.assertIn("| interactive | %s | ask | %s |" % (tool, kind), r["log"])
-        self.assertNotIn(g.DECISION_UNATTENDED, r["log"])
+    def _tail_ok(self, r):
+        """Хвост `mode=… agent=…` стоит на КАЖДОЙ строке лога прогона и равен входу."""
+        want = " | mode=%s agent=%s" % g.log_ctx_of(r["payload"])
+        lines = [ln for ln in r["log"].splitlines() if ln.strip()]
+        self.assertTrue(lines, "прогон не оставил ни одной строки лога")
+        for ln in lines:
+            self.assertTrue(ln.endswith(want), "строка без хвоста %r: %s" % (want, ln))
+        self.assertNotIn(self.AGENT, r["log"], "значение agent_id попало в лог")
 
-    # (а) bypass + каждый ask-вид → ТОТ ЖЕ вопрос, что в обычном интерактиве (с 16.10.2026)
-    def test_bypass_keeps_every_ask_kind_as_plain_question(self):
-        """До 16.10 здесь стоял `test_bypass_turns_every_ask_kind_into_refusal` — та же матрица
-        видов × инструментов, с обратным ожиданием. Матрица сохранена целиком; ожидание теперь —
-        решение bypass ДОСЛОВНО равно решению без поля режима (`_assert_same_as_interactive`)."""
+    def _assert_cell(self, r, kind, tool, who, mode, headless, ctl=None):
+        """Одна клетка таблицы. `ctl` — тот же вход того же `who` в interactive без поля режима
+        (посылка: ask этого вида): с ним сверяется ДОСЛОВНАЯ карточка в вопросе и в отказах."""
+        dec, label, pushes, marker = self._want(kind, who, mode, headless)
+        role = "headless" if headless else "interactive"
+        where = "вид %s · %s · %s · режим %r · %s" % (
+            kind, tool, who, "<нет поля>" if mode is self.NO_FIELD else mode, role)
+        self.assertEqual(r["rc"], 0, where + ": " + r["stderr"])
+        self.assertNotEqual(r["dec"], "allow", "ветка выдала allow: " + where)
+        self.assertEqual(r["dec"], dec, "%s: %s" % (where, r["reason"]))
+        self.assertIn("| %s | %s | %s |" % (role, tool, label), r["log"], where)
+        for other in self.LABELS + ("defer",):
+            if other != label:
+                self.assertNotIn("| %s | %s | %s |" % (role, tool, other), r["log"], where)
+        self.assertEqual(r["pushes"], pushes, where)
+        self.assertEqual(r["marker"], marker, where)
+        self._tail_ok(r)
+        if label == "defer":
+            return
+        self.assertIn("| %s | %s | %s | %s |" % (role, tool, label, kind), r["log"], where)
+        if label == "pass_bypass":
+            self.assertIsNone(r["reason"], where)
+        elif label in ("deny_hard", "deny_agent"):
+            note = g.BYPASS_HARD_NOTE if label == "deny_hard" else g.BYPASS_AGENT_NOTE
+            self.assertTrue(r["reason"].startswith("⛔ " + note), where)
+            self.assertIn("Вид операции: %s." % kind, r["reason"])
+            self.assertIn("Операция НЕ выполнена", r["reason"])
+        elif label == "deny_unattended":
+            for part in ("БЕЗ ВОПРОСА", "сессия в режиме dontAsk", "владелец не у экрана",
+                         "Операция НЕ выполнена", "ЖДЁТ ВЛАДЕЛЬЦА: <команда>, вид %s" % kind):
+                self.assertIn(part, r["reason"], where)
+        if ctl is not None and label in ("deny_hard", "deny_agent", "deny_unattended"):
+            self.assertEqual(g.card_from_decision(r["reason"]), g.card_from_decision(ctl["reason"]),
+                             where + ": в отказе нет ДОСЛОВНОЙ карточки, которая собиралась уйти")
+        if ctl is not None and label == "ask" and not headless:
+            self.assertEqual(r["reason"], ctl["reason"], where + ": карточка не та, что без режима")
+
+    # ── (1) таблица и списки ───────────────────────────────────────────────────────────────
+    def test_hard_kinds_are_the_spec_list(self):
+        self.assertEqual(set(g.BYPASS_HARD_KINDS), set(self.HARD))
+        self.assertEqual(len(g.BYPASS_HARD_KINDS), len(set(g.BYPASS_HARD_KINDS)))
+        self.assertTrue(set(self.HARD) <= set(g._KIND_VOCAB))
+        self.assertIn(g.KIND_EDIT_GUARD, g._KIND_VOCAB)
+        self.assertIs(g.BYPASS_POLICY_ON, True)
+        self.assertEqual(set(g.UNATTENDED_MODES), {"dontAsk"}, "правило dontAsk не трогается")
+        self.assertEqual((g.DECISION_HARD, g.DECISION_AGENT, g.DECISION_PASS_BYPASS,
+                          g.DECISION_UNATTENDED),
+                         ("deny_hard", "deny_agent", "pass_bypass", "deny_unattended"))
+        for label in self.LABELS:
+            self.assertRegex(label, r"^\w+$", "метка обязана разбираться описью шума")
+        self.assertIn("воля владельца 16.10", g.BYPASS_HARD_NOTE)
+        self.assertIn("Фоновый агент", g.BYPASS_AGENT_NOTE)
+
+    def test_bypass_verdict_is_the_table(self):
+        """Чистая функция правила по ВСЕМ видам словаря × кто × режим × роль, против литерала
+        таблицы. Вход — канал без спрятанных видов (Write), чтобы клетку решал вид."""
+        base = {"tool_name": "Write", "tool_input": {"file_path": "x"}}
+        for kind in g._KIND_VOCAB:
+            for who in ("main", "agent"):
+                for mode in self.MATRIX_MODES + self.GARBAGE:
+                    for headless in (False, True):
+                        data = self._payload(base, mode, who)
+                        got = g.bypass_verdict(data, headless, kind)
+                        bypass = (not headless and isinstance(mode, str)
+                                  and mode == "bypassPermissions")
+                        want = (None if not bypass else
+                                "deny_hard" if kind in self.HARD else
+                                "deny_agent" if who == "agent" else "pass_bypass")
+                        with self.subTest(kind=kind, who=who, mode=repr(mode), headless=headless):
+                            self.assertEqual(got, want)
+        # вид вне словаря и сбой разбора — ЖЁСТКИЕ (fail-closed), и у основной сессии тоже
+        main_bp = self._payload(base, self.BYPASS, "main")
+        for kind in ("", "frobnicate", "env_probe"):
+            self.assertEqual(g.bypass_verdict(main_bp, False, kind), "deny_hard", kind)
+        self.assertEqual(g.bypass_verdict(main_bp, False, "kill", failsafe=True), "deny_hard")
+        self.assertIsNone(g.bypass_verdict(main_bp, True, "kill", failsafe=True), "headless")
+
+    def test_bypass_verdict_and_agent_flag_are_total(self):
+        for data in (None, [], "bypassPermissions", 17, {}, {"permission_mode": None},
+                     {"permission_mode": ["bypassPermissions"]}, {"permission_mode": {"a": 1}},
+                     {"permission_mode": "bypassPermissions", "tool_name": None},
+                     {"permission_mode": "bypassPermissions", "tool_name": "Bash",
+                      "tool_input": "кривой вход"}):
+            with self.subTest(data=data):
+                v = g.bypass_verdict(data, False, "kill")
+                self.assertIn(v, (None, "deny_hard", "pass_bypass"))
+                self.assertIn(g.is_agent_call(data), (False, True))
+                self.assertIn(g.log_ctx_of(data)[1], ("0", "1"))
+        # кривой вход Bash в bypass: спрятанное не разобрать — жёстко, не пропуск
+        self.assertEqual(g.bypass_verdict({"permission_mode": "bypassPermissions",
+                                           "tool_name": "Bash", "tool_input": "кривой вход"},
+                                          False, "kill"), "deny_hard")
+
+    def test_agent_id_empty_or_not_string_is_main_session(self):
+        """ОСОЗНАННЫЙ ВЫБОР спецификации: `agent_id` пустой, не строка или нет поля — основная
+        сессия. Непустая строка (в том числе из пробелов) — агент: сомнение уходит в отказ."""
+        for val in ("", None, 0, 123, 1.5, False, True, [], ["x"], {}, {"id": "x"}):
+            with self.subTest(agent_id=repr(val)):
+                self.assertFalse(g.is_agent_call({"agent_id": val}))
+                r = self._inproc(dict(self.KILL, agent_id=val), mode=self.BYPASS)
+                self.assertEqual(r["dec"], None, r["reason"])
+                self.assertIn("| interactive | Bash | pass_bypass | kill |", r["log"])
+                self.assertIn("agent=0", r["log"])
+                guard = dict([d for k, d in self.ASK_INPUTS if k == "edit_guard"][0], agent_id=val)
+                self.assertEqual(g.decide(dict(guard, cwd=PROJ)), ("defer", "", ""),
+                                 "основная сессия гард править может")
+        for val in ("a", " ", self.AGENT):
+            with self.subTest(agent_id=repr(val)):
+                self.assertTrue(g.is_agent_call({"agent_id": val}))
+                r = self._inproc(dict(self.KILL, agent_id=val), mode=self.BYPASS)
+                self.assertEqual(r["dec"], "deny", r["reason"])
+                self.assertIn("| interactive | Bash | deny_agent | kill |", r["log"])
+                self.assertIn("agent=1", r["log"])
+        self.assertFalse(g.is_agent_call({}))
+        self.assertFalse(g.is_agent_call(None))
+
+    # ── (2) полная матрица в процессе ───────────────────────────────────────────────────────
+    def test_full_matrix_every_kind_mode_who_role(self):
+        """Матрица спецификации целиком: каждый вход `ASK_INPUTS` (все виды `_KIND_VOCAB`, кроме
+        `unknown` — у него свой тест) × {основная, агент} × `MATRIX_MODES` × {interactive,
+        headless}. Ни одна клетка не выдаёт allow (`_assert_cell`)."""
+        cells = 0
         for kind, data in self.ASK_INPUTS:
-            with self.subTest(kind=kind, tool=data["tool_name"]):
-                ctl = self._run(data)
-                self.assertEqual(ctl["dec"], "ask", "посылка: без поля режима вид %s спрашивает"
-                                 % kind)
-                self.assertEqual(ctl["pushes"], 1, "посылка: в интерактиве карточка пушится")
-                self.assertIn("| interactive | %s | ask | %s |" % (data["tool_name"], kind),
-                              ctl["log"])
-                r = self._run(data, mode=self.BYPASS)
-                self._assert_same_as_interactive(r, ctl, kind, data["tool_name"])
+            for who in ("main", "agent"):
+                ctl = self._inproc(data, who=who)
+                if not (kind == "edit_guard" and who == "main"):
+                    self.assertEqual(ctl["dec"], "ask", "посылка: без поля режима вид %s · %s · %s "
+                                     "спрашивает: %s" % (kind, data["tool_name"], who, ctl["reason"]))
+                for mode in self.MATRIX_MODES:
+                    for headless in (False, True):
+                        with self.subTest(kind=kind, tool=data["tool_name"], who=who,
+                                          mode=repr(mode), headless=headless):
+                            r = self._inproc(data, mode=mode, who=who, headless=headless)
+                            self._assert_cell(r, kind, data["tool_name"], who, mode, headless,
+                                              ctl=ctl)
+                            cells += 1
+        sys.stderr.write("\n[POLICY-1610] матрица в процессе: %d клеток, входов %d\n"
+                         % (cells, len(self.ASK_INPUTS)))
+        self.assertEqual(cells, len(self.ASK_INPUTS) * 2 * len(self.MATRIX_MODES) * 2)
 
-    def test_dont_ask_mode_is_unattended_too(self):
-        """dontAsk по определению «всё, что потребовало бы вопроса, — отказ»: человека там не
-        ждут, поэтому вопрос тоже уходит отказом с текстом, а не пушем владельцу. С 12.10 (Д1) —
-        на КАЖДОМ входе `ASK_INPUTS`, а не на двух: исключение вида или инструмента из правила
-        обязано валить этот режим. С 16.10.2026 dontAsk — ЕДИНСТВЕННЫЙ режим правила, и эта
-        матрица — его единственный полный сторож."""
+    # ── (3) сквозной прогон процессом ───────────────────────────────────────────────────────
+    def test_end_to_end_by_process_key_cells(self):
+        """Каждый вход ПРОЦЕССОМ в ключевых клетках: без поля режима (посылка — ask и пуш), bypass
+        основной сессии, bypass агента, dontAsk. Это сторож того, что матрица в процессе меряет то
+        же, что живой хук (кодировки, `sys.exit`, окружение)."""
         for kind, data in self.ASK_INPUTS:
-            with self.subTest(kind=kind, tool=data["tool_name"]):
+            tool, who0 = data["tool_name"], self._who_of(data)
+            with self.subTest(kind=kind, tool=tool):
                 ctl = self._run(data)
-                self.assertEqual(ctl["dec"], "ask", "посылка: без поля режима вид %s спрашивает"
-                                 % kind)
+                self.assertEqual((ctl["dec"], ctl["pushes"]), ("ask", 1),
+                                 "посылка: без поля режима вид %s спрашивает и пушит" % kind)
+                self._assert_cell(ctl, kind, tool, who0, self.NO_FIELD, False)
+                for who in ("main", "agent"):
+                    c = ctl if who == who0 else None
+                    r = self._run(data, mode=self.BYPASS, who=who)
+                    self._assert_cell(r, kind, tool, who, self.BYPASS, False, ctl=c)
                 r = self._run(data, mode="dontAsk")
-                self._assert_unattended(r, kind, data["tool_name"], ctl, mode_word="dontAsk")
+                self._assert_cell(r, kind, tool, who0, "dontAsk", False, ctl=ctl)
 
     def test_ask_inputs_cover_every_asking_kind_and_tool(self):
-        """СТОРОЖ ОТ ПРОТУХАНИЯ (Д1 review_escape, 12.10.2026). Имена
-        `test_bypass_keeps_every_ask_kind_as_plain_question` и `test_dont_ask_mode_is_unattended_too`
-        обещают «каждый вид», и держит обещание не
-        память, а сверка с ЗАКРЫТЫМ словарём гарда: новый вид в `_KIND_VOCAB` без входа здесь
-        валит класс, пока вход не добавлен. `unknown` исключён замером, а не словом: объект у него
-        пуст по построению, и `card_decision` отказывает на месте при любой команде — вопроса
-        этого вида не бывает, превращать в отказ нечего. Инструменты — все, которыми приходит ask:
-        правило, исключившее инструменты правки, проходило прежний класс целиком."""
+        """СТОРОЖ ОТ ПРОТУХАНИЯ (Д1 review_escape, 12.10.2026): новый вид в `_KIND_VOCAB` без входа
+        здесь валит класс. `unknown` исключён замером: объект у него пуст по построению, и
+        `card_decision` отказывает на месте — вопроса этого вида не бывает (его клетки — сбой
+        разбора, `test_failsafe_*`). Инструменты — все, которыми приходит ask, и `edit_guard` —
+        всеми пятью каналами записи."""
         kinds = {kind for kind, _ in self.ASK_INPUTS}
         self.assertEqual(kinds, set(g._KIND_VOCAB) - {"unknown"},
                          "вход на спрашивающий вид отсутствует (или вид снят со словаря)")
@@ -5521,234 +6257,375 @@ class TestOwnerAwayNoQuestion(unittest.TestCase):
                 self.assertEqual(g.card_decision("unknown", "", raw)[0], "deny",
                                  "вид unknown начал спрашивать — ему нужен вход в ASK_INPUTS")
         tools = {data["tool_name"] for _, data in self.ASK_INPUTS}
-        for tool in ("Bash", "PowerShell", "Write", "Edit", "MultiEdit", "NotebookEdit", "Read"):
+        guarded = {t for t, v in list(g._TOOL_CHANNELS.items()) + list(g._CODEX_CHANNELS.items())
+                   if v[0] == g.CHANNEL_GUARD}
+        for tool in sorted({"Bash", "PowerShell", "Write", "Edit", "MultiEdit", "NotebookEdit",
+                            "Read"} | guarded):
             with self.subTest(tool=tool):
                 self.assertIn(tool, tools)
+        guard_tools = {d["tool_name"] for k, d in self.ASK_INPUTS if k == "edit_guard"}
+        self.assertEqual(guard_tools, {"Write", "Edit", "MultiEdit", "NotebookEdit",
+                                       "apply_patch"})
 
-    # Д2 review_escape (12.10): тест-флаг в ОКРУЖЕНИИ хука — изоляция каналов, а не выход из правила
-    def test_test_run_flag_in_hook_env_does_not_reopen_question(self):
-        """Флаг тест-прогона (`_TEST_RUN_ENVS`) в окружении ХУКА глушит каналы владельца
-        (`isolated`), но решения не меняет: без поля режима это перехваченный ask, в bypass (с
-        16.10.2026) — ТОТ ЖЕ перехваченный ask, в dontAsk — отказ «владельца нет». Мутант «правило
-        молчит при `is_test_run()`» вернул бы вопрос на экран сессии, унаследовавшей флаг из
-        тестового окружения, а прежний класс гонял хук только со СНЯТЫМИ флагами и этого не видел.
-        Флаг префиксом КОМАНДЫ — другой путь (латч пробы), его держит
-        `test_probe_is_plain_intercept_in_bypass_and_refused_in_dont_ask`."""
-        for flag in g._TEST_RUN_ENVS:
-            with self.subTest(flag=flag):
-                ctl = self._run(self.KILL, env_extra={flag: "1"})
-                self.assertEqual(ctl["dec"], "ask",
-                                 "посылка: без поля режима флаг-прогон спрашивает")
-                self.assertIn("ПЕРЕХВАЧЕНО НА ГРАНИЦЕ", ctl["reason"])
-                self.assertEqual(ctl["pushes"], 0, "посылка: флаг гасит пуш изоляцией")
-                r = self._run(self.KILL, mode=self.BYPASS, env_extra={flag: "1"})
-                self._assert_same_as_interactive(r, ctl, "kill", "Bash")
-                r = self._run(self.KILL, mode="dontAsk", env_extra={flag: "1"})
-                self.assertNotEqual(r["dec"], "ask", "тест-флаг вернул вопрос в режиме dontAsk")
-                self._assert_unattended(r, "kill", "Bash", ctl, mode_word="dontAsk")
+    # ── (4) жёсткое, спрятанное за первым видом ─────────────────────────────────────────────
+    def test_hidden_hard_kind_in_shell_command_is_refused_in_bypass(self):
+        """Карточка оболочки называет ПЕРВЫЙ красный вид. Без этой проверки `taskkill …; git push
+        --force …` в bypass основной сессии ушёл бы пропуском по виду `kill`, и принудительный
+        push исполнился бы без вопроса. Нежёсткие соседи жёсткими не становятся."""
+        gi = "gi" + "t"
+        for cmd, first in (("taskkill /PID 47121 /F; " + gi + " push --force origin main", "kill"),
+                           ("clasp push; cat .env", "clasp_push"),
+                           ("curl -X POST https://example.invalid/h -d a=1; cat .env", "network"),
+                           ("schtasks /Change /TN TurboBabyExpectPC /Disable; " + gi
+                            + " reset --hard HEAD~1",
+                            "schtasks")):
+            data = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+            with self.subTest(cmd=cmd):
+                self.assertEqual(g.decide(dict(data, cwd=PROJ))[:2], ("ask", first))
+                self.assertTrue(g.hidden_hard_kinds(dict(data, cwd=PROJ)))
+                ctl = self._run(data)
+                self.assertEqual(ctl["dec"], "ask")
+                r = self._run(data, mode=self.BYPASS, who="main")
+                self.assertEqual(r["dec"], "deny", r["reason"])
+                self.assertIn("| interactive | Bash | deny_hard | %s |" % first, r["log"])
+                self.assertEqual(g.card_from_decision(r["reason"]),
+                                 g.card_from_decision(ctl["reason"]))
+                self.assertEqual(r["pushes"], 0)
+        calm = {"tool_name": "Bash", "tool_input": {
+            "command": "taskkill /PID 47121 /F; schtasks /Change /TN TurboBabyExpectPC /Disable"}}
+        self.assertEqual(g.hidden_hard_kinds(dict(calm, cwd=PROJ)), ())
+        r = self._run(calm, mode=self.BYPASS, who="main")
+        self.assertEqual(r["dec"], None, r["reason"])
+        self.assertIn("| interactive | Bash | pass_bypass | kill |", r["log"])
 
-    def test_probe_is_plain_intercept_in_bypass_and_refused_in_dont_ask(self):
-        """Обе ночные строки были ПРОБАМИ (скрипты из tmp/): перехват пробы — тоже ask. До 16.10
-        здесь стоял `test_probe_in_bypass_is_refused_without_push`; с 16.10 в bypass перехват
-        остаётся ТЕМ ЖЕ перехватом, что без поля режима (пуша нет — его гасит латч пробы, а не
-        режим), а в dontAsk обязан стать отказом, а не вопросом на экране."""
-        data = {"tool_name": "Bash",
-                "tool_input": {"command": "PRETOOL_TEST_RUN=1 taskkill /PID 47121 /F"}}
-        ctl = self._run(data)
-        self.assertEqual(ctl["dec"], "ask")
-        self.assertIn("ПЕРЕХВАЧЕНО НА ГРАНИЦЕ", ctl["reason"])
-        self.assertEqual(ctl["pushes"], 0)
-        r = self._run(data, mode=self.BYPASS)
-        self._assert_same_as_interactive(r, ctl, "kill", "Bash")
-        self.assertIn("ПЕРЕХВАЧЕНО НА ГРАНИЦЕ", r["reason"])
-        r = self._run(data, mode="dontAsk")
-        self._assert_unattended(r, "kill", "Bash", ctl, mode_word="dontAsk")
+    def test_multi_op_patch_in_bypass_main_is_not_silent(self):
+        """Находка приёмки APPLY_PATCH сквозь хук: «запись вне проекта + удаление» в bypass
+        основной сессии — `deny_hard` по виду `delete`, а не пропуск по первому `write_outside`."""
+        patch = ("*** Begin Patch\n*** Add File: " + self.PUB + "\\guard_bypass_x.txt\n+x\n"
+                 "*** Delete File: D:/turbobaby-bot/docs/guard_bypass_y.md\n*** End Patch")
+        data = {"tool_name": "apply_patch", "tool_input": {"command": patch}}
+        r = self._run(data, mode=self.BYPASS, who="main")
+        self.assertEqual(r["dec"], "deny", r["reason"])
+        self.assertIn("| interactive | apply_patch | deny_hard | delete |", r["log"])
+        mixed = ("*** Begin Patch\n*** Update File: D:/turbobaby-bot/.claude/settings.json\n@@\n"
+                 "+x\n*** Delete File: D:/turbobaby-bot/docs/guard_bypass_y.md\n*** End Patch")
+        r = self._run({"tool_name": "apply_patch", "tool_input": {"command": mixed}},
+                      mode=self.BYPASS, who="main")
+        self.assertEqual(r["dec"], "deny", r["reason"])
+        self.assertIn("| interactive | apply_patch | deny_hard | unknown_tool |", r["log"])
+        self.assertIn(g.AP_MIXED + "edit_claude, delete", r["reason"])
 
-    def test_failsafe_input_in_bypass_stays_plain_refusal(self):
-        """FAIL-SAFE (`ask unknown ''` → пустой объект → deny) в bypass и dontAsk не меняется:
-        отказ был и остаётся, текст тот же, метка лога обычная `deny`. Вход-не-dict — тоже отказ,
-        без падения."""
+    # ── (5) сбой разбора гарда ──────────────────────────────────────────────────────────────
+    def test_failsafe_parse_failure_in_bypass_is_deny_hard(self):
+        """Сбой разбора самого гарда (except в `main` → `unknown`, пустой объект → прежний отказ
+        `_deny_text`). В bypass — `deny_hard` и у основной сессии, и у агента: иначе сбой гарда в
+        bypass стал бы тихим пропуском. В прочих режимах — ПРЕЖНЕЕ решение байт-в-байт (замер
+        16.10: прежнее решение здесь — отказ `deny`, а не вопрос: объект пуст, `card_decision`
+        отказывает на месте). Вход-не-dict режима не несёт — прежний отказ, без падения."""
         crooked = {"tool_name": "Bash", "tool_input": "кривой вход"}
         ctl = self._run(crooked)
         self.assertEqual(ctl["dec"], "deny")
-        for mode in (self.BYPASS, "dontAsk"):
+        self.assertIn("| interactive | Bash | deny | unknown |", ctl["log"])
+        for mode in ("default", "acceptEdits", "plan", "auto", "dontAsk", "", "BypassPermissions"):
             with self.subTest(mode=mode):
                 r = self._run(crooked, mode=mode)
-                self.assertEqual(r["dec"], "deny")
-                self.assertEqual(r["reason"], ctl["reason"])
+                self.assertEqual((r["dec"], r["reason"]), (ctl["dec"], ctl["reason"]))
                 self.assertIn("| interactive | Bash | deny | unknown |", r["log"])
-                self.assertNotIn(g.DECISION_UNATTENDED, r["log"])
+        for who in ("main", "agent"):
+            with self.subTest(who=who):
+                r = self._run(crooked, mode=self.BYPASS, who=who)
+                self.assertEqual(r["dec"], "deny")
+                self.assertTrue(r["reason"].startswith("⛔ " + g.BYPASS_HARD_NOTE), r["reason"])
+                self.assertEqual(g.card_from_decision(r["reason"]), ctl["reason"])
+                self.assertIn("| interactive | Bash | deny_hard | unknown |", r["log"])
+                self.assertEqual((r["pushes"], r["marker"]), (0, False))
+                self._tail_ok(r)
+        r = self._run(crooked, mode=self.BYPASS, headless=True)
+        self.assertEqual((r["dec"], r["reason"]), (ctl["dec"], ctl["reason"]), "headless не трогаем")
         for raw in ('["bypassPermissions"]', '"bypassPermissions"', "17"):
             with self.subTest(raw=raw):
                 r = self._run(raw=raw)
                 self.assertEqual(r["rc"], 0, r["stderr"])
                 self.assertEqual(r["dec"], "deny")
 
-    def _main_inproc(self, data, patches):
-        """`main()` в процессе теста: решение (dec, reason), пуши, строки лога. Нужен для веток,
-        которых процессом не достать (запасной ask `card_decision`, журнальная ветка)."""
-        from unittest import mock
-        import contextlib
-        os.makedirs(self.RUNS, exist_ok=True)
-        d = tempfile.mkdtemp(prefix="inproc_", dir=self.RUNS)
-        logp = os.path.join(d, "guard.log")
-        pushed = []
-        out = io.StringIO()
-        env = {"PRETOOL_GUARD_LOG": logp, "PRETOOL_ASK_MARKER": "", "PRETOOL_MARKER_TOKEN": ""}
-        with contextlib.ExitStack() as st:
-            st.enter_context(mock.patch.dict(os.environ, env))
-            st.enter_context(mock.patch.object(g, "_push", lambda c, k="": pushed.append(k)))
-            for name, fn in patches.items():
-                st.enter_context(mock.patch.object(g, name, fn))
-            st.enter_context(mock.patch.object(sys, "stdin", io.StringIO(json.dumps(data))))
-            st.enter_context(contextlib.redirect_stdout(out))
-            self.addCleanup(g.set_probe, False)        # латч пробы — глобал модуля
-            with self.assertRaises(SystemExit) as ex:
-                g.main()
-        self.assertEqual(ex.exception.code, 0)
-        dec, reason = None, None
-        if out.getvalue().strip():
-            hso = json.loads(out.getvalue().strip().splitlines()[-1])["hookSpecificOutput"]
-            dec, reason = hso["permissionDecision"], hso["permissionDecisionReason"]
-        log = ""
-        if os.path.isfile(logp):
-            with io.open(logp, encoding="utf-8") as f:
-                log = f.read()
-        return dec, reason, pushed, log
+    def test_failsafe_on_a_green_looking_input_in_bypass(self):
+        """Тот же сбой на ЗДОРОВОМ входе (`decide_for_role` падает): без правила основная сессия в
+        bypass получила бы… прежний отказ `deny`; правило делает его `deny_hard` — и, главное, не
+        даёт ему стать пропуском ни в одной клетке bypass."""
+        def boom(*_a, **_k):
+            raise RuntimeError("сбой разбора гарда (тест)")
+        for who in ("main", "agent"):
+            r = self._inproc(self.KILL, mode=self.BYPASS, who=who,
+                             patches={"decide_for_role": boom})
+            self.assertEqual(r["dec"], "deny", r["reason"])
+            self.assertIn("| interactive | Bash | deny_hard | unknown |", r["log"])
+        r = self._inproc(self.KILL, mode="default", patches={"decide_for_role": boom})
+        self.assertEqual(r["dec"], "deny")
+        self.assertIn("| interactive | Bash | deny | unknown |", r["log"])
 
-    def test_fallback_ask_of_card_decision_plain_in_bypass_refused_in_dont_ask(self):
-        """Запасной ask `card_decision` (сбой ВНУТРИ разбора карточки → except → `_card`) — тоже
-        вопрос. До 16.10 здесь стоял `test_fallback_ask_of_card_decision_is_refused_in_bypass`;
-        с 16.10 в bypass он — ТОТ ЖЕ вопрос с пушем, что без поля режима, а в dontAsk обязан стать
-        отказом. Сбой вызываем подменой `_card_blocked`."""
+    def test_fallback_ask_of_card_decision_in_bypass_is_deny_hard(self):
+        """Запасной ask `card_decision` (сбой ВНУТРИ разбора карточки → except → `_card`) — тоже сбой
+        гарда: без поля режима — прежний вопрос с пушем, в bypass — `deny_hard` (а не пропуск по
+        нежёсткому `kill`), в dontAsk — отказ «владельца нет». Сбой — подменой `_card_blocked`."""
         def boom(*_a, **_k):
             raise RuntimeError("сбой разбора карточки (тест)")
-        data = dict(self.KILL, cwd=PROJ)
-        dec, reason, pushed, log = self._main_inproc(data, {"_card_blocked": boom})
-        self.assertEqual((dec, len(pushed)), ("ask", 1), "посылка: без поля — вопрос и пуш")
-        dec1, reason1, pushed1, log1 = self._main_inproc(dict(data, permission_mode=self.BYPASS),
-                                                         {"_card_blocked": boom})
-        self.assertNotEqual(dec1, "allow", "bypass стал разрешением на запасном ask")
-        self.assertEqual((dec1, reason1, pushed1), (dec, reason, pushed),
-                         "запасной ask в bypass разошёлся с обычным интерактивом")
-        self.assertIn("| interactive | Bash | ask | kill |", log1)
-        self.assertNotIn(g.DECISION_UNATTENDED, log1)
-        dec2, reason2, pushed2, log2 = self._main_inproc(dict(data, permission_mode="dontAsk"),
-                                                         {"_card_blocked": boom})
-        self.assertEqual(dec2, "deny")
-        self.assertEqual(pushed2, [])
-        self.assertEqual(g.card_from_decision(reason2), g.card_from_decision(reason))
-        self.assertIn("| interactive | Bash | %s | kill |" % g.DECISION_UNATTENDED, log2)
+        p = {"_card_blocked": boom}
+        ctl = self._inproc(self.KILL, patches=p)
+        self.assertEqual((ctl["dec"], ctl["pushes"]), ("ask", 1), "посылка: без поля — вопрос и пуш")
+        for who in ("main", "agent"):
+            r = self._inproc(self.KILL, mode=self.BYPASS, who=who, patches=p)
+            self.assertEqual(r["dec"], "deny", r["reason"])
+            self.assertEqual(g.card_from_decision(r["reason"]), ctl["reason"])
+            self.assertIn("| interactive | Bash | deny_hard | kill |", r["log"])
+            self.assertEqual(r["pushes"], 0)
+        r = self._inproc(self.KILL, mode="dontAsk", patches=p)
+        self.assertEqual((r["dec"], r["pushes"]), ("deny", 0))
+        self.assertIn("| interactive | Bash | deny_unattended | kill |", r["log"])
+        r = self._inproc(self.KILL, mode="default", patches=p)
+        self.assertEqual((r["dec"], r["reason"], r["pushes"]), ("ask", ctl["reason"], 1))
+        self.assertEqual(g.card_decision("kill", "PID 47121", "taskkill /PID 47121 /F")[0], "ask")
 
-    # (б) прочие режимы (с 16.10 — и bypass), нет поля, мусор в поле → вопрос как раньше
+    # ── (6) рубильник ───────────────────────────────────────────────────────────────────────
+    def test_switch_off_restores_plain_question_in_bypass(self):
+        """`BYPASS_POLICY_ON = False` → bypass снова означает ПРЕЖНИЙ ask (как с d993ffaa) в каждой
+        клетке: та же карточка, тот же пуш, метка `ask`. dontAsk и сбой разбора — как были."""
+        from unittest import mock
+        guard_in = [d for k, d in self.ASK_INPUTS if k == "edit_guard"][0]
+        with mock.patch.object(g, "BYPASS_POLICY_ON", False):
+            for data in (self.KILL, self.ENV_IN, guard_in):
+                for who in ("main", "agent"):
+                    with self.subTest(tool=data["tool_name"], who=who):
+                        ctl = self._inproc(data, who=who)
+                        r = self._inproc(data, mode=self.BYPASS, who=who)
+                        self.assertEqual((r["dec"], r["reason"], r["pushes"]),
+                                         (ctl["dec"], ctl["reason"], ctl["pushes"]))
+                        for label in ("deny_hard", "deny_agent", "pass_bypass"):
+                            self.assertNotIn(label, r["log"])
+            r = self._inproc(self.KILL, mode="dontAsk")
+            self.assertIn("| interactive | Bash | deny_unattended | kill |", r["log"])
+            r = self._inproc(self.KILL, mode=self.BYPASS,
+                             patches={"decide_for_role": lambda *a, **k: 1 / 0})
+            self.assertIn("| interactive | Bash | deny | unknown |", r["log"])
+        src = inspect.getsource(g)
+        self.assertEqual(len(re.findall(r"(?m)^BYPASS_POLICY_ON = (?:True|False)\s*$", src)), 1,
+                         "рубильник обязан быть ОДНОЙ строкой")
+
+    # ── (7) режимы вне bypass и мусор ───────────────────────────────────────────────────────
     def test_other_modes_and_garbage_still_ask(self):
-        for mode in (self.NO_FIELD, "default", "acceptEdits", "plan", "auto", self.BYPASS, "",
-                     None, 123, ["bypassPermissions"], {"mode": "bypassPermissions"},
-                     "BypassPermissions", "bypassPermissions ", "dontask", ["dontAsk"],
-                     "dontAsk "):
-            with self.subTest(mode=mode if mode is not self.NO_FIELD else "<нет поля>"):
-                r = self._run(self.KILL, mode=mode)
-                self.assertEqual(r["rc"], 0, r["stderr"])
-                self.assertNotEqual(r["dec"], "allow")
-                self.assertEqual(r["dec"], "ask", r["reason"])
-                self.assertNotIn("БЕЗ ВОПРОСА", r["reason"])
-                self.assertEqual(r["pushes"], 1, "вне dontAsk вопрос пушится владельцу, как было")
-                self.assertIn("| interactive | Bash | ask | kill |", r["log"])
-                self.assertNotIn(g.DECISION_UNATTENDED, r["log"])
+        """Прочие режимы, нет поля, мусор в поле (регистр, пробел, список, словарь, число) — вопрос
+        как раньше, у основной сессии и у агента, с пушем. Мусор bypass-ом не считается."""
+        for mode in (self.NO_FIELD, "default", "acceptEdits", "plan", "auto") + self.GARBAGE:
+            for who in ("main", "agent"):
+                with self.subTest(mode=mode if mode is not self.NO_FIELD else "<нет поля>",
+                                  who=who):
+                    r = self._run(self.KILL, mode=mode, who=who)
+                    self.assertEqual(r["rc"], 0, r["stderr"])
+                    self.assertEqual(r["dec"], "ask", r["reason"])
+                    self.assertNotIn("БЕЗ ВОПРОСА", r["reason"])
+                    self.assertEqual(r["pushes"], 1, "вне bypass/dontAsk вопрос пушится, как было")
+                    self.assertIn("| interactive | Bash | ask | kill |", r["log"])
+                    for label in self.LABELS[1:]:
+                        self.assertNotIn(label, r["log"])
 
-    # (в) headless + bypass/dontAsk → прежний путь (маркер демону и вопрос), не отказ
-    def test_headless_bypass_keeps_marker_card(self):
-        base = self._run(self.KILL, headless=True)
-        for mode in (self.BYPASS, "dontAsk"):
-            with self.subTest(mode=mode):
-                r = self._run(self.KILL, mode=mode, headless=True)
-                for x in (base, r):
-                    self.assertNotEqual(x["dec"], "allow")
-                    self.assertEqual(x["dec"], "ask", x["reason"])
-                    self.assertTrue(x["marker"], "headless обязан писать карточку в маркер демону")
-                    self.assertEqual(x["pushes"], 1)
-                    self.assertIn("| headless | Bash | ask | kill |", x["log"])
-                    self.assertNotIn(g.DECISION_UNATTENDED, x["log"])
-                self.assertEqual(r["reason"], base["reason"])
+    # ── (8) headless ────────────────────────────────────────────────────────────────────────
+    def test_headless_keeps_marker_card_in_every_mode_and_agent(self):
+        """headless (штамп демона) — карточка в маркер, как была, при ЛЮБОМ режиме и `agent_id`:
+        bypass, dontAsk, нет поля; основная сессия и агент; нежёсткий и жёсткий вид."""
+        guard_in = [d for k, d in self.ASK_INPUTS if k == "edit_guard"][0]
+        for data, kind, whos in ((self.KILL, "kill", ("main", "agent")),
+                                 (self.ENV_IN, "env", ("main", "agent")),
+                                 (guard_in, "edit_guard", ("agent",))):
+            base = self._run(data, headless=True)
+            for mode in (self.BYPASS, "dontAsk"):
+                for who in whos:
+                    with self.subTest(kind=kind, mode=mode, who=who):
+                        r = self._run(data, mode=mode, headless=True, who=who)
+                        for x in (base, r):
+                            self.assertEqual(x["dec"], "ask", x["reason"])
+                            self.assertTrue(x["marker"], "headless обязан писать карточку в маркер")
+                            self.assertEqual(x["pushes"], 1)
+                            self.assertIn("| headless | %s | ask | %s |"
+                                          % (data["tool_name"], kind), x["log"])
+                            for label in self.LABELS[1:]:
+                                self.assertNotIn(label, x["log"])
+                        self.assertEqual(r["reason"], base["reason"])
 
-    # (г) defer / deny / journal в bypass и dontAsk не меняются
+    # ── (9) что правило не трогает ──────────────────────────────────────────────────────────
     def test_defer_and_plain_deny_unchanged_in_bypass(self):
+        """Зелёное молчит, обычный отказ (объект не назван) остаётся обычным `deny` — у основной
+        сессии и у агента, в bypass и dontAsk: правило бьёт только по решению «карточка»."""
         green = {"tool_name": "Bash", "tool_input": {"command": "git status"}}
         unnamed = {"tool_name": "Bash", "tool_input": {"command": "find . -name x | xargs rm"}}
         ctl = self._run(unnamed)
         self.assertEqual(ctl["dec"], "deny")
         for mode in (self.BYPASS, "dontAsk"):
-            with self.subTest(mode=mode):
-                r = self._run(green, mode=mode)
-                self.assertEqual((r["rc"], r["dec"]), (0, None),
-                                 "зелёное в режиме %s обязано молчать" % mode)
-                self.assertIn("| interactive | Bash | defer |", r["log"])
-                r = self._run(unnamed, mode=mode)
-                self.assertEqual(r["dec"], "deny")
-                self.assertEqual(r["reason"], ctl["reason"],
-                                 "обычный отказ в режиме %s переписан" % mode)
-                self.assertIn("| interactive | Bash | deny | delete |", r["log"])
-                self.assertNotIn(g.DECISION_UNATTENDED, r["log"])
-                self.assertEqual(r["pushes"], 0)
+            for who in ("main", "agent"):
+                with self.subTest(mode=mode, who=who):
+                    r = self._run(green, mode=mode, who=who)
+                    self.assertEqual((r["rc"], r["dec"]), (0, None),
+                                     "зелёное в режиме %s обязано молчать" % mode)
+                    self.assertIn("| interactive | Bash | defer |", r["log"])
+                    r = self._run(unnamed, mode=mode, who=who)
+                    self.assertEqual(r["dec"], "deny")
+                    self.assertEqual(r["reason"], ctl["reason"],
+                                     "обычный отказ в режиме %s переписан" % mode)
+                    self.assertIn("| interactive | Bash | deny | delete |", r["log"])
+                    for label in self.LABELS[1:]:
+                        self.assertNotIn(label, r["log"])
+                    self.assertEqual(r["pushes"], 0)
 
     def test_journal_branch_unchanged_in_bypass(self):
         """Журнальная ветка мертва (`card_gate` безусловна), но правило её не трогает: оживи её —
         в bypass и dontAsk она по-прежнему молчит строкой лога, а не превращается в отказ."""
         for mode in (self.BYPASS, "dontAsk"):
-            with self.subTest(mode=mode):
-                data = dict(self.KILL, cwd=PROJ, permission_mode=mode)
-                dec, reason, pushed, log = self._main_inproc(
-                    data, {"card_gate": lambda *a, **k: False})
-                self.assertEqual((dec, pushed), (None, []))
-                self.assertIn("| interactive | Bash | journal | kill |", log)
+            for who in ("main", "agent"):
+                with self.subTest(mode=mode, who=who):
+                    r = self._inproc(self.KILL, mode=mode, who=who,
+                                     patches={"card_gate": lambda *a, **k: False})
+                    self.assertEqual((r["dec"], r["pushes"]), (None, 0))
+                    self.assertIn("| interactive | Bash | journal | kill |", r["log"])
 
-    # (д) пуш: dontAsk — ни одного; default и (с 16.10) bypass — как раньше
-    def test_push_only_when_owner_can_answer(self):
+    def test_test_run_flag_in_hook_env_does_not_change_the_table(self):
+        """Флаг тест-прогона (`_TEST_RUN_ENVS`) в окружении ХУКА глушит каналы владельца
+        (`isolated`), но решения не меняет: без поля режима — перехваченный ask, в bypass основной
+        сессии — пропуск, агента — отказ, жёсткое — отказ, в dontAsk — отказ «владельца нет»."""
+        for flag in g._TEST_RUN_ENVS:
+            with self.subTest(flag=flag):
+                ex = {flag: "1"}
+                ctl = self._run(self.KILL, env_extra=ex)
+                self.assertEqual((ctl["dec"], ctl["pushes"]), ("ask", 0))
+                self.assertIn("ПЕРЕХВАЧЕНО НА ГРАНИЦЕ", ctl["reason"])
+                r = self._run(self.KILL, mode=self.BYPASS, who="main", env_extra=ex)
+                self.assertEqual(r["dec"], None, r["reason"])
+                self.assertIn("| interactive | Bash | pass_bypass | kill |", r["log"])
+                r = self._run(self.KILL, mode=self.BYPASS, who="agent", env_extra=ex)
+                self.assertEqual(r["dec"], "deny")
+                self.assertIn("| interactive | Bash | deny_agent | kill |", r["log"])
+                r = self._run(self.ENV_IN, mode=self.BYPASS, who="main", env_extra=ex)
+                self.assertEqual(r["dec"], "deny")
+                self.assertIn("| interactive | Bash | deny_hard | env |", r["log"])
+                r = self._run(self.KILL, mode="dontAsk", env_extra=ex)
+                self.assertEqual(r["dec"], "deny")
+                self.assertIn("| interactive | Bash | deny_unattended | kill |", r["log"])
+
+    def test_probe_follows_the_table_in_bypass(self):
+        """Проба (env-префикс в команде) прав не даёт и не отнимает: в bypass основной сессии —
+        пропуск нежёсткого, отказ жёсткого; у агента — отказ; в dontAsk — отказ «владельца нет»."""
+        kill = {"tool_name": "Bash",
+                "tool_input": {"command": "PRETOOL_TEST_RUN=1 taskkill /PID 47121 /F"}}
+        env = {"tool_name": "Bash", "tool_input": {"command": "PRETOOL_TEST_RUN=1 cat .env"}}
+        ctl = self._run(kill)
+        self.assertEqual((ctl["dec"], ctl["pushes"]), ("ask", 0))
+        self.assertIn("ПЕРЕХВАЧЕНО НА ГРАНИЦЕ", ctl["reason"])
+        r = self._run(kill, mode=self.BYPASS, who="main")
+        self.assertEqual(r["dec"], None)
+        self.assertIn("| pass_bypass | kill |", r["log"])
+        r = self._run(kill, mode=self.BYPASS, who="agent")
+        self.assertEqual(r["dec"], "deny")
+        self.assertIn("| deny_agent | kill |", r["log"])
+        r = self._run(env, mode=self.BYPASS, who="main")
+        self.assertEqual(r["dec"], "deny")
+        self.assertIn("| deny_hard | env |", r["log"])
+        r = self._run(kill, mode="dontAsk")
+        self.assertEqual(r["dec"], "deny")
+        self.assertIn("| deny_unattended | kill |", r["log"])
+
+    # ── (10) пуш и allow ────────────────────────────────────────────────────────────────────
+    def test_push_only_when_owner_is_asked(self):
+        self.assertEqual(self._run(self.KILL)["pushes"], 1)
         self.assertEqual(self._run(self.KILL, mode="default")["pushes"], 1)
-        self.assertEqual(self._run(self.KILL, mode=self.BYPASS)["pushes"], 1,
-                         "bypass с 16.10 — обычный вопрос: карточка обязана уйти владельцу")
+        self.assertEqual(self._run(self.KILL, mode=self.BYPASS, who="main")["pushes"], 0,
+                         "bypass основной сессии — без вопроса: звать владельца не к чему")
+        self.assertEqual(self._run(self.KILL, mode=self.BYPASS, who="agent")["pushes"], 0)
+        self.assertEqual(self._run(self.ENV_IN, mode=self.BYPASS, who="main")["pushes"], 0)
         self.assertEqual(self._run(self.KILL, mode="dontAsk")["pushes"], 0)
 
-    # (ж) ни одна ветка не выдаёт allow — ни в каком режиме, ни в какой роли
     def test_no_branch_returns_allow(self):
-        """«Байпас работает» (16.10.2026) значит «вопрос как обычно», а не «красное без да». Гард
-        allow не выдаёт вовсе (зелёное молчит `defer`, и авто-allow делает CLI, а не гард), и
-        снятие bypass из правила этого не меняет. Матрица: роль × режим (все названные и мусор) на
-        красном входе; ожидаемое решение — ровно одно из двух: отказ «владельца нет» только у
-        interactive + dontAsk, во всех прочих клетках — вопрос. Полную матрицу видов держат
-        `test_bypass_keeps_every_ask_kind_as_plain_question` и `test_dont_ask_mode_is_unattended_too`
-        (каждая клетка там тоже проверяет «не allow»)."""
-        for headless in (False, True):
-            for mode in (self.NO_FIELD, "default", "acceptEdits", "plan", "auto", self.BYPASS,
-                         "dontAsk", "", None, "allow"):
-                name = mode if mode is not self.NO_FIELD else "<нет поля>"
-                with self.subTest(headless=headless, mode=name):
-                    r = self._run(self.KILL, mode=mode, headless=headless)
-                    self.assertEqual(r["rc"], 0, r["stderr"])
-                    self.assertNotEqual(r["dec"], "allow", "ветка выдала allow")
-                    want = "deny" if (not headless and mode == "dontAsk") else "ask"
-                    self.assertEqual(r["dec"], want, r["reason"])
+        """Роль × режим (все названные и мусор) × кто на нежёстком и на жёстком входе: ожидаемое —
+        ровно клетка таблицы, и ни одна не allow (процессом те же клетки меряет
+        `test_end_to_end_by_process_key_cells`). Гард allow не выдаёт вовсе — и в исходнике нет
+        ни одного решения allow."""
+        for data, kind in ((self.KILL, "kill"), (self.ENV_IN, "env")):
+            for headless in (False, True):
+                for mode in self.NAMED_MODES + (self.NO_FIELD, "", None, "allow"):
+                    for who in ("main", "agent"):
+                        name = mode if mode is not self.NO_FIELD else "<нет поля>"
+                        with self.subTest(kind=kind, headless=headless, mode=name, who=who):
+                            r = self._inproc(data, mode=mode, headless=headless, who=who)
+                            self.assertEqual(r["rc"], 0, r["stderr"])
+                            self.assertNotEqual(r["dec"], "allow", "ветка выдала allow")
+                            self.assertEqual(r["dec"], self._want(kind, who, mode, headless)[0],
+                                             r["reason"])
+        self.assertNotIn('"permissionDecision": "allow"', inspect.getsource(g))
 
-    # (е) строка лога: своя метка, читатель лога её не путает с ask, боевой лог не тронут
-    def test_log_label_is_distinct_and_consumer_safe(self):
-        r = self._run(self.KILL, mode="dontAsk")
-        lines = [ln for ln in r["log"].splitlines() if g.DECISION_UNATTENDED in ln]
-        self.assertEqual(len(lines), 1, r["log"])
-        self.assertTrue(lines[0].endswith("| interactive | Bash | deny_unattended | kill | "
-                                          "taskkill /PID 47121 /F"), lines[0])
-        self.assertNotIn("| deny |", lines[0], "точный счёт обычных отказов смешался бы с этим")
+    # ── (11) лог: метки и хвост ─────────────────────────────────────────────────────────────
+    def test_log_labels_are_distinct_and_consumer_safe(self):
+        """Каждая метка правила — своё слово в поле решения: опись шума разбирает строку и не
+        принимает её за ask; обычный «| deny |» с ними не смешивается; боевой лог не тронут."""
         import shum_opis_pc
-        m = shum_opis_pc._RE_GUARD.match(lines[0])
-        self.assertIsNotNone(m, "опись шума не разбирает строку")
-        self.assertEqual(m.group(4), g.DECISION_UNATTENDED)
-        self.assertEqual(shum_opis_pc.parse_guard_asks(lines), [], "опись приняла отказ за ask")
+        cases = (("deny_unattended", self.KILL, "dontAsk", None, "kill"),
+                 ("deny_hard", self.ENV_IN, self.BYPASS, "main", "env"),
+                 ("deny_agent", self.KILL, self.BYPASS, "agent", "kill"),
+                 ("pass_bypass", self.KILL, self.BYPASS, "main", "kill"))
+        for label, data, mode, who, kind in cases:
+            with self.subTest(label=label):
+                r = self._run(data, mode=mode, who=who)
+                lines = [ln for ln in r["log"].splitlines() if "| %s |" % label in ln]
+                self.assertEqual(len(lines), 1, r["log"])
+                cmd = data["tool_input"]["command"]
+                tail = "mode=%s agent=%s" % (mode, "1" if who == "agent" else "0")
+                self.assertTrue(lines[0].endswith("| interactive | Bash | %s | %s | %s | %s"
+                                                  % (label, kind, cmd, tail)), lines[0])
+                self.assertNotIn("| deny |", lines[0])
+                m = shum_opis_pc._RE_GUARD.match(lines[0])
+                self.assertIsNotNone(m, "опись шума не разбирает строку")
+                self.assertEqual(m.group(4), label)
+                self.assertEqual(shum_opis_pc.parse_guard_asks(lines), [],
+                                 "опись приняла %s за ask" % label)
         live = os.path.join(PROJ, "pretool_guard.log")
         if os.path.isfile(live):
             with io.open(live, encoding="utf-8", errors="replace") as f:
-                self.assertNotIn("deny_unattended | kill | taskkill /PID 47121", f.read(),
+                body = f.read()
+            for label in self.LABELS[1:]:
+                self.assertNotIn("%s | kill | taskkill /PID 47121" % label, body,
                                  "фикстура теста осела в БОЕВОМ pretool_guard.log")
 
-    # чистая функция: без исключений на любом входе, роль решает
+    def test_log_tail_mode_and_agent_on_every_line(self):
+        """Хвост `mode=<режим|-> agent=<1|0>` — на КАЖДОЙ строке прогона, включая служебные строки
+        гарда (`guard | card | …`); значение `agent_id` не печатается; режим — безопасной формой."""
+        p = {"_card_blocked": lambda *a, **k: "проба причины (тест)"}
+        for mode, want in ((self.NO_FIELD, "-"), (None, "-"), (123, "-"), ("", "-"),
+                           (["bypassPermissions"], "-"), ("default", "default"),
+                           (self.BYPASS, self.BYPASS), ("dontAsk", "dontAsk"),
+                           ("bypassPermissions ", "bypassPermissions_"), ("a|b c", "a_b_c"),
+                           ("x" * 70, "x" * 40)):
+            for who, a in (("main", "0"), ("agent", "1")):
+                with self.subTest(mode=repr(mode), who=who):
+                    r = self._inproc(self.KILL, mode=mode, who=who, patches=p)
+                    lines = [ln for ln in r["log"].splitlines() if ln.strip()]
+                    self.assertGreaterEqual(len(lines), 2, "служебная строка карточки не легла")
+                    self.assertTrue(any("| guard | card | deny |" in ln for ln in lines))
+                    for ln in lines:
+                        self.assertTrue(ln.endswith(" | mode=%s agent=%s" % (want, a)), ln)
+                    self.assertNotIn(self.AGENT, r["log"])
+        # вне `main` — нейтральный хвост; без хвоста `_log_line` прежний байт-в-байт
+        g.set_log_ctx(None)
+        self.assertEqual(g.log_tail(), "mode=- agent=0")
+        plain = g._log_line("interactive", "Bash", "defer", "", "ls")
+        self.assertTrue(plain.endswith("| interactive | Bash | defer | - | ls"), plain)
+        self.assertTrue(g._log_line("interactive", "Bash", "defer", "", "ls", "mode=- agent=0")
+                        .endswith("| ls | mode=- agent=0"))
+
+    # ── (12) прочее ─────────────────────────────────────────────────────────────────────────
+    def test_runs_dir_is_temp_not_repo(self):
+        self.assertTrue(self.RUNS)
+        bad = os.path.normcase(os.path.join(PROJ, "tmp", "guard_bypass_runs"))
+        if not os.environ.get("GUARD_BYPASS_RUNS"):
+            self.assertFalse(os.path.normcase(os.path.abspath(self.RUNS)).startswith(bad),
+                             self.RUNS)
+            self.assertTrue(os.path.normcase(os.path.abspath(self.RUNS)).startswith(
+                os.path.normcase(os.path.abspath(tempfile.gettempdir()))), self.RUNS)
+
     def test_owner_away_is_total_and_role_bound(self):
         for data in (None, [], "bypassPermissions", 17, {}, {"permission_mode": None},
                      {"permission_mode": ["bypassPermissions"]}, {"permission_mode": {"a": 1}},
@@ -5760,9 +6637,265 @@ class TestOwnerAwayNoQuestion(unittest.TestCase):
             self.assertTrue(g.owner_away({"permission_mode": mode}, False))
             self.assertFalse(g.owner_away({"permission_mode": mode}, True), "headless не трогаем")
         self.assertFalse(g.owner_away({"permission_mode": self.BYPASS}, True))
-        # 16.10.2026 (решение владельца): bypass из набора снят, dontAsk остаётся.
+        # 16.10.2026 (решение владельца): bypass из набора снят, dontAsk остаётся. Правило bypass
+        # живёт отдельно (POLICY-1610, `bypass_verdict`), а не возвратом bypass в этот набор.
         self.assertNotIn(self.BYPASS, g.UNATTENDED_MODES, "bypass вернулся в правило «владельца нет»")
         self.assertEqual(set(g.UNATTENDED_MODES), {"dontAsk"})
+
+    # ── (13) второй круг 16.10: решения мягче ожидаемого (приёмка и матрица) ─────────────────
+    def test_r2_force_push_without_force_word_is_git_force(self):
+        """Матрица G6–G8: `git push origin +main`, `+HEAD:main` (PowerShell) и `--mirror` шли
+        `defer` во ВСЕХ режимах и у агента — мимо «принудительная перезапись кода на GitHub —
+        всегда отказ». Теперь вид `git_force`: в bypass `deny_hard` и у основной сессии, вне bypass
+        — прежний вопрос этого вида. Обычный push и `+` не в начале слова/в другом сегменте — нет."""
+        for tool, cmd in (("Bash", "git push origin +main"),
+                          ("PowerShell", "git push origin '+HEAD:main'"),
+                          ("Bash", "git push origin +refs/heads/x:refs/heads/x"),
+                          ("Bash", "git push --mirror origin"),
+                          ("Bash", "cd D:/turbobaby-bot && git push -u origin +main")):
+            data = {"tool_name": tool, "tool_input": {"command": cmd}}
+            with self.subTest(cmd=cmd):
+                self.assertEqual(g.decide(dict(data, cwd=PROJ))[:2], ("ask", "git_force"))
+                r = self._run(data, mode=self.BYPASS, who="main")
+                self.assertEqual(r["dec"], "deny", r["reason"])
+                self.assertIn("| interactive | %s | deny_hard | git_force |" % tool, r["log"])
+                self.assertEqual(r["pushes"], 0)
+                r = self._run(data, mode="default")
+                self.assertEqual((r["dec"], r["pushes"]), ("ask", 1), r["reason"])
+        for cmd in ("git push origin main", "git push origin main; echo +1",
+                    "git push origin HEAD:refs/heads/x+y", "git push --push-option=+x origin main",
+                    "echo 'git push origin +main'", "git commit -m \"+main\"", "git status"):
+            with self.subTest(green=cmd):
+                self.assertEqual(g.decide(bash(cmd))[0], "defer", cmd)
+
+    def test_r2_move_out_of_project_is_delete_and_hard_in_bypass(self):
+        """Матрица D6 — единственное ослабление, внесённое POLICY-1610 в первом круге:
+        `Update suggest.py` + `Move to C:\\Users\\Public\\…` давал `write_outside`, и в bypass
+        основной сессии — пропуск (у HEAD и базы — вопрос). Теперь `delete` источника: в bypass
+        `deny_hard` у основной сессии и у агента; вне bypass — вопрос с пушем."""
+        data = [d for k, d in self.ASK_INPUTS
+                if k == "delete" and "*** Move to: " in d["tool_input"].get("command", "")][0]
+        self.assertEqual(g.decide(dict(data, cwd=PROJ)),
+                         ("ask", "delete", "D:/turbobaby-bot/suggest.py"))
+        for who in ("main", "agent"):
+            with self.subTest(who=who):
+                r = self._run(data, mode=self.BYPASS, who=who)
+                self.assertEqual(r["dec"], "deny", r["reason"])
+                self.assertIn("| interactive | apply_patch | deny_hard | delete |", r["log"])
+                self.assertEqual(r["pushes"], 0)
+        r = self._run(data, mode="default")
+        self.assertEqual((r["dec"], r["pushes"]), ("ask", 1), r["reason"])
+        self.assertIn("suggest.py", r["reason"])
+
+    def test_r2_python_file_delete_is_hard_in_bypass(self):
+        """Приёмка: `os.remove('…/suggest.py')` и `shutil.rmtree('…/docs')` — вид `py_write`, и в
+        bypass основной сессии шли ПРОПУСКОМ (живой гард спрашивал) — мимо «удаление важных файлов
+        — всегда отказ». Теперь `deny_hard` (вид в логе прежний — `py_write`). Уборка литералом в
+        `tmp/` — как `rm tmp/x`: пропуск основной сессии. Цель переменной карточки не даёт вовсе —
+        прежний отказ «объект не назван» во всех режимах (правило его не трогает); для правила такая
+        цель — «не доказано, что временная» (чистая функция ниже). Вне bypass — прежний вопрос."""
+        rm = self.PY_DEL
+        cases = ((rm, "deny_hard"),
+                 ("python -c \"import shutil; shutil.rmtree('D:/turbobaby-bot/docs')\"", "deny_hard"),
+                 ("python -c \"import os; os.unlink(r'D:\\turbobaby-bot\\suggest.py')\"", "deny_hard"),
+                 ("python -c \"import os; os.remove('tmp/x.txt'); os.remove('suggest.py')\"",
+                  "deny_hard"),
+                 ("python -c \"import os; p='x.txt'; os.remove(p)\"", "deny"),
+                 ("python -c \"import os; os.remove('tmp/guard_r2_x.txt')\"", "pass_bypass"),
+                 ("python -c \"import shutil; shutil.rmtree('/tmp/guard_r2_dir')\"", "pass_bypass"),
+                 ("python -c \"import bridge_client as b; b.create_booking(1)\"", "pass_bypass"))
+        for cmd, label in cases:
+            data = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+            with self.subTest(cmd=cmd):
+                self.assertEqual(g.decide(dict(data, cwd=PROJ))[:2], ("ask", "py_write"))
+                ctl = self._run(data)
+                self.assertEqual((ctl["dec"], ctl["pushes"]),
+                                 ("deny", 0) if label == "deny" else ("ask", 1), ctl["reason"])
+                r = self._run(data, mode=self.BYPASS, who="main")
+                self.assertIn("| interactive | Bash | %s | py_write |" % label, r["log"])
+                self.assertEqual(r["pushes"], 0)
+                if label == "deny_hard":
+                    self.assertEqual(r["dec"], "deny", r["reason"])
+                    self.assertTrue(r["reason"].startswith("⛔ " + g.BYPASS_HARD_NOTE))
+                    self.assertEqual(g.card_from_decision(r["reason"]), ctl["reason"])
+                elif label == "deny":
+                    self.assertEqual((r["dec"], r["reason"]), ("deny", ctl["reason"]))
+                else:
+                    self.assertIsNone(r["dec"], r["reason"])
+                r = self._run(data, mode=self.BYPASS, who="agent")
+                self.assertEqual(r["dec"], "deny")
+                self.assertIn("| interactive | Bash | %s | py_write |"
+                              % {"deny_hard": "deny_hard", "deny": "deny"}.get(label, "deny_agent"),
+                              r["log"])
+        self.assertTrue(g.py_fs_delete_hard("python -c \"import os; p='x'; os.remove(p)\"",
+                                            "py_write", "os.remove"), "цель переменной — жёстко")
+        # та же операция ЗА первым видом карточки (`kill`) — тоже жёсткая
+        hidden = {"tool_name": "Bash", "tool_input": {"command": "taskkill /PID 47121 /F; " + rm}}
+        self.assertEqual(g.decide(dict(hidden, cwd=PROJ))[:2], ("ask", "kill"))
+        self.assertTrue(g.hidden_hard_kinds(dict(hidden, cwd=PROJ)))
+        r = self._run(hidden, mode=self.BYPASS, who="main")
+        self.assertEqual(r["dec"], "deny", r["reason"])
+        self.assertIn("| interactive | Bash | deny_hard | kill |", r["log"])
+        # dontAsk и headless — прежние
+        data = {"tool_name": "Bash", "tool_input": {"command": rm}}
+        r = self._run(data, mode="dontAsk")
+        self.assertIn("| interactive | Bash | deny_unattended | py_write |", r["log"])
+        r = self._run(data, mode=self.BYPASS, headless=True)
+        self.assertEqual((r["dec"], r["marker"], r["pushes"]), ("ask", True, 1), r["reason"])
+        # чистая функция: только `py_write` с файловым токеном
+        self.assertFalse(g.py_fs_delete_hard(rm, "py_write", "create_booking"))
+        self.assertFalse(g.py_fs_delete_hard(rm, "delete", "os.remove"))
+        self.assertTrue(g.py_fs_delete_hard(rm, "py_write", "os.remove"))
+        self.assertTrue(g.py_fs_delete_hard("python tmp/cleanup_r2.py", "py_write", "os.remove"),
+                        "токен из тела скрипта: цели в команде нет — не доказано")
+
+    def test_r2_edit_guard_of_test_named_source_reaches_owner(self):
+        """Приёмка (32 клетки): правка агентом `test_pretool_guard.py` /
+        `tests/test_guard_card_min.py` гасилась латчем пробы по имени `test_*.py`: вопрос без
+        пуша, а в headless маркер уходил в пробный файл, которого демон не видит. Теперь это
+        карточка: вне bypass — вопрос и пуш, в headless — БОЕВОЙ маркер. Изоляция тест-прогона
+        (окружение) действует как прежде; у прочих видов латч по месту прежний."""
+        for path in (self.GUARD_TEST_SRC, g._GUARD_SOURCES[3]):
+            data = {"tool_name": "Write", "agent_id": self.AGENT,
+                    "tool_input": {"file_path": path, "content": "x"}}
+            with self.subTest(path=path):
+                self.assertTrue(g.is_probe(path), "посылка: имя взводит латч по месту")
+                r = self._run(data, mode="default")
+                self.assertEqual((r["dec"], r["pushes"]), ("ask", 1), r["reason"])
+                self.assertNotIn("ПЕРЕХВАЧЕНО", r["reason"])
+                self.assertIn("| interactive | Write | ask | edit_guard |", r["log"])
+                for mode in (self.NO_FIELD, self.BYPASS, "dontAsk"):
+                    r = self._run(data, mode=mode, headless=True)
+                    self.assertEqual((r["dec"], r["marker"], r["pushes"]), ("ask", True, 1),
+                                     r["reason"])
+                r = self._run(data, mode=self.BYPASS)
+                self.assertIn("| interactive | Write | deny_hard | edit_guard |", r["log"])
+                r = self._run(data, mode="default", env_extra={"PRETOOL_TEST_RUN": "1"})
+                self.assertEqual((r["dec"], r["pushes"]), ("ask", 0))
+                self.assertIn("ПЕРЕХВАЧЕНО НА ГРАНИЦЕ", r["reason"])
+                r = self._run(dict(data, agent_id=""), mode="default")
+                self.assertEqual((r["dec"], r["pushes"]), (None, 0), "основная сессия — defer")
+        other = {"tool_name": "Write", "agent_id": self.AGENT,
+                 "tool_input": {"file_path": self.PUB + r"\test_guard_r2_x.py", "content": "x"}}
+        r = self._run(other, mode="default")
+        self.assertEqual((r["dec"], r["pushes"]), ("ask", 0), "латч по месту у прочих видов прежний")
+        self.assertIn("ПЕРЕХВАЧЕНО НА ГРАНИЦЕ", r["reason"])
+
+    def test_r2_non_string_command_or_path_is_failsafe_not_exit_1(self):
+        """Матрица F3 / приёмка: число вместо `command` или `file_path` роняло `main` ВНЕ try
+        (`is_probe(123)`) кодом 1 — CLI считает это НЕблокирующей ошибкой хука, то есть
+        исполнением. Теперь сбой разбора: rc 0, в bypass `deny_hard`, в прочих — прежний отказ без
+        объекта; строка лога есть."""
+        for tool, ti in (("Bash", {"command": 123}), ("PowerShell", {"command": ["a"]}),
+                         ("Write", {"file_path": 123, "content": "x"}),
+                         ("Edit", {"file_path": {"a": 1}, "old_string": "a", "new_string": "b"})):
+            data = {"tool_name": tool, "tool_input": ti}
+            with self.subTest(tool=tool, ti=ti):
+                for mode, who, label in ((self.BYPASS, "main", "deny_hard"),
+                                         (self.BYPASS, "agent", "deny_hard"),
+                                         ("default", "main", "deny"), ("dontAsk", "main", "deny"),
+                                         (self.NO_FIELD, "main", "deny")):
+                    r = self._run(data, mode=mode, who=who)
+                    self.assertEqual(r["rc"], 0, r["stderr"])
+                    self.assertEqual(r["dec"], "deny", r["reason"])
+                    self.assertIn("| interactive | %s | %s | unknown |" % (tool, label), r["log"])
+                    self.assertEqual(r["pushes"], 0)
+                r = self._run(data, mode=self.BYPASS, headless=True)
+                self.assertEqual((r["rc"], r["dec"]), (0, "deny"), r["stderr"])
+
+
+class TestEditGuardKind(unittest.TestCase):
+    """ВИД `edit_guard` (POLICY-1610, 16.10.2026): запись СУБАГЕНТА в исходник гарда инструментом
+    записи (Write/Edit/MultiEdit/NotebookEdit/apply_patch). Слово владельца: «правка самого гарда»
+    — в списке самого опасного; К3: «основная сессия гард править может, иначе его нельзя будет
+    чинить; фоновый агент — нет». Основной сессии запись остаётся `defer`
+    (`TestGuardSourcesWriteIsNotExecution` не тронут). ГРАНИЦА: правка гарда ОБОЛОЧКОЙ этим видом
+    не ловится — остаток, назван в `_decide_write` и в `test_shell_edit_of_guard_is_a_named_residual`."""
+
+    AGENT = "agent-edit-guard-1610"
+    RED = ("p" + "kill ngrok; rm -rf x; " + "sql" + "ite3 a.db \"DROP TABLE t\"")
+
+    def _w(self, tool, path, agent=None):
+        ti = {"notebook_path": path, "new_source": self.RED} if tool == "NotebookEdit" else \
+            {"file_path": path, "content": self.RED, "new_string": self.RED,
+             "edits": [{"old_string": "a", "new_string": self.RED}]}
+        d = {"tool_name": tool, "tool_input": ti, "cwd": PROJ}
+        if agent is not None:
+            d["agent_id"] = agent
+        return d
+
+    def test_agent_write_into_every_guard_source_is_edit_guard(self):
+        for path in g._GUARD_SOURCES:
+            for tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+                with self.subTest(path=path, tool=tool):
+                    self.assertEqual(g.decide(self._w(tool, path, self.AGENT)),
+                                     ("ask", g.KIND_EDIT_GUARD, path))
+                    self.assertEqual(g.decide(self._w(tool, path))[0], "defer")
+                    self.assertEqual(g.decide(self._w(tool, path, ""))[0], "defer")
+            with self.subTest(path=path, tool="apply_patch"):
+                patch = "*** Begin Patch\n*** Update File: " + path + "\n@@\n+x\n*** End Patch"
+                data = {"tool_name": "apply_patch", "cwd": PROJ, "tool_input": {"command": patch}}
+                self.assertEqual(g.decide(dict(data, agent_id=self.AGENT)),
+                                 ("ask", g.KIND_EDIT_GUARD, path))
+                self.assertEqual(g.decide(data), ("defer", "", ""))
+
+    def test_only_exact_guard_sources_and_precedence_unchanged(self):
+        """Тёзка гарда в другом дереве — не исходник гарда (прежний вид); секреты, конфиг `.claude`
+        и `.git` у агента спрашивают СВОИМ видом, как у основной сессии."""
+        for path in (r"D:\foreign\other\pretool_guard.py",
+                     os.path.join(PROJ, ".claude", "worktrees", "wf_x", "pretool_guard.py"),
+                     os.path.join(PROJ, "docs", "pretool_guard.py")):
+            with self.subTest(path=path):
+                a = g.decide(self._w("Edit", path, self.AGENT))
+                self.assertNotEqual(a[1], g.KIND_EDIT_GUARD)
+                self.assertEqual(a, g.decide(self._w("Edit", path)))
+        for path, kind in ((os.path.join(PROJ, "tmp", "guard_bypass_nofile", ".env"), "edit_secret"),
+                           (os.path.join(PROJ, ".claude", "settings.json"), "edit_claude"),
+                           (os.path.join(PROJ, ".git", "config"), "edit_git")):
+            with self.subTest(kind=kind):
+                self.assertEqual(g.decide(self._w("Edit", path, self.AGENT))[:2], ("ask", kind))
+
+    def test_full_pipeline_card_for_agent(self):
+        """`decide` → `decide_for_role` → `card_decision`: у агента рождается КАРТОЧКА с объектом,
+        фразой «фоновый агент», последствием и откатом без чужого файла; класс читается из неё."""
+        data = self._w("Edit", g._GUARD_SOURCES[0], self.AGENT)
+        for headless in (False, True):
+            with self.subTest(headless=headless):
+                action, kind, obj = g.decide_for_role(data, headless=headless, env={})
+                self.assertEqual((action, kind), ("ask", g.KIND_EDIT_GUARD))
+                decision, text = g.card_decision(kind, obj, "")
+                self.assertEqual(decision, "ask", text)
+                self.assertIn("фоновый агент", text)
+                self.assertIn(g.OBJ_LINE_PREFIX + obj, text)
+                self.assertIn(g.CONSEQ_LINE_PREFIX, text)
+                self.assertEqual(g.kinds_from_card(text), frozenset({g.KIND_EDIT_GUARD}))
+                self.assertFalse(g.is_top_tier(kind))
+        self.assertEqual(g.decide_for_role(self._w("Edit", g._GUARD_SOURCES[0]), headless=False,
+                                           env={})[0], "defer")
+        # талон демона на этот вид — законный вид словаря (headless-агент после «да» владельца)
+        env = {g.APPROVED_KINDS_ENV: g.KIND_EDIT_GUARD}
+        self.assertEqual(g.owner_approved_kinds(env), frozenset({g.KIND_EDIT_GUARD}))
+        self.assertEqual(g.decide_for_role(data, headless=True, env=env)[0], "approved")
+
+    def test_main_session_edits_guard_silently_in_every_mode(self):
+        """Основная сессия гард править может — в ЛЮБОМ режиме: решение `defer`, ни вопроса, ни
+        отказа (у агента в default — вопрос `edit_guard`, в bypass — `deny_hard`: матрица выше)."""
+        for mode in (None, "default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"):
+            data = self._w("Write", g._GUARD_SOURCES[0])
+            if mode:
+                data["permission_mode"] = mode
+            with self.subTest(mode=mode):
+                self.assertEqual(g.decide_for_role(data, headless=False, env={})[0], "defer")
+
+    def test_shell_edit_of_guard_is_a_named_residual(self):
+        """ОСТАТОК, а не свойство: правка исходника гарда ОБОЛОЧКОЙ (`sed -i`, `cp` поверх)
+        видом `edit_guard` не ловится — спецификация называет это честно. Тест держит ГРАНИЦУ
+        видимой: закроет её правка — она же поправит этот тест."""
+        for cmd in ("sed -i s/a/b/ pretool_guard.py", "cp tmp/x.py pretool_guard.py"):
+            data = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": PROJ,
+                    "agent_id": self.AGENT}
+            with self.subTest(cmd=cmd):
+                self.assertNotEqual(g.decide(data)[1], g.KIND_EDIT_GUARD)
 
 
 if __name__ == "__main__":

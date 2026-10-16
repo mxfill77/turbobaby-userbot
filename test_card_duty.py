@@ -70,6 +70,7 @@ _LIVE_TARGET = {
     "read_secret":  (r"D:\turbobaby-bot\.env", ""),
     "edit_claude":  (r"D:\turbobaby-bot\.claude\settings.json", ""),
     "edit_git":     (r"D:\turbobaby-bot\.git\hooks\pre-commit", ""),
+    "edit_guard":   (r"D:\turbobaby-bot\pretool_guard.py", ""),   # POLICY-1610: правит субагент
     # ДВА ИМЕНИ НЕЗНАНИЯ ГАРДА. Цели у них нет ЗАКОНОМЕРНО — и держит их вторая половина
     # `_highest_kind`, а не наличие объекта (см. `test_unparsed_kinds_held_without_object`).
     "unknown":      ("", "нераспознанная команда"),
