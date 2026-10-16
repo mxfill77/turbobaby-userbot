@@ -117,6 +117,16 @@ class LocBase(unittest.TestCase):
     _ENV_KEYS = ("PC_LOCAL_DEC", "STEP_SELFHEAL", "PLAN_ADAPT")
 
     def setUp(self):
+        # ИЗОЛЯЦИЯ ПАРКОВКИ ПОВОДОВ (17.10.2026, r4; тот же приём, что test_pc_orchestrator.Base
+        # :498-504). decision_waits.STORE считается от __file__ модуля (decision_waits.py:39), мимо
+        # log_setup.state_path, и process_approval_timeouts → _park_expired_approval
+        # (pc_orchestrator.py:5595) дописывал фикстурный повод #102 «op=other | красный кусок»
+        # (TestChainRedStep, :525) в ЖИВОЙ pc_orchestrator.decision_waits.json — на каждом гейте
+        # self-update (живой случай 17.10 00:46:33, гейт d993ffaa→e62a96f5). Подмена стоит ПЕРВОЙ
+        # в setUp, с addCleanup сразу за собой; боевого поведения не меняет.
+        _tmp_dw = tempfile.mkdtemp(prefix="iso_locbase_")
+        self.addCleanup(setattr, o.decision_waits, "STORE", o.decision_waits.STORE)
+        o.decision_waits.STORE = os.path.join(_tmp_dw, "pc_orchestrator.decision_waits.json")
         self._env = {k: os.environ.get(k) for k in self._ENV_KEYS}
         os.environ["PC_LOCAL_DEC"] = "1"
         os.environ["STEP_SELFHEAL"] = "1"
