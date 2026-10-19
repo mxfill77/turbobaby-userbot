@@ -225,3 +225,15 @@ rc_profile_choice.txt
 # during a period of repeated system resource exhaustion. Tracked files stay tracked.
 /_scratch*/
 /tmp_*/
+
+# МАШИННЫЕ ЛОТКИ РЕВЬЮ — вне поля зрения git (19.10.2026, слово владельца; К3 Рок; Codex TB-QA-1910-1946 → A/P3).
+# Их пишут сами автоматы (review_auto / review_intake / review_audit / contour_digest): это бухгалтерия, а не продукт.
+# Тысячи untracked-файлов в них раздували список неотслеживаемых файлов дерева. 19.10 при ходах Codex на ПК были
+# всплески памяти (до 0.43 ГиБ запаса) от сотен процессов git; связь с числом untracked-файлов — ГИПОТЕЗА, не доказана.
+# Уже закоммиченные файлы лотков остаются в git — правило касается только НОВЫХ; нужное добавляется явно `git add -f`.
+# Следствие, названное вслух: сторож следа работы демона (pc_orchestrator._worktree_trace_since, по `git status`)
+# перестаёт видеть новые файлы этих лотков. Папки снимков сюда НЕ входят: они под git намеренно (замок
+# test_chatlog_servicing.test_photo_dir_is_git_path_not_tmp_not_chatlog).
+/docs/review_receipts/
+/docs/review_inbox/
+/docs/review_outbox/
