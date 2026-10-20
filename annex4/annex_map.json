@@ -1,0 +1,587 @@
+{
+ "agreement": {
+  "date_th": "20 ตุลาคม 2569",
+  "date_en": "20 October 2026",
+  "lessor_th": "Mr. Filipp Vorobev",
+  "lessor_en": "Mr. Filipp Vorobev",
+  "lessee_th": "บริษัท ทีบี โมบิลิตี จำกัด (TB Mobility Co., Ltd.)",
+  "lessee_en": "TB Mobility Co., Ltd.",
+  "lessor_sig": "Mr. Filipp Vorobev",
+  "lessee_sig": "TB Mobility Co., Ltd. — by Mr. Mongkonchai Sarayasa, Director"
+ },
+ "bikes": [
+  {
+   "no": 1,
+   "name": "ADV 350CC BLACK PHUKET 5849",
+   "reg_no_book": "1กอ 5662 ภูเก็ต (Phuket)",
+   "make_model": "HONDA ADV350",
+   "vin": "MLHNF1478R5202471",
+   "reg_src": {
+    "drive_id": "17Vtizch4AScI7Fld2SVDrdp_QimiYzEi",
+    "page": 3,
+    "title": "Green book - ADV 350 - Phuket 5662 (prev 5849 Sa Kaeo).pdf",
+    "bbox": {
+     "x0": 0.03,
+     "y0": 0.138,
+     "x1": 0.97,
+     "y1": 0.885
+    }
+   },
+   "cover_src": {
+    "drive_id": "17Vtizch4AScI7Fld2SVDrdp_QimiYzEi",
+    "page": 1,
+    "title": "Green book - ADV 350 - Phuket 5662 (prev 5849 Sa Kaeo).pdf",
+    "bbox": {
+     "x0": 0.03,
+     "y0": 0.29,
+     "x1": 0.97,
+     "y1": 0.71
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 2,
+   "name": "ADV 350CC GREY BKK 798",
+   "reg_no_book": "2กช 440 ภูเก็ต (Phuket)",
+   "make_model": "HONDA ADV350",
+   "vin": "MLHNF1479P5100111",
+   "reg_src": {
+    "drive_id": "1SCosjb0KzuW7yZLoLc942TrLyDnm6i_k",
+    "page": 3,
+    "title": "Green book - ADV 350 - Phuket 440 (prev 8664 Phuket, 798 Bangkok).pdf",
+    "bbox": {
+     "x0": 0.04,
+     "y0": 0.1,
+     "x1": 0.97,
+     "y1": 0.89
+    }
+   },
+   "cover_src": {
+    "drive_id": "1SCosjb0KzuW7yZLoLc942TrLyDnm6i_k",
+    "page": 1,
+    "title": "Green book - ADV 350 - Phuket 440 (prev 8664 Phuket, 798 Bangkok).pdf",
+    "bbox": {
+     "x0": 0.03,
+     "y0": 0.31,
+     "x1": 0.97,
+     "y1": 0.69
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 3,
+   "name": "CB 300CC R 9011",
+   "reg_no_book": "1กว 461 ภูเก็ต (Phuket)",
+   "make_model": "HONDA CB300R",
+   "vin": "MLHNC5574J5004151",
+   "reg_src": {
+    "drive_id": "12ea3Exc1S5PHi3Znv6UYqXISpRE4OuJ_",
+    "page": 3,
+    "title": "Green book - CB 300R - Phuket 461 (prev 9011 Chonburi).pdf",
+    "bbox": {
+     "x0": 0.065,
+     "y0": 0.145,
+     "x1": 0.93,
+     "y1": 0.84
+    }
+   },
+   "cover_src": {
+    "drive_id": "12ea3Exc1S5PHi3Znv6UYqXISpRE4OuJ_",
+    "page": 1,
+    "title": "Green book - CB 300R - Phuket 461 (prev 9011 Chonburi).pdf",
+    "bbox": {
+     "x0": 0.05,
+     "y0": 0.325,
+     "x1": 0.965,
+     "y1": 0.69
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 4,
+   "name": "CBR 650R PHUKET 4505",
+   "status": "file04"
+  },
+  {
+   "no": 5,
+   "name": "CLICK 125CC PHUKET 5580",
+   "status": "file04"
+  },
+  {
+   "no": 6,
+   "name": "FORZA 300CC WHITE PHUKET 8950",
+   "reg_no_book": "1กม 8950 ภูเก็ต (Phuket)",
+   "make_model": "HONDA FORZA",
+   "vin": "MLHNF0770J5012464",
+   "reg_src": {
+    "drive_id": "1-0NQ5dve-uEi9PTNShBHZ_-g0PU8ko6Y",
+    "page": 1,
+    "title": "Green book - FORZA 300 - Phuket 8950.pdf",
+    "bbox": {
+     "x0": 0.06,
+     "y0": 0.15,
+     "x1": 0.97,
+     "y1": 0.84
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 7,
+   "name": "MT-03 300CC BLUE PHUKET 5068",
+   "status": "file04"
+  },
+  {
+   "no": 8,
+   "name": "NINJA 400CC PHUKET 6334",
+   "reg_no_book": "1กล 6334 ภูเก็ต (Phuket)",
+   "make_model": "KAWASAKI EX400K",
+   "vin": "JKAEX400KKDAA3240",
+   "reg_src": {
+    "drive_id": "1xRiQ3y_4-V4dzAv_xbRmfI1JQspnCuV9",
+    "page": 1,
+    "title": "ninja 400 6334.pdf",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 1,
+     "y1": 1
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 9,
+   "name": "NMAX 155CC BLACK GOLD PHUKET 4255",
+   "status": "file04"
+  },
+  {
+   "no": 10,
+   "name": "NMAX 155CC BLACK GOLD-2 PHUKET 4685",
+   "reg_no_book": "1กม 4685 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA NMAX",
+   "vin": "MH3SG571111007423",
+   "reg_src": {
+    "drive_id": "1C5Sbze67RrfR5v3LzHXlZ8vaBxzl-Po9",
+    "page": 1,
+    "title": "NMAX 155 — Phuket 4685 — green book.pdf",
+    "bbox": {
+     "x0": 0,
+     "y0": 0.005,
+     "x1": 1,
+     "y1": 1
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 11,
+   "name": "NMAX 155CC BLACK GOLD-3 PHUKET 7530",
+   "status": "file04"
+  },
+  {
+   "no": 12,
+   "name": "NMAX 155CC BLACK GREEN PHUKET 4253",
+   "status": "file04"
+  },
+  {
+   "no": 13,
+   "name": "NMAX 155CC BLACK PHUKET 8952",
+   "reg_no_book": "1กม 8952 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA NMAX",
+   "vin": "MH3SG571111004580",
+   "reg_src": {
+    "drive_id": "1GngUzdlmFV1H7oRkXc52ZWzCbhOJrtkj",
+    "page": 4,
+    "title": "4 xmaxes.pdf",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.999,
+     "y1": 0.999
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 14,
+   "name": "NMAX 155CC GREEN-B PHUKET 4957",
+   "reg_no_book": "1กม 4957 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA NMAX",
+   "vin": "MH3SG571111002481",
+   "reg_src": {
+    "drive_id": "1RfiCGkNXsSD0RE-fBx2bBc7BwmFRIbJj",
+    "page": 2,
+    "title": "3 nmaxes.pdf",
+    "bbox": {
+     "x0": 0.03,
+     "y0": 0,
+     "x1": 1,
+     "y1": 1
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 15,
+   "name": "NMAX 155CC GREY GOLD PHUKET 6908",
+   "status": "file04"
+  },
+  {
+   "no": 16,
+   "name": "NMAX 155CC GREY PHUKET 5960",
+   "status": "file04"
+  },
+  {
+   "no": 17,
+   "name": "NMAX 155CC RACE PHUKET 7532",
+   "status": "file04"
+  },
+  {
+   "no": 18,
+   "name": "NMAX 155CC RED WHITE PHUKET 9548",
+   "reg_no_book": "1กม 9548 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA NMAX",
+   "vin": "MH3SG571111013079",
+   "reg_src": {
+    "drive_id": "1cLeQsG2dJ3kw8JnnbGBI15qh1sxRb6gp",
+    "page": 1,
+    "title": "NMAX 155 — Phuket 9548 — green book.pdf",
+    "bbox": {
+     "x0": 0.01,
+     "y0": 0.02,
+     "x1": 0.99,
+     "y1": 0.99
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 19,
+   "name": "VULCAN 650CC S PHUKET 5065",
+   "status": "file04"
+  },
+  {
+   "no": 20,
+   "name": "XMAX 300CC NEW RED GLOSS BKK 5709",
+   "reg_no_book": "1กอ 5709 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA XMAX",
+   "vin": "MH3SH222111010411",
+   "reg_src": {
+    "drive_id": "1GngUzdlmFV1H7oRkXc52ZWzCbhOJrtkj",
+    "page": 3,
+    "title": "4 xmaxes.pdf",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.975,
+     "y1": 0.999
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 21,
+   "name": "XMAX 300CC BLUE PHUKET 5773",
+   "reg_no_book": "1กม 5773 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA XMAX 300",
+   "vin": "MH3SH087111025257",
+   "reg_src": {
+    "drive_id": "1Vq-HagwW_8xDYa1LTyyiUv_jITBTZMVp",
+    "page": 1,
+    "title": "xmax 5773 (blue2).pdf",
+    "bbox": {
+     "x0": 0,
+     "y0": 0.02,
+     "x1": 1,
+     "y1": 1
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 22,
+   "name": "XMAX 300CC GREEN PHUKET 4248",
+   "reg_no_book": "1กม 4248 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA XMAX 300",
+   "vin": "MH3SH087111041628",
+   "reg_src": {
+    "drive_id": "1jjsO4bUjJfozHbuk9kFDohFvYDss9D_W",
+    "page": 3,
+    "title": "XMAX 300 — Phuket 4248 — green book + agreement.pdf",
+    "bbox": {
+     "x0": 0,
+     "y0": 0.02,
+     "x1": 1,
+     "y1": 1
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 23,
+   "name": "XMAX 300CC GREY PHUKET 4246",
+   "status": "owner_will_provide"
+  },
+  {
+   "no": 24,
+   "name": "XSR 155CC BLACK PHUKET 8949",
+   "status": "file04"
+  },
+  {
+   "no": 25,
+   "name": "XSR 155 GREEN",
+   "status": "file04"
+  },
+  {
+   "no": 26,
+   "name": "XMAX 300CC NEW BLACK PHUKET 8969",
+   "reg_no_book": "1กฬ 8969 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA XMAX",
+   "vin": "MH3SH222111015946",
+   "reg_src": {
+    "drive_id": "1brIz80HAisJR_GXkOH1axf7uhu7L17U7",
+    "page": 2,
+    "title": "Green book - XMAX 300 - Phuket 8969 (prev 2392 Chai Nat).pdf",
+    "bbox": {
+     "x0": 0.03,
+     "y0": 0.11,
+     "x1": 0.95,
+     "y1": 0.87
+    }
+   },
+   "cover_src": {
+    "drive_id": "1brIz80HAisJR_GXkOH1axf7uhu7L17U7",
+    "page": 1,
+    "title": "Green book - XMAX 300 - Phuket 8969 (prev 2392 Chai Nat).pdf",
+    "bbox": {
+     "x0": 0.15,
+     "y0": 0.36,
+     "x1": 0.97,
+     "y1": 0.69
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 27,
+   "name": "XMAX 300CC NEW BLUE PHUKET 1813",
+   "status": "file04"
+  },
+  {
+   "no": 28,
+   "name": "ADV 350CC DARK GREY BANGKOK 6895",
+   "status": "owner_will_provide"
+  },
+  {
+   "no": 29,
+   "name": "XMAX 300CC NEW RED GLOSS 2 PHUKET 4729",
+   "reg_no_book": "1กร 4729 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA XMAX",
+   "vin": "MH3SH222111009423",
+   "reg_src": {
+    "drive_id": "1GngUzdlmFV1H7oRkXc52ZWzCbhOJrtkj",
+    "page": 2,
+    "title": "4 xmaxes.pdf",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.999,
+     "y1": 0.999
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 30,
+   "name": "XMAX 300CC NEW BROWN BANGKOK 9315",
+   "reg_no_book": "1กย 8676 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA XMAX",
+   "vin": "MH3SH222111022757",
+   "reg_src": {
+    "drive_id": "1CRfOw741wtBzlSE57hIE36-7eLswzIpv",
+    "page": 3,
+    "title": "Green book - XMAX 300 - Phuket 8676 (prev 9315 Bangkok).pdf",
+    "bbox": {
+     "x0": 0.03,
+     "y0": 0.135,
+     "x1": 0.97,
+     "y1": 0.85
+    }
+   },
+   "cover_src": {
+    "drive_id": "1CRfOw741wtBzlSE57hIE36-7eLswzIpv",
+    "page": 1,
+    "title": "Green book - XMAX 300 - Phuket 8676 (prev 9315 Bangkok).pdf",
+    "bbox": {
+     "x0": 0.03,
+     "y0": 0.315,
+     "x1": 0.97,
+     "y1": 0.685
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 31,
+   "name": "ADV 350CC RED BKK 9890",
+   "status": "owner_will_provide"
+  },
+  {
+   "no": 32,
+   "name": "XADV 750CC BLACK BKK 3902",
+   "reg_no_book": "2กก 5104 ภูเก็ต (Phuket)",
+   "make_model": "HONDA X-ADV",
+   "vin": "JH2RH10T3PK200196",
+   "reg_src": {
+    "drive_id": "18NicSogtmYXc7mrjcCVkrQIFykLCVTMY",
+    "page": 1,
+    "title": "XADV 750 — was BKK 3902, now Phuket 2กก 5104 — green book.pdf",
+    "bbox": {
+     "x0": 0,
+     "y0": 0.09,
+     "x1": 1,
+     "y1": 1
+    }
+   },
+   "cover_src": {
+    "drive_id": "18NicSogtmYXc7mrjcCVkrQIFykLCVTMY",
+    "page": 2,
+    "title": "XADV 750 — was BKK 3902, now Phuket 2กก 5104 — green book.pdf",
+    "bbox": {
+     "x0": 0,
+     "y0": 0.48,
+     "x1": 0.99,
+     "y1": 0.99
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 33,
+   "name": "XMAX 300CC NEW BLUE-2 PHUKET 4725",
+   "reg_no_book": "1กร 4725 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA XMAX",
+   "vin": "MH3SH222111010176",
+   "reg_src": {
+    "drive_id": "1GngUzdlmFV1H7oRkXc52ZWzCbhOJrtkj",
+    "page": 1,
+    "title": "4 xmaxes.pdf",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.998,
+     "y1": 0.995
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 34,
+   "name": "CB 650R BLACK PHUKET 3503",
+   "reg_no_book": "1กม 3503 ภูเก็ต (Phuket)",
+   "make_model": "HONDA CB650R",
+   "vin": "MLHRH0275N5200230",
+   "reg_src": {
+    "drive_id": "1H4HRc5TgcjrN7vRFH4RMJWf9YHts2z0g",
+    "page": 1,
+    "title": "CB 650R — Phuket 3503 — green book.pdf",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.995,
+     "y1": 1
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 35,
+   "name": "XADV 750CC GREY BKK 2478",
+   "reg_no_book": "2กจ 9286 ภูเก็ต (Phuket)",
+   "make_model": "HONDA X-ADV",
+   "vin": "JH2RH10TXNK100030",
+   "reg_src": {
+    "drive_id": "1fzkjUgawl2MB6xIqbe0FjODaDsJFIS3w",
+    "page": 3,
+    "title": "Green book - X-ADV 750 - Phuket 9286 (prev 2478 Bangkok).pdf",
+    "bbox": {
+     "x0": 0.03,
+     "y0": 0.17,
+     "x1": 0.97,
+     "y1": 0.84
+    }
+   },
+   "cover_src": {
+    "drive_id": "1fzkjUgawl2MB6xIqbe0FjODaDsJFIS3w",
+    "page": 1,
+    "title": "Green book - X-ADV 750 - Phuket 9286 (prev 2478 Bangkok).pdf",
+    "bbox": {
+     "x0": 0.03,
+     "y0": 0.28,
+     "x1": 0.97,
+     "y1": 0.72
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 36,
+   "name": "ADV 350CC LIGHT GREY HKT 6004",
+   "reg_no_book": "2กง 6004 ภูเก็ต (Phuket)",
+   "make_model": "HONDA ADV350",
+   "vin": "MLHNF1479R5203497",
+   "reg_src": {
+    "drive_id": "1ZUBo2Pf9SsSJdgwV6oDcM7WMGb9tfpKp",
+    "page": 1,
+    "title": "ADV 350 — was 8855, now Phuket 2กง 6004 — green book.pdf",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 1,
+     "y1": 0.995
+    }
+   },
+   "cover_src": {
+    "drive_id": "1OPHRzShjLAeNNwzxTNTBJojjc8-oHhlM",
+    "page": 1,
+    "title": "Green book - ADV 350 - Phuket 6004 (prev 8855 Bangkok) - front cover.pdf",
+    "bbox": {
+     "x0": 0.03,
+     "y0": 0.28,
+     "x1": 0.975,
+     "y1": 0.72
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 37,
+   "name": "ADV 350CC BLACK GOLD PHUKET 372",
+   "reg_no_book": "2กก 372 ภูเก็ต (Phuket)",
+   "make_model": "HONDA ADV350",
+   "vin": "MLHNF1471R5208757",
+   "reg_src": {
+    "drive_id": "1nTycjItnF9PG445AEzUX-cXIJNmQ0LvU",
+    "page": 1,
+    "title": "ADV 350 — Phuket 372 — green book.pdf",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.985,
+     "y1": 1
+    }
+   },
+   "status": "ok"
+  },
+  {
+   "no": 38,
+   "name": "XMAX 300CC NEW BLUE-3 PHUKET 4724",
+   "status": "file04"
+  }
+ ],
+ "_about": "Annex 4 to the Long-Term Motorcycle Rental Agreement of 20.10.2026: what is attached for each of the 38 bikes of Annex 1. reg_src/cover_src = Drive PDF + page (1-based) verified on 20.10.2026 by a blind second reading; status: ok / file04 (page only in the >10 MB summary scan 04) / owner_will_provide (no book page with Philipp yet: #23 no book, #28 and #31 not re-registered)."
+}
