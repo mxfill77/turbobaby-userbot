@@ -14,6 +14,7 @@ map becomes a "To be provided" placeholder, and the index marks it ○.
 Fonts: Noto Sans / Noto Sans Thai / Noto Serif Thai woff2 from npm @fontsource (see README.md).
 """
 import os
+import re
 import sys
 import json
 import html
@@ -286,24 +287,57 @@ def bike_page(no, kind):
     return INDEX_PAGES + 2 * (no - 1) + (1 if kind == "photo" else 0)
 
 
+MARKS = re.compile(r"[✓○] [✓○] [✓○]")
+# Catalog entries of a digitally signed or form-carrying PDF: copying pages into a new file drops them,
+# and any rewrite would break a cryptographic signature anyway.
+SIGNED_CATALOG = ("/AcroForm", "/Perms", "/DSS")
+
+
 def flat_text(page):
-    return " ".join(page.extract_text().split())
+    return " ".join(page.extract_text().replace("\x00", "").split())
+
+
+def where_differ(a, b, ctx=60):
+    """The first place two texts differ, with a little context on each side."""
+    i = next((k for k, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+    s = max(0, i - ctx)
+    return "  signed: …%s…\n  fresh:  …%s…" % (a[s:i + ctx], b[s:i + ctx])
+
+
+def index_row(text, vin):
+    """Index row of the bike with this VIN: the text from the previous row's ✓/○ marks to its own."""
+    m = re.search(re.escape(vin) + " " + MARKS.pattern, text)
+    if not m:
+        return None
+    start = max((p.end() for p in MARKS.finditer(text, 0, m.start())), default=0)
+    return text[start:m.end()].strip()
 
 
 def splice(amap, signed, fresh, swaps, out):
     """Signed PDF + fresh build → the signed PDF with the named bike sheets taken from the fresh build.
 
     Every other page is copied from the signed file as is, so the signatures stay on exactly the pages
-    that carried them. A sheet is swapped only when both files show that bike and sheet on that page
-    (header, VIN, sheet title, page number): a layout that moved, or a signed file of another build,
-    stops the splice instead of landing a photo under the wrong bike. The index rows of the swapped
-    bikes must also agree (✓/○): the index sits on the signed pages, and a mark the signed index does
-    not show would contradict the signature."""
-    import re
+    that carried them. A sheet is swapped only when
+      - both files show that bike and sheet on that page (name, VIN, sheet title, page number): a layout
+        that moved, or a signed file of another build, stops the splice instead of landing a photo under
+        the wrong bike;
+      - the sheet's text is the same in both files, so only its pictures change: a reg. no. or model that
+        moved in the map would otherwise contradict the bike's other sheet and the signed index;
+      - the bike's index row (name, reg. no., VIN, ✓/○) is the same in both files: the index sits on the
+        signed pages, and a row the signed index does not show would contradict the signature.
+    A digitally signed or form-carrying file is refused (page copying drops the catalog with the
+    signature), and so is an output path that would overwrite an input or an existing file."""
     from pypdf import PdfReader, PdfWriter
+    real = {os.path.realpath(p) for p in (signed, fresh)}
+    if os.path.realpath(out) in real or os.path.exists(out):
+        sys.exit("--out %s is an input or already exists: the signed original must stay as it is" % out)
     bikes = {b["no"]: b for b in amap["bikes"]}
     total = len(bikes)
     rs, rf = PdfReader(signed), PdfReader(fresh)
+    held = [k for k in SIGNED_CATALOG if k in rs.trailer["/Root"]]
+    if held:
+        sys.exit("signed PDF carries %s (digital signature or form): a page splice would drop it — "
+                 "swap the pages in an unsigned build and sign again" % ", ".join(held))
     pages = INDEX_PAGES + 2 * total
     if len(rs.pages) != pages or len(rf.pages) != pages:
         sys.exit("expected %d pages: signed has %d, fresh has %d" % (pages, len(rs.pages), len(rf.pages)))
@@ -316,22 +350,27 @@ def splice(amap, signed, fresh, swaps, out):
             sys.exit("cannot swap #%s %s: no such bike, no VIN to check it by, or kind not books/photo" % (no, kind))
         i = bike_page(no, kind)
         want = ["%d. %s" % (no, b["name"]), "ANNEX 4 · %d / %d" % (no, total), b["vin"], SHEET_TITLE[kind], "Page %d / %d" % (i + 1, pages)]
-        marks = {}
+        text, row = {}, {}
         for name, r in (("signed", rs), ("fresh", rf)):
-            miss = [w for w in want if w not in flat_text(r.pages[i])]
+            text[name] = flat_text(r.pages[i])
+            miss = [w for w in want if w not in text[name]]
             if miss:
                 sys.exit("%s page %d is not the %s sheet of #%d: missing %s" % (name, i + 1, kind, no, miss))
-            m = re.search(re.escape(b["vin"]) + r" ([✓○]) ([✓○]) ([✓○])", index[name])
-            if not m:
+            row[name] = index_row(index[name], b["vin"])
+            if row[name] is None:
                 sys.exit("%s index has no row with the marks of #%d (VIN %s)" % (name, no, b["vin"]))
-            marks[name] = "".join(m.groups())
-        if marks["signed"] != marks["fresh"]:
-            sys.exit("index row of #%d: signed %s, fresh %s — the signed index would no longer match the sheet"
-                     % (no, marks["signed"], marks["fresh"]))
+        if row["signed"] != row["fresh"]:
+            sys.exit("index row of #%d differs — the signed index would no longer match the sheet:\n%s"
+                     % (no, where_differ(row["signed"], row["fresh"])))
+        if text["signed"] != text["fresh"]:
+            sys.exit("page %d (#%d %s): text differs between signed and fresh — only pictures may change:\n%s"
+                     % (i + 1, no, kind, where_differ(text["signed"], text["fresh"])))
         take[i] = (no, kind)
     w = PdfWriter()
     for i in range(pages):
         w.add_page(rf.pages[i] if i in take else rs.pages[i])
+    if rs.metadata:
+        w.add_metadata(dict(rs.metadata))
     with open(out + ".tmp", "wb") as f:
         w.write(f)
     os.replace(out + ".tmp", out)
@@ -339,11 +378,13 @@ def splice(amap, signed, fresh, swaps, out):
 
 
 def parse_swaps(s):
-    """'3:photo,25:photo' → [(3, 'photo'), (25, 'photo')]."""
+    """'3:photo,25:photo' → [(3, 'photo'), (25, 'photo')]; anything else stops with the bad part named."""
     out = []
     for part in s.split(","):
-        no, _, kind = part.strip().partition(":")
-        out.append((int(no), kind))
+        m = re.fullmatch(r"\s*([0-9]+)\s*:\s*(books|photo)\s*", part)
+        if not m:
+            sys.exit("--swap: bad part %r — expected N:books or N:photo, comma-separated" % part)
+        out.append((int(m.group(1)), m.group(2)))
     return out
 
 
