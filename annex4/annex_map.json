@@ -4,7 +4,7 @@
   "date_en": "20 October 2026",
   "lessor_th": "Mr. Filipp Vorobev",
   "lessor_en": "Mr. Filipp Vorobev",
-  "lessee_th": "บริษัท ทีบี โมบิลิตี จำกัด (TB Mobility Co., Ltd.)",
+  "lessee_th": "บริษัท ทีบี โมบิลิตี จำกัด",
   "lessee_en": "TB Mobility Co., Ltd.",
   "lessor_sig": "Mr. Filipp Vorobev",
   "lessee_sig": "TB Mobility Co., Ltd. — by Mr. Mongkonchai Sarayasa, Director"
@@ -131,7 +131,7 @@
   },
   {
    "no": 7,
-   "name": "MT-03 300CC BLUE PHUKET 5068",
+   "name": "MT-03 300CC BLUE 5068",
    "status": "file04"
   },
   {
@@ -374,7 +374,10 @@
   {
    "no": 28,
    "name": "ADV 350CC DARK GREY BANGKOK 6895",
-   "status": "owner_will_provide"
+   "status": "owner_will_provide",
+   "reg_no_book": "3กส 6895 ชลบุรี (Chonburi)",
+   "make_model": "HONDA ADV350",
+   "vin": "MLHNF1476N5000643"
   },
   {
    "no": 29,
@@ -428,7 +431,10 @@
   {
    "no": 31,
    "name": "ADV 350CC RED BKK 9890",
-   "status": "owner_will_provide"
+   "status": "owner_will_provide",
+   "reg_no_book": "1กส 9890 สมุทรสาคร (Samut Sakhon)",
+   "make_model": "HONDA ADV350",
+   "vin": "MLHNF1477N5000117"
   },
   {
    "no": 32,
@@ -583,5 +589,6 @@
    "status": "file04"
   }
  ],
- "_about": "Annex 4 to the Long-Term Motorcycle Rental Agreement of 20.10.2026: what is attached for each of the 38 bikes of Annex 1. reg_src/cover_src = Drive PDF + page (1-based) verified on 20.10.2026 by a blind second reading; status: ok / file04 (page only in the >10 MB summary scan 04) / owner_will_provide (no book page with Philipp yet: #23 no book, #28 and #31 not re-registered)."
+ "_about": "Annex 4 to the Long-Term Motorcycle Rental Agreement of 20.10.2026: what is attached for each of the 38 bikes of Annex 1. reg_src/cover_src = Drive PDF + page (1-based) verified on 20.10.2026 by a blind second reading; status: ok / file04 (page only in the >10 MB summary scan 04) / owner_will_provide (no book page with Philipp yet: #23 no book, #28 and #31 not re-registered).",
+ "_names": "Names follow Annex 1 of the contract; typos normalised: Cyrillic С → Latin C (#7, #8, #24), #24 overlapping glyph read as CC, #7 plate printed over two lines."
 }

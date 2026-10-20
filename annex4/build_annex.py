@@ -5,8 +5,10 @@ Two steps (a cloud session has everything they need: poppler, Pillow, Chromium v
   prepare — <src_dir>/<drive_id>.pdf (the Drive PDFs named in annex_map.json) → <img_dir>/<NN>_cover.jpg
             and <NN>_reg.jpg: page rendered at 200 dpi, cut to the verified document box, white trimmed.
   html    — annex_map.json + <img_dir> → annex.html; then `node print_pdf.js annex.html annex.pdf`.
-Photos are put by hand as <img_dir>/<NN>_photo.jpg after the plate on them is checked against the
-book. Any missing image becomes a "To be provided" placeholder, and the index marks it ○.
+Photos are put as <img_dir>/<NN>_photo.jpg after the plate on them is checked against the book, and
+the bike gets a "photo" entry in the map (source + plate seen). Only what the map names is attached;
+an image without a map entry, or a map entry without an image, stops the build. Anything not in the
+map becomes a "To be provided" placeholder, and the index marks it ○.
 Fonts: Noto Sans / Noto Sans Thai / Noto Serif Thai woff2 from npm @fontsource (see README.md).
 """
 import os
@@ -15,6 +17,7 @@ import json
 import html
 import argparse
 import subprocess
+import pathlib
 
 NAVY = "#1F4E79"
 ROW = "#F3F7FA"
@@ -42,8 +45,8 @@ def font_faces(font_dir):
         p = os.path.join(font_dir, rel)
         if not os.path.exists(p):
             sys.exit("font missing: %s" % p)
-        out.append("@font-face{font-family:'%s';font-weight:%d;src:url('file://%s') format('woff2');}"
-                   % (fam, w, p))
+        out.append("@font-face{font-family:'%s';font-weight:%d;src:url('%s') format('woff2');}"
+                   % (fam, w, uri(p)))
     return "\n".join(out)
 
 
@@ -97,9 +100,15 @@ table.idx td.mono { font-family: 'Noto Sans', monospace; letter-spacing: .15px; 
 """
 
 
+def uri(p):
+    """file:// URL with the path percent-encoded: a '#', '?' or '%' in a folder name would otherwise
+    turn every image into a broken-image icon while the index still shows ✓."""
+    return pathlib.Path(os.path.abspath(p)).as_uri()
+
+
 def fig(cls, path, label_th, label_en):
     if path:
-        return '<div class="fig %s"><img src="file://%s"></div>' % (cls, esc(path))
+        return '<div class="fig %s"><img src="%s"></div>' % (cls, esc(uri(path)))
     return ('<div class="fig %s ph"><div><span class="th">%s</span> / %s<small>%s — %s</small></div></div>'
             % (cls, PENDING_TH, PENDING_EN, esc(label_th), esc(label_en)))
 
@@ -108,9 +117,24 @@ def build(amap, img_dir, font_dir, draft):
     bikes = amap["bikes"]
     total = len(bikes)
 
+    # An image is attached only when the map says so: a stray NN_<kind>.jpg left in img_dir by an
+    # earlier run must not land under a bike number with a ✓, and a mapped page must not vanish.
+    errors = []
+    for b in bikes:
+        for kind, key in (("cover", "cover_src"), ("reg", "reg_src"), ("photo", "photo")):
+            p = os.path.join(img_dir, "%02d_%s.jpg" % (b["no"], kind))
+            if b.get(key) and not os.path.exists(p):
+                errors.append("#%d %s: in the map, but %s is missing" % (b["no"], kind, p))
+            if not b.get(key) and os.path.exists(p):
+                errors.append("#%d %s: %s exists, but the map has no %s" % (b["no"], kind, p, key))
+    if errors:
+        sys.exit("map and images disagree:\n  " + "\n  ".join(errors))
+
     def img(no, kind):
-        p = os.path.join(img_dir, "%02d_%s.jpg" % (no, kind))
-        return p if os.path.exists(p) else None
+        return os.path.join(img_dir, "%02d_%s.jpg" % (no, kind)) if {
+            "cover": "cover_src", "reg": "reg_src", "photo": "photo"}[kind] in by_no[no] else None
+
+    by_no = {b["no"]: b for b in bikes}
 
     rows = []
     for b in bikes:
@@ -129,27 +153,29 @@ def build(amap, img_dir, font_dir, draft):
     if draft:
         out.append('<div class="draft">ร่าง / DRAFT — %s</div>' % esc(draft))
     out.append('<h1>ภาคผนวก 4 <span class="en">ANNEX 4 — REGISTRATION BOOKS AND PHOTOGRAPHS OF THE MOTORCYCLES</span></h1>')
-    out.append('<div class="sub"><span class="th">เล่มทะเบียนและภาพถ่ายรถจักรยานยนต์ตามภาคผนวก 1</span></div>')
-    out.append('<p class="th">แนบท้ายสัญญาเช่ารถจักรยานยนต์ระยะยาว ลงวันที่ %s ระหว่าง %s (ผู้ให้เช่า) และ %s (ผู้เช่า)</p>'
+    out.append('<div class="sub"><span class="th">คู่มือจดทะเบียนรถและภาพถ่ายรถจักรยานยนต์ตามภาคผนวก 1</span></div>')
+    out.append('<p class="th">แนบท้ายสัญญาเช่ารถจักรยานยนต์ระยะยาว ลงวันที่ %s ระหว่าง %s (“ผู้ให้เช่า”) กับ %s (“ผู้เช่า”)</p>'
                % (esc(a["date_th"]), esc(a["lessor_th"]), esc(a["lessee_th"])))
     out.append('<p class="en">Attached to the Long-Term Motorcycle Rental Agreement dated %s between %s (Lessor) and %s (Lessee).</p>'
                % (esc(a["date_en"]), esc(a["lessor_en"]), esc(a["lessee_en"])))
     out.append('<p class="th">สำหรับรถจักรยานยนต์แต่ละคัน เรียงตามลำดับในภาคผนวก 1 ได้แนบเอกสารดังนี้</p>')
     out.append('<p class="en">For each motorcycle, in the order of Annex 1, the following are attached:</p>')
     out.append('<ol class="items">'
-               '<li><span class="th">หน้าปกเล่มทะเบียน ซึ่งแสดงเลขทะเบียนทั้งหมดของรถ</span><br>'
+               '<li><span class="th">หน้าปกคู่มือจดทะเบียนรถ ซึ่งแสดงเลขทะเบียนทั้งหมดของรถ</span><br>'
                '<span class="en">the front cover of the registration book, listing all registration numbers of the vehicle;</span></li>'
                '<li><span class="th">หน้ารายการจดทะเบียนที่ระบุ MR. FILIPP VOROBEV เป็นผู้ถือกรรมสิทธิ์ พร้อมยี่ห้อ แบบ และเลขตัวรถ</span><br>'
                '<span class="en">the registration page recording MR. FILIPP VOROBEV as owner (ผู้ถือกรรมสิทธิ์), with make, model and VIN;</span></li>'
-               '<li><span class="th">ภาพถ่ายรถจักรยานยนต์ที่เห็นแผ่นป้ายทะเบียน</span><br>'
+               '<li><span class="th">ภาพถ่ายรถจักรยานยนต์ซึ่งปรากฏแผ่นป้ายทะเบียนอย่างชัดเจน</span><br>'
                '<span class="en">a photograph of the motorcycle showing its number plate.</span></li></ol>')
-    out.append('<p class="th">รถจักรยานยนต์แต่ละคันระบุด้วยเลขตัวรถ (VIN) กรณีเลขทะเบียนมีการเปลี่ยนแปลง '
-               'เลขทะเบียนปัจจุบันเป็นไปตามเล่มทะเบียน ส่วนชื่อเรียกในภาคผนวก 1 ใช้เพื่อการอ้างอิง</p>')
-    out.append('<p class="en">Each motorcycle is identified by its VIN. Where a registration number has changed, '
-               'the current number is as shown in the registration book; the identifier used in Annex 1 is kept for reference.</p>')
+    out.append('<p class="th">ให้ถือเลขตัวรถ (VIN) ตามคู่มือจดทะเบียนรถเป็นหลักในการระบุรถจักรยานยนต์แต่ละคัน '
+               'กรณีเลขทะเบียนมีการเปลี่ยนแปลง เลขทะเบียนปัจจุบันเป็นไปตามคู่มือจดทะเบียนรถ '
+               'ส่วนชื่อเรียกในภาคผนวก 1 ใช้เพื่อการอ้างอิง</p>')
+    out.append('<p class="en">Each motorcycle is identified by the VIN shown in its registration book. Where a registration '
+               'number has changed, the current number is as shown in the registration book; the identifier used in '
+               'Annex 1 is kept for reference.</p>')
     out.append('<table class="idx"><thead><tr><th>No.</th><th>รถจักรยานยนต์ (ภาคผนวก 1)<br>Motorcycle (Annex 1)</th>'
-               '<th>ทะเบียนตามเล่ม<br>Reg. no. (book)</th><th>เลขตัวรถ<br>VIN</th><th>ปก<br>Cover</th>'
-               '<th>หน้าจดทะเบียน<br>Reg. page</th><th>ภาพถ่าย<br>Photo</th></tr></thead><tbody>')
+               '<th>เลขทะเบียนตามคู่มือ<br>Reg. no. (book)</th><th>เลขตัวรถ<br>VIN</th><th>หน้าปก<br>Cover</th>'
+               '<th>หน้ารายการจดทะเบียน<br>Reg. page</th><th>ภาพถ่าย<br>Photo</th></tr></thead><tbody>')
     out.extend(rows)
     out.append("</tbody></table>")
     out.append('<p class="legend">✓ <span class="th">แนบแล้ว</span> / attached &nbsp;&nbsp; ○ <span class="th">%s</span> / %s</p>'
@@ -166,7 +192,7 @@ def build(amap, img_dir, font_dir, draft):
         no = b["no"]
         meta = []
         if b.get("reg_no_book"):
-            meta.append('<b class="th">ทะเบียน</b> / <b>Reg. no.:</b> <span class="th">%s</span>' % esc(b["reg_no_book"]))
+            meta.append('<b class="th">เลขทะเบียน</b> / <b>Reg. no.:</b> <span class="th">%s</span>' % esc(b["reg_no_book"]))
         if b.get("make_model"):
             meta.append('<b class="th">ยี่ห้อ/แบบ</b> / <b>Make/model:</b> %s' % esc(b["make_model"]))
         if b.get("vin"):
@@ -177,22 +203,25 @@ def build(amap, img_dir, font_dir, draft):
         reg = img(no, "reg")
         photo = img(no, "photo")
         out.append('<section class="page">' + head)
-        out.append('<div class="sec"><span class="th">1. หน้าปกเล่มทะเบียน</span> <span class="en">/ Registration book — front cover</span></div>')
-        out.append(fig("cover", cover, "หน้าปกเล่มทะเบียน", "registration book front cover"))
-        out.append('<div class="sec"><span class="th">2. รายการจดทะเบียน — ผู้ถือกรรมสิทธิ์ MR. FILIPP VOROBEV</span> '
+        out.append('<div class="sec"><span class="th">1. หน้าปกคู่มือจดทะเบียนรถ</span> <span class="en">/ Registration book — front cover</span></div>')
+        out.append(fig("cover", cover, "หน้าปกคู่มือจดทะเบียนรถ", "registration book front cover"))
+        out.append('<div class="sec"><span class="th">2. หน้ารายการจดทะเบียน — ผู้ถือกรรมสิทธิ์ MR. FILIPP VOROBEV</span> '
                    '<span class="en">/ Registration page — owner MR. FILIPP VOROBEV</span></div>')
         out.append(fig("reg", reg, "หน้ารายการจดทะเบียน", "registration page"))
         out.append("</section>")
         out.append('<section class="page">' + head)
         out.append('<div class="sec"><span class="th">3. ภาพถ่ายรถจักรยานยนต์</span> <span class="en">/ Photograph of the motorcycle</span></div>')
-        out.append(fig("photo", photo, "ภาพถ่ายรถที่เห็นป้ายทะเบียน", "photo showing the number plate"))
+        out.append(fig("photo", photo, "ภาพถ่ายรถจักรยานยนต์ซึ่งปรากฏแผ่นป้ายทะเบียน", "photo showing the number plate"))
         out.append("</section>")
     out.append("</body></html>")
     return "\n".join(out)
 
 
-def prepare(amap, src_dir, img_dir, work_dir, pad=0.02, fuzz=18, margin=12, long_side=(1500, 1900)):
-    """Book pages from the Drive PDFs → cropped JPEGs named <NN>_cover.jpg / <NN>_reg.jpg."""
+def prepare(amap, src_dir, img_dir, work_dir, pad=0.015, fuzz=18, margin=12, long_side=(1500, 1900)):
+    """Book pages from the Drive PDFs → cropped JPEGs named <NN>_cover.jpg / <NN>_reg.jpg.
+
+    The pad is a fraction of the verified document box (not of the page), so on a two-up scan the
+    crop reaches only a few pixels past the box and does not pull in text of the facing page."""
     from PIL import Image, ImageChops
     os.makedirs(img_dir, exist_ok=True)
     os.makedirs(work_dir, exist_ok=True)
@@ -213,8 +242,9 @@ def prepare(amap, src_dir, img_dir, work_dir, pad=0.02, fuzz=18, margin=12, long
             im = Image.open(stem + ".png").convert("RGB")
             w, h = im.size
             bb = s.get("bbox") or {"x0": 0, "y0": 0, "x1": 1, "y1": 1}
-            im = im.crop((max(0, int((bb["x0"] - pad) * w)), max(0, int((bb["y0"] - pad) * h)),
-                          min(w, int((bb["x1"] + pad) * w)), min(h, int((bb["y1"] + pad) * h))))
+            px, py = pad * (bb["x1"] - bb["x0"]), pad * (bb["y1"] - bb["y0"])
+            im = im.crop((max(0, int((bb["x0"] - px) * w)), max(0, int((bb["y0"] - py) * h)),
+                          min(w, int((bb["x1"] + px) * w)), min(h, int((bb["y1"] + py) * h))))
             ink = ImageChops.difference(im.convert("L"), Image.new("L", im.size, 255))
             box = ink.point(lambda v: 255 if v > fuzz else 0).getbbox()
             if box:

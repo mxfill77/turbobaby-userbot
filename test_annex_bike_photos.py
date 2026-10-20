@@ -108,6 +108,12 @@ class TestTopicPhotos(unittest.TestCase):
                                          is_image=lambda m: m.photo is not None))
         self.assertEqual([m.id for m in got], [2])
 
+    def test_zero_want_reads_nothing(self):
+        c = _Client([_Msg(1, True)])
+        got = self._run(abp.topic_photos(c, "e", 5, 0, reverse=False, is_image=lambda m: True))
+        self.assertEqual(got, [])
+        self.assertEqual(c.calls, [])
+
     def test_scan_cap_bounds_reading(self):
         c = _Client([_Msg(i, False) for i in range(100, 0, -1)])
         got = self._run(abp.topic_photos(c, "e", 5, 3, reverse=False, is_image=lambda m: False,
@@ -116,10 +122,89 @@ class TestTopicPhotos(unittest.TestCase):
         self.assertEqual(c.calls[0]["limit"], 7)
 
 
+class _DlMsg:
+    WHEN = datetime.datetime(2026, 10, 20, 3, 0, tzinfo=datetime.timezone.utc)
+
+    def __init__(self, mid, payload=b"\xff\xd8\xffJPEG", fail=None, partial=False):
+        self.id = mid
+        self.date = self.WHEN
+        self.photo = object()
+        self.document = None
+        self.payload, self.fail, self.partial = payload, fail, partial
+
+    async def download_media(self, file):
+        with open(file, "wb") as f:
+            f.write(self.payload[:2] if self.partial else self.payload)
+        if self.fail:
+            raise self.fail
+        return file
+
+
+class _ListClient:
+    def __init__(self, msgs, fail=None):
+        self.msgs, self.fail = msgs, fail
+
+    def iter_messages(self, entity, **kw):
+        fail, seq = self.fail, (list(reversed(self.msgs)) if kw.get("reverse") else list(self.msgs))
+
+        async def gen():
+            if fail:
+                raise fail
+            for m in seq[: kw.get("limit")]:
+                yield m
+        return gen()
+
+
+class TestFetchBike(unittest.TestCase):
+    def _fetch(self, client, out, **kw):
+        args = dict(newest=5, oldest=0, dry=False, is_image=lambda m: True, fix_ext=lambda p: p,
+                    out_dir=out)
+        args.update(kw)
+        return asyncio.run(abp.fetch_bike(client, "e", 1, "ADV 350CC BLACK PHUKET 5849", 62, **args))
+
+    def test_downloads_into_bike_dir_with_final_name(self):
+        with tempfile.TemporaryDirectory() as t:
+            row = self._fetch(_ListClient([_DlMsg(7)]), t)
+            self.assertEqual(row["saved"], 1)
+            self.assertEqual(os.path.basename(row["files"][0]), "2026-10-20_t62_m7.jpg")
+            self.assertEqual(os.listdir(os.path.dirname(row["files"][0])), ["2026-10-20_t62_m7.jpg"])
+
+    def test_broken_download_leaves_only_part_and_is_retried(self):
+        with tempfile.TemporaryDirectory() as t:
+            row = self._fetch(_ListClient([_DlMsg(7, partial=True, fail=ConnectionError())]), t)
+            self.assertEqual(row["saved"], 0)
+            self.assertEqual(row["failed"], [{"mid": 7, "why": "ConnectionError"}])
+            d = abp.bike_dir(1, "ADV 350CC BLACK PHUKET 5849", t)
+            self.assertEqual(os.listdir(d), ["2026-10-20_t62_m7.jpg.part"])
+            row = self._fetch(_ListClient([_DlMsg(7)]), t)       # повтор качает заново, а не берёт огрызок
+            self.assertEqual(row["saved"], 1)
+
+    def test_existing_photo_with_other_extension_is_not_fetched_again(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = abp.bike_dir(1, "ADV 350CC BLACK PHUKET 5849", t)
+            os.makedirs(d)
+            with open(os.path.join(d, "2026-10-20_t62_m7.png"), "wb") as f:
+                f.write(b"\x89PNG")
+            row = self._fetch(_ListClient([_DlMsg(7)]), t)
+            self.assertEqual(row["saved"], 0)
+            self.assertEqual([os.path.basename(f) for f in row["files"]], ["2026-10-20_t62_m7.png"])
+
+    def test_unreadable_topic_is_reported_and_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as t:
+            row = self._fetch(_ListClient([], fail=ValueError("MSG_ID_INVALID")), t)
+            self.assertIn("ValueError", row["why"])
+            self.assertEqual(row["photos"], 0)
+
+    def test_bike_without_topic_says_how_to_name_it(self):
+        row = asyncio.run(abp.fetch_bike(None, "e", 25, "XSR 155 GREEN", None, 5, 0, True,
+                                         lambda m: True, lambda p: p))
+        self.assertIn("--topic 25=", row["why"])
+
+
 class TestFilesAndZip(unittest.TestCase):
-    def test_photo_name_is_phuket_date_and_message_id(self):
+    def test_photo_name_is_phuket_date_topic_and_message_id(self):
         when = datetime.datetime(2026, 10, 19, 20, 30, tzinfo=datetime.timezone.utc)
-        self.assertEqual(abp.photo_name(when, 123), "2026-10-20_m123.jpg")
+        self.assertEqual(abp.photo_name(when, 62, 123), "2026-10-20_t62_m123.jpg")
 
     def test_bike_dir_is_numbered_slug(self):
         d = abp.bike_dir(7, "MT-03 300CC BLUE PHUKET 5068", out_dir="/x")
@@ -129,12 +214,14 @@ class TestFilesAndZip(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             src = os.path.join(t, "annex_bike_photos")
             os.makedirs(os.path.join(src, "01_A"))
-            with open(os.path.join(src, "01_A", "2026-10-20_m1.jpg"), "wb") as f:
+            with open(os.path.join(src, "01_A", "2026-10-20_t62_m1.jpg"), "wb") as f:
                 f.write(b"\xff\xd8\xff")
+            with open(os.path.join(src, "01_A", "2026-10-20_t62_m2.jpg.part"), "wb") as f:
+                f.write(b"\xff\xd8")
             zp = os.path.join(t, "a.zip")
             self.assertEqual(abp.make_zip(src, zp), 1)
             with zipfile.ZipFile(zp) as z:
-                self.assertEqual(z.namelist(), ["annex_bike_photos/01_A/2026-10-20_m1.jpg"])
+                self.assertEqual(z.namelist(), ["annex_bike_photos/01_A/2026-10-20_t62_m1.jpg"])
 
     def test_out_dir_is_ignored_tmp(self):
         rel = os.path.relpath(abp.OUT_DIR, HERE).replace("\\", "/")
