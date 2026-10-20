@@ -1,0 +1,427 @@
+# -*- coding: utf-8 -*-
+"""Annex 4 builder: registration-book pages + photos of the 38 motorcycles of Annex 1.
+
+Steps (a cloud session has everything they need: poppler, Pillow, pypdf, Chromium via playwright):
+  prepare — <src_dir>/<drive_id>.pdf (the Drive PDFs named in annex_map.json) → <img_dir>/<NN>_cover.jpg
+            and <NN>_reg.jpg: page rendered at 200 dpi, cut to the verified document box, white trimmed.
+  html    — annex_map.json + <img_dir> → annex.html; then `node print_pdf.js annex.html annex.pdf`.
+  splice  — once the annex is signed: the signed PDF with only the named bike sheets taken from a fresh
+            build, every other page (the signed one included) copied as is.
+Photos are put as <img_dir>/<NN>_photo.jpg after the plate on them is checked against the book, and
+the bike gets a "photo" entry in the map (source + plate seen). Only what the map names is attached;
+an image without a map entry, or a map entry without an image, stops the build. Anything not in the
+map becomes a "To be provided" placeholder, and the index marks it ○.
+Fonts: Noto Sans / Noto Sans Thai / Noto Serif Thai woff2 from npm @fontsource (see README.md).
+"""
+import os
+import re
+import sys
+import json
+import html
+import argparse
+import subprocess
+import pathlib
+
+NAVY = "#1F4E79"
+ROW = "#F3F7FA"
+LINE = "#B7C9D6"
+
+PENDING_TH = "จะจัดส่งเพิ่มเติม"
+PENDING_EN = "To be provided"
+
+
+def esc(s):
+    return html.escape(s or "")
+
+
+def font_faces(font_dir):
+    faces = [
+        ("Noto Sans Thai", 400, "fontsource-noto-sans-thai-5.1.1/package/files/noto-sans-thai-thai-400-normal.woff2"),
+        ("Noto Sans Thai", 700, "fontsource-noto-sans-thai-5.1.1/package/files/noto-sans-thai-thai-700-normal.woff2"),
+        ("Noto Serif Thai", 400, "fontsource-noto-serif-thai-5.1.1/package/files/noto-serif-thai-thai-400-normal.woff2"),
+        ("Noto Serif Thai", 600, "fontsource-noto-serif-thai-5.1.1/package/files/noto-serif-thai-thai-600-normal.woff2"),
+        ("Noto Sans", 400, "fontsource-noto-sans-5.1.1/package/files/noto-sans-latin-400-normal.woff2"),
+        ("Noto Sans", 700, "fontsource-noto-sans-5.1.1/package/files/noto-sans-latin-700-normal.woff2"),
+    ]
+    out = []
+    for fam, w, rel in faces:
+        p = os.path.join(font_dir, rel)
+        if not os.path.exists(p):
+            sys.exit("font missing: %s" % p)
+        out.append("@font-face{font-family:'%s';font-weight:%d;src:url('%s') format('woff2');}"
+                   % (fam, w, uri(p)))
+    return "\n".join(out)
+
+
+CSS = """
+@page { size: A4; margin: 14mm 14mm 16mm 14mm; }
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: #fff; }
+body { font-family: 'Noto Sans', 'Noto Sans Thai', sans-serif; font-size: 9.5pt; color: #111; }
+.th { font-family: 'Noto Sans Thai', 'Noto Sans', sans-serif; }
+h1 { font-family: 'Noto Serif Thai', 'Noto Sans', serif; font-weight: 400; color: NAVY;
+     font-size: 22pt; margin: 0 0 1mm 0; line-height: 1.25; }
+h1 .en { font-family: 'Noto Sans', sans-serif; font-size: 12.5pt; font-weight: 700; letter-spacing: .2px; }
+.sub { color: NAVY; font-weight: 700; font-size: 11pt; margin: 0 0 3mm 0; }
+p { margin: 0 0 1.6mm 0; line-height: 1.45; }
+p.en { font-size: 8.8pt; color: #333; }
+ol.items { margin: 1mm 0 2.5mm 5mm; padding: 0; }
+ol.items li { margin: 0 0 1mm 0; line-height: 1.4; }
+table.idx { width: 100%; border-collapse: collapse; margin-top: 2mm; font-size: 7.6pt; }
+table.idx th { background: NAVY; color: #fff; font-weight: 700; padding: 1.4mm 1.2mm; border: 0.3mm solid NAVY;
+               text-align: center; line-height: 1.25; }
+table.idx td { border: 0.3mm solid LINE; padding: 1mm 1.2mm; line-height: 1.25; vertical-align: middle; }
+table.idx tr:nth-child(even) td { background: ROW; }
+table.idx td.c { text-align: center; }
+table.idx td.mono { font-family: 'Noto Sans', monospace; letter-spacing: .15px; }
+.ok { color: #1a6b2f; font-weight: 700; }
+.legend { font-size: 8pt; color: #444; margin-top: 1.5mm; }
+.pend { color: #8a5a00; }
+.sig { width: 100%; border-collapse: collapse; margin-top: 5mm; font-size: 8.5pt; page-break-inside: avoid; }
+.sig td { border: 0.3mm solid LINE; padding: 2.5mm; width: 50%; vertical-align: top; height: 30mm; }
+.sig .who { color: NAVY; font-weight: 700; }
+.draft { display: inline-block; border: 0.4mm solid #b3261e; color: #b3261e; font-weight: 700;
+         padding: 0.6mm 2mm; font-size: 8pt; margin-bottom: 2mm; }
+.page { page-break-before: always; }
+.bar { display: flex; justify-content: space-between; align-items: baseline; border-bottom: 0.6mm solid NAVY;
+       padding-bottom: 1.2mm; margin-bottom: 2.5mm; }
+.bar .t { color: NAVY; font-weight: 700; font-size: 13pt; }
+.bar .n { color: NAVY; font-size: 9pt; white-space: nowrap; }
+.meta { font-size: 8.6pt; margin-bottom: 2.5mm; line-height: 1.5; }
+.meta b { color: NAVY; }
+.sec { color: NAVY; font-weight: 700; font-size: 9.5pt; margin: 0 0 1.2mm 0; }
+.sec .en { font-weight: 400; color: #333; }
+.fig { border: 0.3mm solid LINE; display: flex; align-items: center; justify-content: center; overflow: hidden;
+       background: #fff; margin-bottom: 3mm; }
+.fig img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+.fig.cover { height: 68mm; }
+.fig.reg { height: 150mm; }
+.fig.reg.full { height: 222mm; }
+.fig.photo { height: 228mm; }
+.ph { background: ROW; border: 0.5mm dashed LINE; color: #5b6b78; text-align: center; font-size: 11pt; }
+.ph small { display: block; font-size: 8.5pt; margin-top: 1mm; }
+"""
+
+
+def uri(p):
+    """file:// URL with the path percent-encoded: a '#', '?' or '%' in a folder name would otherwise
+    turn every image into a broken-image icon while the index still shows ✓."""
+    return pathlib.Path(os.path.abspath(p)).as_uri()
+
+
+def fig(cls, path, label_th, label_en):
+    if path:
+        return '<div class="fig %s"><img src="%s"></div>' % (cls, esc(uri(path)))
+    return ('<div class="fig %s ph"><div><span class="th">%s</span> / %s<small>%s — %s</small></div></div>'
+            % (cls, PENDING_TH, PENDING_EN, esc(label_th), esc(label_en)))
+
+
+def build(amap, img_dir, font_dir, draft):
+    bikes = amap["bikes"]
+    total = len(bikes)
+
+    # An image is attached only when the map says so: a stray NN_<kind>.jpg left in img_dir by an
+    # earlier run must not land under a bike number with a ✓, and a mapped page must not vanish.
+    errors = []
+    for b in bikes:
+        for kind, key in (("cover", "cover_src"), ("reg", "reg_src"), ("photo", "photo")):
+            p = os.path.join(img_dir, "%02d_%s.jpg" % (b["no"], kind))
+            if b.get(key) and not os.path.exists(p):
+                errors.append("#%d %s: in the map, but %s is missing" % (b["no"], kind, p))
+            if not b.get(key) and os.path.exists(p):
+                errors.append("#%d %s: %s exists, but the map has no %s" % (b["no"], kind, p, key))
+    if errors:
+        sys.exit("map and images disagree:\n  " + "\n  ".join(errors))
+
+    def img(no, kind):
+        return os.path.join(img_dir, "%02d_%s.jpg" % (no, kind)) if {
+            "cover": "cover_src", "reg": "reg_src", "photo": "photo"}[kind] in by_no[no] else None
+
+    by_no = {b["no"]: b for b in bikes}
+
+    rows = []
+    for b in bikes:
+        no = b["no"]
+        marks = []
+        for kind in ("cover", "reg", "photo"):
+            marks.append('<td class="c ok">✓</td>' if img(no, kind) else '<td class="c pend">○</td>')
+        rows.append('<tr><td class="c">%d</td><td>%s</td><td class="th">%s</td><td class="mono">%s</td>%s</tr>'
+                    % (no, esc(b["name"]), esc(b.get("reg_no_book") or "—"), esc(b.get("vin") or "—"),
+                       "".join(marks)))
+
+    a = amap["agreement"]
+    out = ["<!doctype html><html><head><meta charset='utf-8'><title>Annex 4</title><style>",
+           font_faces(font_dir), CSS.replace("NAVY", NAVY).replace("ROW", ROW).replace("LINE", LINE),
+           "</style></head><body>"]
+    if draft:
+        out.append('<div class="draft">ร่าง / DRAFT — %s</div>' % esc(draft))
+    out.append('<h1>ภาคผนวก 4 <span class="en">ANNEX 4 — REGISTRATION BOOKS AND PHOTOGRAPHS OF THE MOTORCYCLES</span></h1>')
+    out.append('<div class="sub"><span class="th">คู่มือจดทะเบียนรถและภาพถ่ายรถจักรยานยนต์ตามภาคผนวก 1</span></div>')
+    out.append('<p class="th">แนบท้ายสัญญาเช่ารถจักรยานยนต์ระยะยาว ลงวันที่ %s ระหว่าง %s (“ผู้ให้เช่า”) กับ %s (“ผู้เช่า”)</p>'
+               % (esc(a["date_th"]), esc(a["lessor_th"]), esc(a["lessee_th"])))
+    out.append('<p class="en">Attached to the Long-Term Motorcycle Rental Agreement dated %s between %s (Lessor) and %s (Lessee).</p>'
+               % (esc(a["date_en"]), esc(a["lessor_en"]), esc(a["lessee_en"])))
+    out.append('<p class="th">สำหรับรถจักรยานยนต์แต่ละคัน เรียงตามลำดับในภาคผนวก 1 ได้แนบเอกสารดังนี้</p>')
+    out.append('<p class="en">For each motorcycle, in the order of Annex 1, the following are attached:</p>')
+    out.append('<ol class="items">'
+               '<li><span class="th">หน้าปกคู่มือจดทะเบียนรถ ซึ่งแสดงเลขทะเบียนทั้งหมดของรถ</span><br>'
+               '<span class="en">the front cover of the registration book, listing all registration numbers of the vehicle;</span></li>'
+               '<li><span class="th">หน้ารายการจดทะเบียนที่ระบุ MR. FILIPP VOROBEV เป็นผู้ถือกรรมสิทธิ์ พร้อมยี่ห้อ แบบ และเลขตัวรถ</span><br>'
+               '<span class="en">the registration page recording MR. FILIPP VOROBEV as owner (ผู้ถือกรรมสิทธิ์), with make, model and VIN;</span></li>'
+               '<li><span class="th">ภาพถ่ายรถจักรยานยนต์ซึ่งปรากฏแผ่นป้ายทะเบียนอย่างชัดเจน</span><br>'
+               '<span class="en">a photograph of the motorcycle showing its number plate.</span></li></ol>')
+    out.append('<p class="th">ให้ถือเลขตัวรถ (VIN) ตามคู่มือจดทะเบียนรถเป็นหลักในการระบุรถจักรยานยนต์แต่ละคัน '
+               'กรณีเลขทะเบียนมีการเปลี่ยนแปลง เลขทะเบียนปัจจุบันเป็นไปตามคู่มือจดทะเบียนรถ '
+               'ส่วนชื่อเรียกในภาคผนวก 1 ใช้เพื่อการอ้างอิง</p>')
+    out.append('<p class="en">Each motorcycle is identified by the VIN shown in its registration book. Where a registration '
+               'number has changed, the current number is as shown in the registration book; the identifier used in '
+               'Annex 1 is kept for reference.</p>')
+    out.append('<table class="idx"><thead><tr><th>No.</th><th>รถจักรยานยนต์ (ภาคผนวก 1)<br>Motorcycle (Annex 1)</th>'
+               '<th>เลขทะเบียนตามคู่มือ<br>Reg. no. (book)</th><th>เลขตัวรถ<br>VIN</th><th>หน้าปก<br>Cover</th>'
+               '<th>หน้ารายการจดทะเบียน<br>Reg. page</th><th>ภาพถ่าย<br>Photo</th></tr></thead><tbody>')
+    out.extend(rows)
+    out.append("</tbody></table>")
+    out.append('<p class="legend">✓ <span class="th">แนบแล้ว</span> / attached &nbsp;&nbsp; ○ <span class="th">%s</span> / %s</p>'
+               % (PENDING_TH, PENDING_EN.lower()))
+    out.append('<table class="sig"><tr><td><div class="who"><span class="th">ผู้ให้เช่า</span> / LESSOR</div>%s<br><br>'
+               'Signature / <span class="th">ลายมือชื่อ</span>: ______________________<br><br>'
+               'Date / <span class="th">วันที่</span>: ______________</td>'
+               '<td><div class="who"><span class="th">ผู้เช่า</span> / LESSEE</div>%s<br><br>'
+               'Signature / <span class="th">ลายมือชื่อ</span>: ______________________<br><br>'
+               'Date / <span class="th">วันที่</span>: ______________</td></tr></table>'
+               % (esc(a["lessor_sig"]), esc(a["lessee_sig"])))
+
+    for b in bikes:
+        no = b["no"]
+        meta = []
+        if b.get("reg_no_book"):
+            meta.append('<b class="th">เลขทะเบียน</b> / <b>Reg. no.:</b> <span class="th">%s</span>' % esc(b["reg_no_book"]))
+        if b.get("make_model"):
+            meta.append('<b class="th">ยี่ห้อ/แบบ</b> / <b>Make/model:</b> %s' % esc(b["make_model"]))
+        if b.get("vin"):
+            meta.append('<b class="th">เลขตัวรถ</b> / <b>VIN:</b> %s' % esc(b["vin"]))
+        head = ('<div class="bar"><div class="t">%d. %s</div><div class="n">ANNEX 4 · %d / %d</div></div>'
+                '<div class="meta">%s</div>' % (no, esc(b["name"]), no, total, " &nbsp;·&nbsp; ".join(meta)))
+        cover = img(no, "cover")
+        reg = img(no, "reg")
+        photo = img(no, "photo")
+        out.append('<section class="page">' + head)
+        out.append('<div class="sec"><span class="th">1. หน้าปกคู่มือจดทะเบียนรถ</span> <span class="en">/ Registration book — front cover</span></div>')
+        out.append(fig("cover", cover, "หน้าปกคู่มือจดทะเบียนรถ", "registration book front cover"))
+        out.append('<div class="sec"><span class="th">2. หน้ารายการจดทะเบียน — ผู้ถือกรรมสิทธิ์ MR. FILIPP VOROBEV</span> '
+                   '<span class="en">/ Registration page — owner MR. FILIPP VOROBEV</span></div>')
+        out.append(fig("reg", reg, "หน้ารายการจดทะเบียน", "registration page"))
+        out.append("</section>")
+        out.append('<section class="page">' + head)
+        out.append('<div class="sec"><span class="th">3. ภาพถ่ายรถจักรยานยนต์</span> <span class="en">/ Photograph of the motorcycle</span></div>')
+        out.append(fig("photo", photo, "ภาพถ่ายรถจักรยานยนต์ซึ่งปรากฏแผ่นป้ายทะเบียน", "photo showing the number plate"))
+        out.append("</section>")
+    out.append("</body></html>")
+    return "\n".join(out)
+
+
+def render_page(pdf, page, stem):
+    """Page → RGB image through a cached PNG, 2200 px on the long side (scans embedded at 72 ppi would
+    otherwise render to ~4500 px at a fixed dpi). The render goes to `<stem>.tmp.png` and is
+    renamed only when complete: a run killed mid-render (timeout) must not leave a truncated PNG
+    that the next run reuses as finished. A cached PNG that does not load is rendered again."""
+    from PIL import Image
+    png = stem + ".png"
+    if os.path.exists(png):
+        try:
+            im = Image.open(png)
+            im.load()
+            return im.convert("RGB")
+        except OSError:
+            pass
+    subprocess.run(["pdftoppm", "-scale-to", "2200", "-f", str(page), "-l", str(page),
+                    "-png", "-singlefile", pdf, stem + ".tmp"], check=True)
+    os.replace(stem + ".tmp.png", png)
+    return Image.open(png).convert("RGB")
+
+
+def prepare(amap, src_dir, img_dir, work_dir, pad=0.015, fuzz=18, margin=12, long_side=(1500, 1900)):
+    """Book pages from the Drive PDFs → cropped JPEGs named <NN>_cover.jpg / <NN>_reg.jpg.
+
+    The pad is a fraction of the verified document box (not of the page), so on a two-up scan the
+    crop reaches only a few pixels past the box and does not pull in text of the facing page."""
+    from PIL import Image, ImageChops
+    os.makedirs(img_dir, exist_ok=True)
+    os.makedirs(work_dir, exist_ok=True)
+    done = []
+    for b in amap["bikes"]:
+        for kind, key in (("cover", "cover_src"), ("reg", "reg_src")):
+            s = b.get(key)
+            if not s:
+                continue
+            pdf = os.path.join(src_dir, s["drive_id"] + ".pdf")
+            if not os.path.exists(pdf):
+                print("no source for #%d %s: %s" % (b["no"], kind, pdf))
+                continue
+            stem = os.path.join(work_dir, "%s_p%d" % (s["drive_id"], s["page"]))
+            im = render_page(pdf, s["page"], stem)
+            w, h = im.size
+            bb = s.get("bbox") or {"x0": 0, "y0": 0, "x1": 1, "y1": 1}
+            px, py = pad * (bb["x1"] - bb["x0"]), pad * (bb["y1"] - bb["y0"])
+            im = im.crop((max(0, int((bb["x0"] - px) * w)), max(0, int((bb["y0"] - py) * h)),
+                          min(w, int((bb["x1"] + px) * w)), min(h, int((bb["y1"] + py) * h))))
+            ink = ImageChops.difference(im.convert("L"), Image.new("L", im.size, 255))
+            box = ink.point(lambda v: 255 if v > fuzz else 0).getbbox()
+            if box:
+                im = im.crop((max(0, box[0] - margin), max(0, box[1] - margin),
+                              min(im.size[0], box[2] + margin), min(im.size[1], box[3] + margin)))
+            lim = long_side[0] if kind == "cover" else long_side[1]
+            im.thumbnail((lim, lim))
+            out = os.path.join(img_dir, "%02d_%s.jpg" % (b["no"], kind))
+            im.save(out, quality=84, optimize=True)
+            done.append(out)
+    return done
+
+
+INDEX_PAGES = 2
+SHEET_TITLE = {"books": "Registration book — front cover", "photo": "Photograph of the motorcycle"}
+
+
+def bike_page(no, kind):
+    """0-based page of a bike's sheet: after the index every bike has two pages — books, then photo."""
+    return INDEX_PAGES + 2 * (no - 1) + (1 if kind == "photo" else 0)
+
+
+MARKS = re.compile(r"[✓○] [✓○] [✓○]")
+# Catalog entries of a digitally signed or form-carrying PDF: copying pages into a new file drops them,
+# and any rewrite would break a cryptographic signature anyway.
+SIGNED_CATALOG = ("/AcroForm", "/Perms", "/DSS")
+
+
+def flat_text(page):
+    return " ".join(page.extract_text().replace("\x00", "").split())
+
+
+def where_differ(a, b, ctx=60):
+    """The first place two texts differ, with a little context on each side."""
+    i = next((k for k, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+    s = max(0, i - ctx)
+    return "  signed: …%s…\n  fresh:  …%s…" % (a[s:i + ctx], b[s:i + ctx])
+
+
+def index_row(text, vin):
+    """Index row of the bike with this VIN: the text from the previous row's ✓/○ marks to its own."""
+    m = re.search(re.escape(vin) + " " + MARKS.pattern, text)
+    if not m:
+        return None
+    start = max((p.end() for p in MARKS.finditer(text, 0, m.start())), default=0)
+    return text[start:m.end()].strip()
+
+
+def splice(amap, signed, fresh, swaps, out):
+    """Signed PDF + fresh build → the signed PDF with the named bike sheets taken from the fresh build.
+
+    Every other page is copied from the signed file as is, so the signatures stay on exactly the pages
+    that carried them. A sheet is swapped only when
+      - both files show that bike and sheet on that page (name, VIN, sheet title, page number): a layout
+        that moved, or a signed file of another build, stops the splice instead of landing a photo under
+        the wrong bike;
+      - the sheet's text is the same in both files, so only its pictures change: a reg. no. or model that
+        moved in the map would otherwise contradict the bike's other sheet and the signed index;
+      - the bike's index row (name, reg. no., VIN, ✓/○) is the same in both files: the index sits on the
+        signed pages, and a row the signed index does not show would contradict the signature.
+    A digitally signed or form-carrying file is refused (page copying drops the catalog with the
+    signature), and so is an output path that would overwrite an input or an existing file."""
+    from pypdf import PdfReader, PdfWriter
+    real = {os.path.realpath(p) for p in (signed, fresh)}
+    if os.path.realpath(out) in real or os.path.exists(out):
+        sys.exit("--out %s is an input or already exists: the signed original must stay as it is" % out)
+    bikes = {b["no"]: b for b in amap["bikes"]}
+    total = len(bikes)
+    rs, rf = PdfReader(signed), PdfReader(fresh)
+    held = [k for k in SIGNED_CATALOG if k in rs.trailer["/Root"]]
+    if held:
+        sys.exit("signed PDF carries %s (digital signature or form): a page splice would drop it — "
+                 "swap the pages in an unsigned build and sign again" % ", ".join(held))
+    pages = INDEX_PAGES + 2 * total
+    if len(rs.pages) != pages or len(rf.pages) != pages:
+        sys.exit("expected %d pages: signed has %d, fresh has %d" % (pages, len(rs.pages), len(rf.pages)))
+    index = {name: " ".join(flat_text(r.pages[i]) for i in range(INDEX_PAGES)) for name, r in
+             (("signed", rs), ("fresh", rf))}
+    take = {}
+    for no, kind in swaps:
+        b = bikes.get(no)
+        if not b or not b.get("vin") or kind not in SHEET_TITLE:
+            sys.exit("cannot swap #%s %s: no such bike, no VIN to check it by, or kind not books/photo" % (no, kind))
+        i = bike_page(no, kind)
+        want = ["%d. %s" % (no, b["name"]), "ANNEX 4 · %d / %d" % (no, total), b["vin"], SHEET_TITLE[kind], "Page %d / %d" % (i + 1, pages)]
+        text, row = {}, {}
+        for name, r in (("signed", rs), ("fresh", rf)):
+            text[name] = flat_text(r.pages[i])
+            miss = [w for w in want if w not in text[name]]
+            if miss:
+                sys.exit("%s page %d is not the %s sheet of #%d: missing %s" % (name, i + 1, kind, no, miss))
+            row[name] = index_row(index[name], b["vin"])
+            if row[name] is None:
+                sys.exit("%s index has no row with the marks of #%d (VIN %s)" % (name, no, b["vin"]))
+        if row["signed"] != row["fresh"]:
+            sys.exit("index row of #%d differs — the signed index would no longer match the sheet:\n%s"
+                     % (no, where_differ(row["signed"], row["fresh"])))
+        if text["signed"] != text["fresh"]:
+            sys.exit("page %d (#%d %s): text differs between signed and fresh — only pictures may change:\n%s"
+                     % (i + 1, no, kind, where_differ(text["signed"], text["fresh"])))
+        take[i] = (no, kind)
+    w = PdfWriter()
+    for i in range(pages):
+        w.add_page(rf.pages[i] if i in take else rs.pages[i])
+    if rs.metadata:
+        w.add_metadata(dict(rs.metadata))
+    with open(out + ".tmp", "wb") as f:
+        w.write(f)
+    os.replace(out + ".tmp", out)
+    return sorted((i + 1, no, kind) for i, (no, kind) in take.items())
+
+
+def parse_swaps(s):
+    """'3:photo,25:photo' → [(3, 'photo'), (25, 'photo')]; anything else stops with the bad part named."""
+    out = []
+    for part in s.split(","):
+        m = re.fullmatch(r"\s*([0-9]+)\s*:\s*(books|photo)\s*", part)
+        if not m:
+            sys.exit("--swap: bad part %r — expected N:books or N:photo, comma-separated" % part)
+        out.append((int(m.group(1)), m.group(2)))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("prepare", help="Drive PDFs → cropped book pages")
+    p.add_argument("--map", required=True)
+    p.add_argument("--src", required=True, help="dir with <drive_id>.pdf")
+    p.add_argument("--img", required=True)
+    p.add_argument("--work", required=True, help="scratch dir for page renders")
+    h = sub.add_parser("html", help="map + images → annex.html")
+    h.add_argument("--map", required=True)
+    h.add_argument("--img", required=True)
+    h.add_argument("--fonts", required=True)
+    h.add_argument("--out", required=True)
+    h.add_argument("--draft", default="", help="text of the DRAFT stamp; empty = final, no stamp")
+    s = sub.add_parser("splice", help="signed PDF + fresh build → signed PDF with the named bike sheets replaced")
+    s.add_argument("--map", required=True)
+    s.add_argument("--signed", required=True)
+    s.add_argument("--fresh", required=True, help="PDF printed from the current map and images")
+    s.add_argument("--swap", required=True, help="bike sheets to take from the fresh PDF: '3:photo,25:photo' (books|photo)")
+    s.add_argument("--out", required=True)
+    a = ap.parse_args()
+    amap = json.load(open(a.map, encoding="utf-8"))
+    if a.cmd == "prepare":
+        print("pages:", len(prepare(amap, a.src, a.img, a.work)))
+        return
+    if a.cmd == "splice":
+        for page, no, kind in splice(amap, a.signed, a.fresh, parse_swaps(a.swap), a.out):
+            print("page %d ← fresh: #%d %s" % (page, no, kind))
+        print("pdf:", a.out)
+        return
+    with open(a.out, "w", encoding="utf-8") as f:
+        f.write(build(amap, os.path.abspath(a.img), os.path.abspath(a.fonts), a.draft))
+    print("html:", a.out)
+
+
+if __name__ == "__main__":
+    main()
