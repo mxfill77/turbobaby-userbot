@@ -132,10 +132,11 @@
     ]
    },
    "photo": {
-    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 66, message 12473",
-    "date": "2026-10-06",
-    "plate_seen": "2กอ 9011 ชลบุรี",
-    "plate_status": "earlier"
+    "source": "owner, sent in the build session on 20.10.2026 (night shot, rear; not from the forum)",
+    "date": "2026-10-20",
+    "plate_seen": "1กว 461 ภูเก็ต",
+    "plate_status": "current",
+    "replaces": "forum topic 66, message 12473 of 06.10.2026 (old plate 2กอ 9011 ชลบุรี)"
    }
   },
   {
@@ -1035,10 +1036,11 @@
     ]
    },
    "photo": {
-    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 455, message 12187",
-    "date": "2026-09-28",
-    "plate_seen": "1กษ 7943 บุรีรัมย์",
-    "plate_status": "earlier"
+    "source": "owner, sent in the build session on 20.10.2026 as an interim photo (night shot, rear; not from the forum)",
+    "date": "2026-10-20",
+    "plate_seen": "1กร 1023 ภูเก็ต",
+    "plate_status": "current",
+    "replaces": "forum topic 455, message 12187 of 28.09.2026 (old plate 1กษ 7943 บุรีรัมย์)"
    }
   },
   {

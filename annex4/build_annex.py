@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """Annex 4 builder: registration-book pages + photos of the 38 motorcycles of Annex 1.
 
-Two steps (a cloud session has everything they need: poppler, Pillow, Chromium via playwright):
+Steps (a cloud session has everything they need: poppler, Pillow, pypdf, Chromium via playwright):
   prepare — <src_dir>/<drive_id>.pdf (the Drive PDFs named in annex_map.json) → <img_dir>/<NN>_cover.jpg
             and <NN>_reg.jpg: page rendered at 200 dpi, cut to the verified document box, white trimmed.
   html    — annex_map.json + <img_dir> → annex.html; then `node print_pdf.js annex.html annex.pdf`.
+  splice  — once the annex is signed: the signed PDF with only the named bike sheets taken from a fresh
+            build, every other page (the signed one included) copied as is.
 Photos are put as <img_dir>/<NN>_photo.jpg after the plate on them is checked against the book, and
 the bike gets a "photo" entry in the map (source + plate seen). Only what the map names is attached;
 an image without a map entry, or a map entry without an image, stops the build. Anything not in the
@@ -275,6 +277,76 @@ def prepare(amap, src_dir, img_dir, work_dir, pad=0.015, fuzz=18, margin=12, lon
     return done
 
 
+INDEX_PAGES = 2
+SHEET_TITLE = {"books": "Registration book — front cover", "photo": "Photograph of the motorcycle"}
+
+
+def bike_page(no, kind):
+    """0-based page of a bike's sheet: after the index every bike has two pages — books, then photo."""
+    return INDEX_PAGES + 2 * (no - 1) + (1 if kind == "photo" else 0)
+
+
+def flat_text(page):
+    return " ".join(page.extract_text().split())
+
+
+def splice(amap, signed, fresh, swaps, out):
+    """Signed PDF + fresh build → the signed PDF with the named bike sheets taken from the fresh build.
+
+    Every other page is copied from the signed file as is, so the signatures stay on exactly the pages
+    that carried them. A sheet is swapped only when both files show that bike and sheet on that page
+    (header, VIN, sheet title, page number): a layout that moved, or a signed file of another build,
+    stops the splice instead of landing a photo under the wrong bike. The index rows of the swapped
+    bikes must also agree (✓/○): the index sits on the signed pages, and a mark the signed index does
+    not show would contradict the signature."""
+    import re
+    from pypdf import PdfReader, PdfWriter
+    bikes = {b["no"]: b for b in amap["bikes"]}
+    total = len(bikes)
+    rs, rf = PdfReader(signed), PdfReader(fresh)
+    pages = INDEX_PAGES + 2 * total
+    if len(rs.pages) != pages or len(rf.pages) != pages:
+        sys.exit("expected %d pages: signed has %d, fresh has %d" % (pages, len(rs.pages), len(rf.pages)))
+    index = {name: " ".join(flat_text(r.pages[i]) for i in range(INDEX_PAGES)) for name, r in
+             (("signed", rs), ("fresh", rf))}
+    take = {}
+    for no, kind in swaps:
+        b = bikes.get(no)
+        if not b or not b.get("vin") or kind not in SHEET_TITLE:
+            sys.exit("cannot swap #%s %s: no such bike, no VIN to check it by, or kind not books/photo" % (no, kind))
+        i = bike_page(no, kind)
+        want = ["%d. %s" % (no, b["name"]), "ANNEX 4 · %d / %d" % (no, total), b["vin"], SHEET_TITLE[kind], "Page %d / %d" % (i + 1, pages)]
+        marks = {}
+        for name, r in (("signed", rs), ("fresh", rf)):
+            miss = [w for w in want if w not in flat_text(r.pages[i])]
+            if miss:
+                sys.exit("%s page %d is not the %s sheet of #%d: missing %s" % (name, i + 1, kind, no, miss))
+            m = re.search(re.escape(b["vin"]) + r" ([✓○]) ([✓○]) ([✓○])", index[name])
+            if not m:
+                sys.exit("%s index has no row with the marks of #%d (VIN %s)" % (name, no, b["vin"]))
+            marks[name] = "".join(m.groups())
+        if marks["signed"] != marks["fresh"]:
+            sys.exit("index row of #%d: signed %s, fresh %s — the signed index would no longer match the sheet"
+                     % (no, marks["signed"], marks["fresh"]))
+        take[i] = (no, kind)
+    w = PdfWriter()
+    for i in range(pages):
+        w.add_page(rf.pages[i] if i in take else rs.pages[i])
+    with open(out + ".tmp", "wb") as f:
+        w.write(f)
+    os.replace(out + ".tmp", out)
+    return sorted((i + 1, no, kind) for i, (no, kind) in take.items())
+
+
+def parse_swaps(s):
+    """'3:photo,25:photo' → [(3, 'photo'), (25, 'photo')]."""
+    out = []
+    for part in s.split(","):
+        no, _, kind = part.strip().partition(":")
+        out.append((int(no), kind))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -289,10 +361,21 @@ def main():
     h.add_argument("--fonts", required=True)
     h.add_argument("--out", required=True)
     h.add_argument("--draft", default="", help="text of the DRAFT stamp; empty = final, no stamp")
+    s = sub.add_parser("splice", help="signed PDF + fresh build → signed PDF with the named bike sheets replaced")
+    s.add_argument("--map", required=True)
+    s.add_argument("--signed", required=True)
+    s.add_argument("--fresh", required=True, help="PDF printed from the current map and images")
+    s.add_argument("--swap", required=True, help="bike sheets to take from the fresh PDF: '3:photo,25:photo' (books|photo)")
+    s.add_argument("--out", required=True)
     a = ap.parse_args()
     amap = json.load(open(a.map, encoding="utf-8"))
     if a.cmd == "prepare":
         print("pages:", len(prepare(amap, a.src, a.img, a.work)))
+        return
+    if a.cmd == "splice":
+        for page, no, kind in splice(amap, a.signed, a.fresh, parse_swaps(a.swap), a.out):
+            print("page %d ← fresh: #%d %s" % (page, no, kind))
+        print("pdf:", a.out)
         return
     with open(a.out, "w", encoding="utf-8") as f:
         f.write(build(amap, os.path.abspath(a.img), os.path.abspath(a.fonts), a.draft))
