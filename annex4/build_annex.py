@@ -94,8 +94,7 @@ table.idx td.mono { font-family: 'Noto Sans', monospace; letter-spacing: .15px; 
 .fig.cover { height: 68mm; }
 .fig.reg { height: 150mm; }
 .fig.reg.full { height: 222mm; }
-.fig.photo { height: 214mm; }
-.cap { font-size: 8.5pt; color: #333; line-height: 1.5; margin-top: -1.5mm; }
+.fig.photo { height: 228mm; }
 .ph { background: ROW; border: 0.5mm dashed LINE; color: #5b6b78; text-align: center; font-size: 11pt; }
 .ph small { display: block; font-size: 8.5pt; margin-top: 1mm; }
 """
@@ -112,22 +111,6 @@ def fig(cls, path, label_th, label_en):
         return '<div class="fig %s"><img src="%s"></div>' % (cls, esc(uri(path)))
     return ('<div class="fig %s ph"><div><span class="th">%s</span> / %s<small>%s — %s</small></div></div>'
             % (cls, PENDING_TH, PENDING_EN, esc(label_th), esc(label_en)))
-
-
-STATUS_WORDS = {"current": ("เลขทะเบียนปัจจุบัน", "current registration number"),
-                "earlier": ("เลขทะเบียนเดิมของรถคันนี้ตามหน้าปกคู่มือจดทะเบียนรถ",
-                            "earlier registration number of this vehicle, listed on the registration book cover")}
-
-
-def photo_caption(ph):
-    """Date of the photo and the plate it shows: a bike that still carries its old plate is shown as such,
-    so the reader sees why the photo and the current number above differ."""
-    th, en = STATUS_WORDS[ph["plate_status"]]
-    d = ph["date"].split("-")
-    date = "%s.%s.%s" % (d[2], d[1], d[0])
-    return ('<div class="cap"><span class="th">ภาพถ่ายวันที่ %s · ป้ายทะเบียนในภาพ: %s (%s)</span><br>'
-            'Photo of %s · plate in the photo: <span class="th">%s</span> (%s)</div>'
-            % (date, esc(ph["plate_seen"]), th, date, esc(ph["plate_seen"]), en))
 
 
 def build(amap, img_dir, font_dir, draft):
@@ -229,8 +212,6 @@ def build(amap, img_dir, font_dir, draft):
         out.append('<section class="page">' + head)
         out.append('<div class="sec"><span class="th">3. ภาพถ่ายรถจักรยานยนต์</span> <span class="en">/ Photograph of the motorcycle</span></div>')
         out.append(fig("photo", photo, "ภาพถ่ายรถจักรยานยนต์ซึ่งปรากฏแผ่นป้ายทะเบียน", "photo showing the number plate"))
-        if photo:
-            out.append(photo_caption(b["photo"]))
         out.append("</section>")
     out.append("</body></html>")
     return "\n".join(out)
