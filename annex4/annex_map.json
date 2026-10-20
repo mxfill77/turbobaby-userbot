@@ -16,29 +16,41 @@
    "reg_no_book": "1กอ 5662 ภูเก็ต (Phuket)",
    "make_model": "HONDA ADV350",
    "vin": "MLHNF1478R5202471",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "17Vtizch4AScI7Fld2SVDrdp_QimiYzEi",
-    "page": 3,
-    "title": "Green book - ADV 350 - Phuket 5662 (prev 5849 Sa Kaeo).pdf",
+    "drive_id": "1StWalEgm33iTB76819bmf--RPcrDMvp0",
+    "page": 2,
+    "title": "5662 ADV350 2024.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
-     "x0": 0.03,
-     "y0": 0.138,
+     "x0": 0,
+     "y0": 0,
      "x1": 0.97,
-     "y1": 0.885
+     "y1": 1
     }
    },
    "cover_src": {
-    "drive_id": "17Vtizch4AScI7Fld2SVDrdp_QimiYzEi",
+    "drive_id": "1StWalEgm33iTB76819bmf--RPcrDMvp0",
     "page": 1,
-    "title": "Green book - ADV 350 - Phuket 5662 (prev 5849 Sa Kaeo).pdf",
+    "title": "5662 ADV350 2024.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
-     "x0": 0.03,
-     "y0": 0.29,
-     "x1": 0.97,
-     "y1": 0.71
-    }
+     "x0": 0,
+     "y0": 0,
+     "x1": 1,
+     "y1": 1
+    },
+    "plates": [
+     "1กธ 5849 | สระแก้ว",
+     "1กอ 5662 | ภูเก็ต"
+    ]
    },
-   "status": "ok"
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 62, message 471",
+    "date": "2025-07-08",
+    "plate_seen": "1กธ 5849 สระแก้ว",
+    "plate_status": "earlier"
+   }
   },
   {
    "no": 2,
@@ -46,29 +58,42 @@
    "reg_no_book": "2กช 440 ภูเก็ต (Phuket)",
    "make_model": "HONDA ADV350",
    "vin": "MLHNF1479P5100111",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "1SCosjb0KzuW7yZLoLc942TrLyDnm6i_k",
-    "page": 3,
-    "title": "Green book - ADV 350 - Phuket 440 (prev 8664 Phuket, 798 Bangkok).pdf",
+    "drive_id": "1_K2oYK_qCCr2llAHSFW_bK6N4tcwu-oF",
+    "page": 2,
+    "title": "440 ADV350 2023.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
-     "x0": 0.04,
-     "y0": 0.1,
-     "x1": 0.97,
-     "y1": 0.89
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.99,
+     "y1": 0.995
     }
    },
    "cover_src": {
-    "drive_id": "1SCosjb0KzuW7yZLoLc942TrLyDnm6i_k",
+    "drive_id": "1_K2oYK_qCCr2llAHSFW_bK6N4tcwu-oF",
     "page": 1,
-    "title": "Green book - ADV 350 - Phuket 440 (prev 8664 Phuket, 798 Bangkok).pdf",
+    "title": "440 ADV350 2023.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
-     "x0": 0.03,
-     "y0": 0.31,
-     "x1": 0.97,
-     "y1": 0.69
-    }
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.99,
+     "y1": 0.975
+    },
+    "plates": [
+     "5ขย 798 | กรุงเทพมหานคร",
+     "1กฮ 8664 | ภูเก็ต",
+     "2กช 440 | ภูเก็ต"
+    ]
    },
-   "status": "ok"
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 64, message 12882",
+    "date": "2026-10-16",
+    "plate_seen": "2กช 440 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 3,
@@ -76,39 +101,119 @@
    "reg_no_book": "1กว 461 ภูเก็ต (Phuket)",
    "make_model": "HONDA CB300R",
    "vin": "MLHNC5574J5004151",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "12ea3Exc1S5PHi3Znv6UYqXISpRE4OuJ_",
-    "page": 3,
-    "title": "Green book - CB 300R - Phuket 461 (prev 9011 Chonburi).pdf",
+    "drive_id": "1fDvaR9YzWKgKSv2lemjWBoFODAQDtlKB",
+    "page": 2,
+    "title": "461 CB300R 2018.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
-     "x0": 0.065,
-     "y0": 0.145,
-     "x1": 0.93,
-     "y1": 0.84
+     "x0": 0,
+     "y0": 0,
+     "x1": 1,
+     "y1": 0.99
     }
    },
    "cover_src": {
-    "drive_id": "12ea3Exc1S5PHi3Znv6UYqXISpRE4OuJ_",
+    "drive_id": "1fDvaR9YzWKgKSv2lemjWBoFODAQDtlKB",
     "page": 1,
-    "title": "Green book - CB 300R - Phuket 461 (prev 9011 Chonburi).pdf",
+    "title": "461 CB300R 2018.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
-     "x0": 0.05,
-     "y0": 0.325,
-     "x1": 0.965,
-     "y1": 0.69
-    }
+     "x0": 0,
+     "y0": 0,
+     "x1": 1,
+     "y1": 1
+    },
+    "plates": [
+     "2กอ 9011 | ชลบุรี",
+     "1กว 461 | ภูเก็ต"
+    ]
    },
-   "status": "ok"
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 66, message 12473",
+    "date": "2026-10-06",
+    "plate_seen": "2กอ 9011 ชลบุรี",
+    "plate_status": "earlier"
+   }
   },
   {
    "no": 4,
    "name": "CBR 650R PHUKET 4505",
-   "status": "file04"
+   "status": "ok",
+   "reg_no_book": "1กม 4505 ภูเก็ต (Phuket)",
+   "make_model": "HONDA CBR650R",
+   "vin": "MLHRH0175K5000722",
+   "reg_src": {
+    "drive_id": "11QifGyBiI9HKhUdiOnxSOkJEFKOy6SLc",
+    "page": 2,
+    "title": "4505 CBR650R 2018.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.98,
+     "y1": 1
+    }
+   },
+   "cover_src": {
+    "drive_id": "11QifGyBiI9HKhUdiOnxSOkJEFKOy6SLc",
+    "page": 1,
+    "title": "4505 CBR650R 2018.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 1,
+     "y1": 1
+    },
+    "plates": [
+     "1กด 2627 | พิษณุโลก",
+     "1กม 4505 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 68, message 12497",
+    "date": "2026-10-08",
+    "plate_seen": "1กม 4505 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 5,
    "name": "CLICK 125CC PHUKET 5580",
-   "status": "file04"
+   "status": "ok",
+   "reg_no_book": "1กธ 5762 ภูเก็ต (Phuket)",
+   "make_model": "HONDA CLICK 125 I",
+   "vin": "MLHJF3515H5312803",
+   "reg_src": {
+    "drive_id": "1wyGvNuZY3Ff8rsT9hrmPIRtg8vf3snm6",
+    "page": 2,
+    "title": "5762 CLICK125I 2017.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.985,
+     "y1": 0.995
+    }
+   },
+   "cover_src": {
+    "drive_id": "1wyGvNuZY3Ff8rsT9hrmPIRtg8vf3snm6",
+    "page": 1,
+    "title": "5762 CLICK125I 2017.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0.005,
+     "y0": 0,
+     "x1": 0.995,
+     "y1": 0.99
+    },
+    "plates": [
+     "6กท 1149 | กรุงเทพมหานคร",
+     "1กธ 5762 | ภูเก็ต"
+    ]
+   }
   },
   {
    "no": 6,
@@ -116,23 +221,83 @@
    "reg_no_book": "1กม 8950 ภูเก็ต (Phuket)",
    "make_model": "HONDA FORZA",
    "vin": "MLHNF0770J5012464",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "1-0NQ5dve-uEi9PTNShBHZ_-g0PU8ko6Y",
-    "page": 1,
-    "title": "Green book - FORZA 300 - Phuket 8950.pdf",
+    "drive_id": "1XMxAihCL6iNhRCydQwo7Q18uv_zYnqGS",
+    "page": 2,
+    "title": "8950 FORZA 2019.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
-     "x0": 0.06,
-     "y0": 0.15,
-     "x1": 0.97,
-     "y1": 0.84
+     "x0": 0.01,
+     "y0": 0,
+     "x1": 0.98,
+     "y1": 1
     }
    },
-   "status": "ok"
+   "cover_src": {
+    "drive_id": "1XMxAihCL6iNhRCydQwo7Q18uv_zYnqGS",
+    "page": 1,
+    "title": "8950 FORZA 2019.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.995,
+     "y1": 0.985
+    },
+    "plates": [
+     "1กฌ 2340 | เพชรบุรี",
+     "1กม 8950 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 70, message 2173",
+    "date": "2025-10-20",
+    "plate_seen": "1กม 8950 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 7,
    "name": "MT-03 300CC BLUE 5068",
-   "status": "file04"
+   "status": "ok",
+   "reg_no_book": "1กว 5068 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA MT-03",
+   "vin": "MH3RH12S111001295",
+   "reg_src": {
+    "drive_id": "1aARzMfQ4LglQo9ueKoSf82u0r4wV6thg",
+    "page": 2,
+    "title": "5068 MT-03 2021.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0.01,
+     "y0": 0,
+     "x1": 0.99,
+     "y1": 1
+    }
+   },
+   "cover_src": {
+    "drive_id": "1aARzMfQ4LglQo9ueKoSf82u0r4wV6thg",
+    "page": 1,
+    "title": "5068 MT-03 2021.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 1,
+     "y1": 0.99
+    },
+    "plates": [
+     "4ขล 7139 | กรุงเทพมหานคร",
+     "1กว 5068 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 71, message 12053",
+    "date": "2026-09-24",
+    "plate_seen": "1กว 5068 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 8,
@@ -140,23 +305,83 @@
    "reg_no_book": "1กล 6334 ภูเก็ต (Phuket)",
    "make_model": "KAWASAKI EX400K",
    "vin": "JKAEX400KKDAA3240",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "1xRiQ3y_4-V4dzAv_xbRmfI1JQspnCuV9",
+    "drive_id": "1rufdzIWkIcx7xPgXREsuMUKK302NNOdA",
+    "page": 2,
+    "title": "6334 EX400K 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.99,
+     "y1": 0.985
+    }
+   },
+   "cover_src": {
+    "drive_id": "1rufdzIWkIcx7xPgXREsuMUKK302NNOdA",
     "page": 1,
-    "title": "ninja 400 6334.pdf",
+    "title": "6334 EX400K 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 1,
+     "y1": 0.99
+    },
+    "plates": [
+     "3ขญ 8747 | กรุงเทพมหานคร",
+     "1กล 6334 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 73, message 989",
+    "date": "2025-07-31",
+    "plate_seen": "1กล 6334 ภูเก็ต",
+    "plate_status": "current"
+   }
+  },
+  {
+   "no": 9,
+   "name": "NMAX 155CC BLACK GOLD PHUKET 4255",
+   "status": "ok",
+   "reg_no_book": "1กม 4255 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA NMAX",
+   "vin": "MH3SG571111019316",
+   "reg_src": {
+    "drive_id": "1ym6ld1qgi2WYtt7Ur4rPFP1wgBVEbuOd",
+    "page": 2,
+    "title": "4255 NMAX 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.99,
+     "y1": 1
+    }
+   },
+   "cover_src": {
+    "drive_id": "1ym6ld1qgi2WYtt7Ur4rPFP1wgBVEbuOd",
+    "page": 1,
+    "title": "4255 NMAX 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
      "x0": 0,
      "y0": 0,
      "x1": 1,
      "y1": 1
-    }
+    },
+    "plates": [
+     "2ขว 279 | กรุงเทพมหานคร",
+     "1กม 4255 | ภูเก็ต"
+    ]
    },
-   "status": "ok"
-  },
-  {
-   "no": 9,
-   "name": "NMAX 155CC BLACK GOLD PHUKET 4255",
-   "status": "file04"
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 75, message 12385",
+    "date": "2026-10-02",
+    "plate_seen": "1กม 4255 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 10,
@@ -164,28 +389,126 @@
    "reg_no_book": "1กม 4685 ภูเก็ต (Phuket)",
    "make_model": "YAMAHA NMAX",
    "vin": "MH3SG571111007423",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "1C5Sbze67RrfR5v3LzHXlZ8vaBxzl-Po9",
-    "page": 1,
-    "title": "NMAX 155 — Phuket 4685 — green book.pdf",
+    "drive_id": "1YDjNlcJG752Sfa0HMpCy--rLywtdyOdL",
+    "page": 2,
+    "title": "4685 NMAX 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
      "x0": 0,
-     "y0": 0.005,
-     "x1": 1,
-     "y1": 1
+     "y0": 0,
+     "x1": 0.995,
+     "y1": 0.995
     }
    },
-   "status": "ok"
+   "cover_src": {
+    "drive_id": "1YDjNlcJG752Sfa0HMpCy--rLywtdyOdL",
+    "page": 1,
+    "title": "4685 NMAX 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.995,
+     "y1": 0.99
+    },
+    "plates": [
+     "2ขฎ 452 | กรุงเทพมหานคร",
+     "2กว 2596 | นครราชสีมา",
+     "1กม 4685 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 76, message 12362",
+    "date": "2026-10-01",
+    "plate_seen": "1กม 4685 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 11,
    "name": "NMAX 155CC BLACK GOLD-3 PHUKET 7530",
-   "status": "file04"
+   "status": "ok",
+   "reg_no_book": "1กม 7530 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA NMAX",
+   "vin": "MH3SG571111008080",
+   "reg_src": {
+    "drive_id": "1rjY716B3hoxBO1pA7fmjpXb23zxlDRXl",
+    "page": 2,
+    "title": "7530 NMAX 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.97,
+     "y1": 1
+    }
+   },
+   "cover_src": {
+    "drive_id": "1rjY716B3hoxBO1pA7fmjpXb23zxlDRXl",
+    "page": 1,
+    "title": "7530 NMAX 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.905,
+     "y1": 1
+    },
+    "plates": [
+     "1กน 2114 | พิษณุโลก",
+     "1กม 7530 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 77, message 12854",
+    "date": "2026-10-16",
+    "plate_seen": "1กม 7530 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 12,
    "name": "NMAX 155CC BLACK GREEN PHUKET 4253",
-   "status": "file04"
+   "status": "ok",
+   "reg_no_book": "1กม 4253 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA NMAX",
+   "vin": "MH3SG571111006337",
+   "reg_src": {
+    "drive_id": "1dcGeJL4vBlLowWZ_MeKGwZmLklgurx4Z",
+    "page": 2,
+    "title": "4253 NMAX 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.995,
+     "y1": 1
+    }
+   },
+   "cover_src": {
+    "drive_id": "1dcGeJL4vBlLowWZ_MeKGwZmLklgurx4Z",
+    "page": 1,
+    "title": "4253 NMAX 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.9,
+     "y1": 0.985
+    },
+    "plates": [
+     "2ขช 5578 | กรุงเทพมหานคร",
+     "1กม 4253 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 78, message 11351",
+    "date": "2026-08-18",
+    "plate_seen": "1กม 4253 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 13,
@@ -193,18 +516,41 @@
    "reg_no_book": "1กม 8952 ภูเก็ต (Phuket)",
    "make_model": "YAMAHA NMAX",
    "vin": "MH3SG571111004580",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "1GngUzdlmFV1H7oRkXc52ZWzCbhOJrtkj",
-    "page": 4,
-    "title": "4 xmaxes.pdf",
+    "drive_id": "1wY1rrzffwyhuJAvp8FqZET-aCaTWWfR-",
+    "page": 2,
+    "title": "8952 NMAX 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
      "x0": 0,
      "y0": 0,
-     "x1": 0.999,
-     "y1": 0.999
+     "x1": 0.99,
+     "y1": 1
     }
    },
-   "status": "ok"
+   "cover_src": {
+    "drive_id": "1wY1rrzffwyhuJAvp8FqZET-aCaTWWfR-",
+    "page": 1,
+    "title": "8952 NMAX 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0.01,
+     "x1": 0.975,
+     "y1": 1
+    },
+    "plates": [
+     "2ขข 2056 | กรุงเทพมหานคร",
+     "1กม 8952 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 74, message 12897",
+    "date": "2026-10-17",
+    "plate_seen": "1กม 8952 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 14,
@@ -212,33 +558,167 @@
    "reg_no_book": "1กม 4957 ภูเก็ต (Phuket)",
    "make_model": "YAMAHA NMAX",
    "vin": "MH3SG571111002481",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "1RfiCGkNXsSD0RE-fBx2bBc7BwmFRIbJj",
+    "drive_id": "1gO6_vSaVDDS390x-rRIHMHJ5mjdz3dDj",
     "page": 2,
-    "title": "3 nmaxes.pdf",
+    "title": "4957 NMAX 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
-     "x0": 0.03,
+     "x0": 0,
      "y0": 0,
-     "x1": 1,
-     "y1": 1
+     "x1": 0.99,
+     "y1": 0.985
     }
    },
-   "status": "ok"
+   "cover_src": {
+    "drive_id": "1gO6_vSaVDDS390x-rRIHMHJ5mjdz3dDj",
+    "page": 1,
+    "title": "4957 NMAX 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.995,
+     "y1": 0.995
+    },
+    "plates": [
+     "2ขก 6149 | กรุงเทพมหานคร.",
+     "1กม 4957 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 79, message 812",
+    "date": "2025-07-21",
+    "plate_seen": "1กม 4957 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 15,
    "name": "NMAX 155CC GREY GOLD PHUKET 6908",
-   "status": "file04"
+   "status": "ok",
+   "reg_no_book": "1กม 6908 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA NMAX",
+   "vin": "MH3SG574111020047",
+   "reg_src": {
+    "drive_id": "1890Ieu4B8T86b1f5bzarcVFZXlU3oIPx",
+    "page": 2,
+    "title": "6908 NMAX 2021.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0.01,
+     "y0": 0,
+     "x1": 0.985,
+     "y1": 0.99
+    }
+   },
+   "cover_src": {
+    "drive_id": "1890Ieu4B8T86b1f5bzarcVFZXlU3oIPx",
+    "page": 1,
+    "title": "6908 NMAX 2021.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0.02,
+     "y0": 0,
+     "x1": 0.99,
+     "y1": 0.93
+    },
+    "plates": [
+     "2กฎ 6295 | ขอนแก่น",
+     "1กม 6908 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 201, message 12404",
+    "date": "2026-10-02",
+    "plate_seen": "1กม 6908 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 16,
    "name": "NMAX 155CC GREY PHUKET 5960",
-   "status": "file04"
+   "status": "ok",
+   "reg_no_book": "1กม 5960 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA NMAX",
+   "vin": "MH3SG571111029784",
+   "reg_src": {
+    "drive_id": "1Dy0VpWLU-HrcYJgRSezwSOo1xLxjeR5X",
+    "page": 2,
+    "title": "5960 NMAX 2021.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.99,
+     "y1": 0.99
+    }
+   },
+   "cover_src": {
+    "drive_id": "1Dy0VpWLU-HrcYJgRSezwSOo1xLxjeR5X",
+    "page": 1,
+    "title": "5960 NMAX 2021.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.995,
+     "y1": 0.995
+    },
+    "plates": [
+     "3ขฒ 769 | กรุงเทพมหานคร",
+     "1กม 5960 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 80, message 11572",
+    "date": "2026-08-24",
+    "plate_seen": "1กม 5960 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 17,
    "name": "NMAX 155CC RACE PHUKET 7532",
-   "status": "file04"
+   "status": "ok",
+   "reg_no_book": "1กม 7532 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA NMAX",
+   "vin": "MH3SG571111002613",
+   "reg_src": {
+    "drive_id": "1uJzL_FYoA50M1CjwdYF1G-0VCUfQ4BxW",
+    "page": 2,
+    "title": "7532 NMAX 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.99,
+     "y1": 0.99
+    }
+   },
+   "cover_src": {
+    "drive_id": "1uJzL_FYoA50M1CjwdYF1G-0VCUfQ4BxW",
+    "page": 1,
+    "title": "7532 NMAX 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.92,
+     "y1": 1
+    },
+    "plates": [
+     "2กง 3261 | ระยอง",
+     "1กม 7532 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 346, message 348",
+    "date": "2025-07-04",
+    "plate_seen": "1กม 7532 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 18,
@@ -246,23 +726,83 @@
    "reg_no_book": "1กม 9548 ภูเก็ต (Phuket)",
    "make_model": "YAMAHA NMAX",
    "vin": "MH3SG571111013079",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "1cLeQsG2dJ3kw8JnnbGBI15qh1sxRb6gp",
-    "page": 1,
-    "title": "NMAX 155 — Phuket 9548 — green book.pdf",
+    "drive_id": "16XD40K-NarSQdbYcFSR12gzku3vMm6qb",
+    "page": 2,
+    "title": "9548 NMAX 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
-     "x0": 0.01,
-     "y0": 0.02,
-     "x1": 0.99,
-     "y1": 0.99
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.98,
+     "y1": 1
     }
    },
-   "status": "ok"
+   "cover_src": {
+    "drive_id": "16XD40K-NarSQdbYcFSR12gzku3vMm6qb",
+    "page": 1,
+    "title": "9548 NMAX 2020.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 1,
+     "y1": 0.98
+    },
+    "plates": [
+     "2ขษ 4660 | กรุงเทพมหานคร",
+     "1กม 9548 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 1051, message 11462",
+    "date": "2026-08-20",
+    "plate_seen": "1กม 9548 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 19,
    "name": "VULCAN 650CC S PHUKET 5065",
-   "status": "file04"
+   "status": "ok",
+   "reg_no_book": "1กว 5065 ภูเก็ต (Phuket)",
+   "make_model": "KAWASAKI VULCAN CAFE",
+   "vin": "JKAEN650EEDA04877",
+   "reg_src": {
+    "drive_id": "1pnBoJCjLUEUIN2WuODW6QvkCwwZ5gbcb",
+    "page": 2,
+    "title": "5056 VULCAN CAFE 2019.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.995,
+     "y1": 0.99
+    }
+   },
+   "cover_src": {
+    "drive_id": "1pnBoJCjLUEUIN2WuODW6QvkCwwZ5gbcb",
+    "page": 1,
+    "title": "5056 VULCAN CAFE 2019.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 1,
+     "y1": 0.985
+    },
+    "plates": [
+     "2ขช 9225 | กรุงเทพมหานคร",
+     "1กว 5065 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 81, message 12840",
+    "date": "2026-10-16",
+    "plate_seen": "1กว 5065 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 20,
@@ -270,18 +810,41 @@
    "reg_no_book": "1กอ 5709 ภูเก็ต (Phuket)",
    "make_model": "YAMAHA XMAX",
    "vin": "MH3SH222111010411",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "1GngUzdlmFV1H7oRkXc52ZWzCbhOJrtkj",
-    "page": 3,
-    "title": "4 xmaxes.pdf",
+    "drive_id": "194JkEE8VGKV_KUokntqnlWsdljs3nE-b",
+    "page": 2,
+    "title": "5709 XMAX 2023.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
      "x0": 0,
      "y0": 0,
-     "x1": 0.975,
-     "y1": 0.999
+     "x1": 1,
+     "y1": 0.985
     }
    },
-   "status": "ok"
+   "cover_src": {
+    "drive_id": "194JkEE8VGKV_KUokntqnlWsdljs3nE-b",
+    "page": 1,
+    "title": "5709 XMAX 2023.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.995,
+     "y1": 1
+    },
+    "plates": [
+     "6ขฒ 8946 | กรุงเทพมหานคร",
+     "1กอ 5709 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 721, message 725",
+    "date": "2025-07-16",
+    "plate_seen": "1กอ 5709 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 21,
@@ -289,18 +852,41 @@
    "reg_no_book": "1กม 5773 ภูเก็ต (Phuket)",
    "make_model": "YAMAHA XMAX 300",
    "vin": "MH3SH087111025257",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "1Vq-HagwW_8xDYa1LTyyiUv_jITBTZMVp",
-    "page": 1,
-    "title": "xmax 5773 (blue2).pdf",
+    "drive_id": "1k_EF_KOgNXkDFDScdXo55sFWVVRFRTWf",
+    "page": 2,
+    "title": "5773 XMAX300 2019.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
      "x0": 0,
-     "y0": 0.02,
-     "x1": 1,
+     "y0": 0,
+     "x1": 0.99,
      "y1": 1
     }
    },
-   "status": "ok"
+   "cover_src": {
+    "drive_id": "1k_EF_KOgNXkDFDScdXo55sFWVVRFRTWf",
+    "page": 1,
+    "title": "5773 XMAX300 2019.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0.005,
+     "y0": 0,
+     "x1": 0.995,
+     "y1": 0.985
+    },
+    "plates": [
+     "1กล 4102 | สุราษฎร์ธานี",
+     "1กม 5773 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 264, message 267",
+    "date": "2025-07-03",
+    "plate_seen": "1กม 5773 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 22,
@@ -308,10 +894,12 @@
    "reg_no_book": "1กม 4248 ภูเก็ต (Phuket)",
    "make_model": "YAMAHA XMAX 300",
    "vin": "MH3SH087111041628",
+   "status": "ok",
    "reg_src": {
     "drive_id": "1jjsO4bUjJfozHbuk9kFDohFvYDss9D_W",
     "page": 3,
     "title": "XMAX 300 — Phuket 4248 — green book + agreement.pdf",
+    "folder": "ДЛЯ БУХГАЛТЕРИИ — зелёные книги 21.09.2026",
     "bbox": {
      "x0": 0,
      "y0": 0.02,
@@ -319,22 +907,138 @@
      "y1": 1
     }
    },
-   "status": "ok"
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 222, message 226",
+    "date": "2025-07-03",
+    "plate_seen": "1กม 4248 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 23,
    "name": "XMAX 300CC GREY PHUKET 4246",
-   "status": "owner_will_provide"
+   "status": "ok",
+   "reg_no_book": "1กม 4246 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA XMAX 300",
+   "vin": "MH3SH087111020010",
+   "reg_src": {
+    "drive_id": "1Jk5HYTf-H59XIjjRG3NH385qvv64Aiws",
+    "page": 2,
+    "title": "4246 XMAX 2019.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.99,
+     "y1": 1
+    }
+   },
+   "cover_src": {
+    "drive_id": "1Jk5HYTf-H59XIjjRG3NH385qvv64Aiws",
+    "page": 1,
+    "title": "4246 XMAX 2019.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0.005,
+     "y0": 0,
+     "x1": 0.995,
+     "y1": 0.985
+    },
+    "plates": [
+     "1กฒ 69 | ปัตตานี",
+     "1กม 4246 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 381, message 384",
+    "date": "2025-07-06",
+    "plate_seen": "1กม 4246 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 24,
    "name": "XSR 155CC BLACK PHUKET 8949",
-   "status": "file04"
+   "status": "ok",
+   "reg_no_book": "1กม 8949 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA XSR155",
+   "vin": "MLERG634111002892",
+   "reg_src": {
+    "drive_id": "1jjr-pW_xaUbdrOX49V8bnOTsmyMVM8hn",
+    "page": 2,
+    "title": "8949 XSR155 2021.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.98,
+     "y1": 1
+    }
+   },
+   "cover_src": {
+    "drive_id": "1jjr-pW_xaUbdrOX49V8bnOTsmyMVM8hn",
+    "page": 1,
+    "title": "8949 XSR155 2021.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.99,
+     "y1": 0.985
+    },
+    "plates": [
+     "1กธ 5460 | ประจวบคีรีขันธ์",
+     "1กม 8949 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 334, message 12966",
+    "date": "2026-10-19",
+    "plate_seen": "1กม 8949 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 25,
    "name": "XSR 155 GREEN",
-   "status": "file04"
+   "status": "ok",
+   "reg_no_book": "1กร 1023 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA XSR155",
+   "vin": "MLERG634111001748",
+   "reg_src": {
+    "drive_id": "1WAW92TkDkhksnmTRoS_x3DrfJ5k9XBcg",
+    "page": 2,
+    "title": "1023 XSR155 2021.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.98,
+     "y1": 1
+    }
+   },
+   "cover_src": {
+    "drive_id": "1WAW92TkDkhksnmTRoS_x3DrfJ5k9XBcg",
+    "page": 1,
+    "title": "1023 XSR155 2021.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 1,
+     "y1": 0.975
+    },
+    "plates": [
+     "1กษ 7943 | บุรีรัมย์",
+     "1กร 1023 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 455, message 12187",
+    "date": "2026-09-28",
+    "plate_seen": "1กษ 7943 บุรีรัมย์",
+    "plate_status": "earlier"
+   }
   },
   {
    "no": 26,
@@ -342,34 +1046,83 @@
    "reg_no_book": "1กฬ 8969 ภูเก็ต (Phuket)",
    "make_model": "YAMAHA XMAX",
    "vin": "MH3SH222111015946",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "1brIz80HAisJR_GXkOH1axf7uhu7L17U7",
+    "drive_id": "1A_GS8zmHhcGYc813EpOR2cy6Tdw7gMOk",
     "page": 2,
-    "title": "Green book - XMAX 300 - Phuket 8969 (prev 2392 Chai Nat).pdf",
+    "title": "8969 XMAX 2023.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
-     "x0": 0.03,
-     "y0": 0.11,
-     "x1": 0.95,
-     "y1": 0.87
+     "x0": 0,
+     "y0": 0,
+     "x1": 1,
+     "y1": 0.99
     }
    },
    "cover_src": {
-    "drive_id": "1brIz80HAisJR_GXkOH1axf7uhu7L17U7",
+    "drive_id": "1A_GS8zmHhcGYc813EpOR2cy6Tdw7gMOk",
     "page": 1,
-    "title": "Green book - XMAX 300 - Phuket 8969 (prev 2392 Chai Nat).pdf",
+    "title": "8969 XMAX 2023.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
-     "x0": 0.15,
-     "y0": 0.36,
-     "x1": 0.97,
-     "y1": 0.69
-    }
+     "x0": 0.01,
+     "y0": 0,
+     "x1": 0.975,
+     "y1": 0.995
+    },
+    "plates": [
+     "1กษ 2392 | ชัยนาท",
+     "1กฬ 8969 | ภูเก็ต"
+    ]
    },
-   "status": "ok"
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 85, message 12861",
+    "date": "2026-10-16",
+    "plate_seen": "1กฬ 8969 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 27,
    "name": "XMAX 300CC NEW BLUE PHUKET 1813",
-   "status": "file04"
+   "status": "ok",
+   "reg_no_book": "1กฬ 1813 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA XMAX",
+   "vin": "MH3SH222111004755",
+   "reg_src": {
+    "drive_id": "1OHpscx-iPrz8QZO-yDkgdOSE-EXUGIRQ",
+    "page": 2,
+    "title": "1813 XMAX 2022.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.99,
+     "y1": 1
+    }
+   },
+   "cover_src": {
+    "drive_id": "1OHpscx-iPrz8QZO-yDkgdOSE-EXUGIRQ",
+    "page": 1,
+    "title": "1813 XMAX 2022.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.97,
+     "y1": 0.975
+    },
+    "plates": [
+     "3กข 5199 | เชียงใหม่",
+     "1กฬ 1813 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 243, message 12293",
+    "date": "2026-09-30",
+    "plate_seen": "1กฬ 1813 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 28,
@@ -385,18 +1138,40 @@
    "reg_no_book": "1กร 4729 ภูเก็ต (Phuket)",
    "make_model": "YAMAHA XMAX",
    "vin": "MH3SH222111009423",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "1GngUzdlmFV1H7oRkXc52ZWzCbhOJrtkj",
+    "drive_id": "1Jf5t8A5ZmofLa081jM2X4S86yfs2gqlu",
     "page": 2,
-    "title": "4 xmaxes.pdf",
+    "title": "4729 XMAX 2023.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
      "x0": 0,
      "y0": 0,
-     "x1": 0.999,
-     "y1": 0.999
+     "x1": 0.995,
+     "y1": 0.99
     }
    },
-   "status": "ok"
+   "cover_src": {
+    "drive_id": "1Jf5t8A5ZmofLa081jM2X4S86yfs2gqlu",
+    "page": 1,
+    "title": "4729 XMAX 2023.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0.005,
+     "y0": 0,
+     "x1": 0.995,
+     "y1": 0.985
+    },
+    "plates": [
+     "1กร 4729 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 119, message 123",
+    "date": "2025-07-02",
+    "plate_seen": "1กร 4729 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 30,
@@ -404,29 +1179,44 @@
    "reg_no_book": "1กย 8676 ภูเก็ต (Phuket)",
    "make_model": "YAMAHA XMAX",
    "vin": "MH3SH222111022757",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "1CRfOw741wtBzlSE57hIE36-7eLswzIpv",
-    "page": 3,
-    "title": "Green book - XMAX 300 - Phuket 8676 (prev 9315 Bangkok).pdf",
+    "drive_id": "1cu7Jb0tATNwU8wdFh_6YsgjJfNupggzm",
+    "page": 2,
+    "title": "8676 XMAX 2023.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
-     "x0": 0.03,
-     "y0": 0.135,
-     "x1": 0.97,
-     "y1": 0.85
+     "x0": 0,
+     "y0": 0,
+     "x1": 1,
+     "y1": 0.99
     }
    },
    "cover_src": {
-    "drive_id": "1CRfOw741wtBzlSE57hIE36-7eLswzIpv",
+    "drive_id": "1cu7Jb0tATNwU8wdFh_6YsgjJfNupggzm",
     "page": 1,
-    "title": "Green book - XMAX 300 - Phuket 8676 (prev 9315 Bangkok).pdf",
+    "title": "8676 XMAX 2023.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
-     "x0": 0.03,
-     "y0": 0.315,
-     "x1": 0.97,
-     "y1": 0.685
-    }
+     "x0": 0,
+     "y0": 0,
+     "x1": 1,
+     "y1": 1
+    },
+    "plates": [
+     "4กข 2666 | ชลบุรี",
+     "1กฎ 4018 | ปทุมธานี",
+     "8ขย 9315 | กรุงเทพมหานคร",
+     "1กย 8676 | ภูเก็ต (printed over row 3, on top of 8ขย 9315 / กรุงเทพมหานคร)",
+     "1กย-8676 | ภูเก็ต (row 4, handwritten in pen)"
+    ]
    },
-   "status": "ok"
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 1190, message 13020",
+    "date": "2026-10-20",
+    "plate_seen": "8ขย 9315 กรุงเทพมหานคร",
+    "plate_status": "earlier"
+   }
   },
   {
    "no": 31,
@@ -442,29 +1232,41 @@
    "reg_no_book": "2กก 5104 ภูเก็ต (Phuket)",
    "make_model": "HONDA X-ADV",
    "vin": "JH2RH10T3PK200196",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "18NicSogtmYXc7mrjcCVkrQIFykLCVTMY",
-    "page": 1,
-    "title": "XADV 750 — was BKK 3902, now Phuket 2กก 5104 — green book.pdf",
+    "drive_id": "1-C2bFNEAhRRax2D0ZYWTMOP2BKL1MdTm",
+    "page": 2,
+    "title": "5104 X-ADV 2022.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
      "x0": 0,
-     "y0": 0.09,
-     "x1": 1,
+     "y0": 0,
+     "x1": 0.99,
      "y1": 1
     }
    },
    "cover_src": {
-    "drive_id": "18NicSogtmYXc7mrjcCVkrQIFykLCVTMY",
-    "page": 2,
-    "title": "XADV 750 — was BKK 3902, now Phuket 2กก 5104 — green book.pdf",
+    "drive_id": "1-C2bFNEAhRRax2D0ZYWTMOP2BKL1MdTm",
+    "page": 1,
+    "title": "5104 X-ADV 2022.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
      "x0": 0,
-     "y0": 0.48,
+     "y0": 0,
      "x1": 0.99,
-     "y1": 0.99
-    }
+     "y1": 0.965
+    },
+    "plates": [
+     "1กบ 3902 | ประจวบคีรีขันธ์",
+     "2กก 5104 | ภูเก็ต"
+    ]
    },
-   "status": "ok"
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 82, message 12633",
+    "date": "2026-10-12",
+    "plate_seen": "2กก 5104 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 33,
@@ -472,18 +1274,40 @@
    "reg_no_book": "1กร 4725 ภูเก็ต (Phuket)",
    "make_model": "YAMAHA XMAX",
    "vin": "MH3SH222111010176",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "1GngUzdlmFV1H7oRkXc52ZWzCbhOJrtkj",
-    "page": 1,
-    "title": "4 xmaxes.pdf",
+    "drive_id": "1ZLtXUC-6YSTDs13vLNCp_gYkDkfRMMxT",
+    "page": 2,
+    "title": "4725 XMAX 2023.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
-     "x0": 0,
+     "x0": 0.01,
      "y0": 0,
-     "x1": 0.998,
-     "y1": 0.995
+     "x1": 0.99,
+     "y1": 0.99
     }
    },
-   "status": "ok"
+   "cover_src": {
+    "drive_id": "1ZLtXUC-6YSTDs13vLNCp_gYkDkfRMMxT",
+    "page": 1,
+    "title": "4725 XMAX 2023.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0.005,
+     "y0": 0,
+     "x1": 0.965,
+     "y1": 0.975
+    },
+    "plates": [
+     "1กร 4725 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 2202, message 2204",
+    "date": "2025-10-23",
+    "plate_seen": "1กร 4725 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 34,
@@ -491,18 +1315,40 @@
    "reg_no_book": "1กม 3503 ภูเก็ต (Phuket)",
    "make_model": "HONDA CB650R",
    "vin": "MLHRH0275N5200230",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "1H4HRc5TgcjrN7vRFH4RMJWf9YHts2z0g",
-    "page": 1,
-    "title": "CB 650R — Phuket 3503 — green book.pdf",
+    "drive_id": "1smOKqy8G7DoTyMQQ7AFMsA5ODockqpkP",
+    "page": 2,
+    "title": "3503 CB650R 2022.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
      "x0": 0,
      "y0": 0,
-     "x1": 0.995,
-     "y1": 1
+     "x1": 1,
+     "y1": 0.985
     }
    },
-   "status": "ok"
+   "cover_src": {
+    "drive_id": "1smOKqy8G7DoTyMQQ7AFMsA5ODockqpkP",
+    "page": 1,
+    "title": "3503 CB650R 2022.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 1,
+     "y1": 0.99
+    },
+    "plates": [
+     "1กม 3503 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 67, message 12780",
+    "date": "2026-10-15",
+    "plate_seen": "1กม 3503 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 35,
@@ -510,29 +1356,41 @@
    "reg_no_book": "2กจ 9286 ภูเก็ต (Phuket)",
    "make_model": "HONDA X-ADV",
    "vin": "JH2RH10TXNK100030",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "1fzkjUgawl2MB6xIqbe0FjODaDsJFIS3w",
-    "page": 3,
-    "title": "Green book - X-ADV 750 - Phuket 9286 (prev 2478 Bangkok).pdf",
+    "drive_id": "1MB6QmeVEmgqHuixc5NFR-_aVVuh64pe_",
+    "page": 2,
+    "title": "9286 X-ADV 2022.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
-     "x0": 0.03,
-     "y0": 0.17,
-     "x1": 0.97,
-     "y1": 0.84
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.99,
+     "y1": 0.985
     }
    },
    "cover_src": {
-    "drive_id": "1fzkjUgawl2MB6xIqbe0FjODaDsJFIS3w",
+    "drive_id": "1MB6QmeVEmgqHuixc5NFR-_aVVuh64pe_",
     "page": 1,
-    "title": "Green book - X-ADV 750 - Phuket 9286 (prev 2478 Bangkok).pdf",
+    "title": "9286 X-ADV 2022.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
-     "x0": 0.03,
-     "y0": 0.28,
-     "x1": 0.97,
-     "y1": 0.72
-    }
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.995,
+     "y1": 0.99
+    },
+    "plates": [
+     "4ขอ 2478 | กรุงเทพมหานคร",
+     "2กจ 9286 | ภูเก็ต"
+    ]
    },
-   "status": "ok"
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 83, message 12657",
+    "date": "2026-10-13",
+    "plate_seen": "4ขอ 2478 กรุงเทพมหานคร",
+    "plate_status": "earlier"
+   }
   },
   {
    "no": 36,
@@ -540,29 +1398,41 @@
    "reg_no_book": "2กง 6004 ภูเก็ต (Phuket)",
    "make_model": "HONDA ADV350",
    "vin": "MLHNF1479R5203497",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "1ZUBo2Pf9SsSJdgwV6oDcM7WMGb9tfpKp",
-    "page": 1,
-    "title": "ADV 350 — was 8855, now Phuket 2กง 6004 — green book.pdf",
+    "drive_id": "1HZvoCma3ysi57h8LhAgvV3Mc0WKHdrXv",
+    "page": 2,
+    "title": "6004 ADV350 2024.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
      "x0": 0,
      "y0": 0,
-     "x1": 1,
+     "x1": 0.995,
      "y1": 0.995
     }
    },
    "cover_src": {
-    "drive_id": "1OPHRzShjLAeNNwzxTNTBJojjc8-oHhlM",
+    "drive_id": "1HZvoCma3ysi57h8LhAgvV3Mc0WKHdrXv",
     "page": 1,
-    "title": "Green book - ADV 350 - Phuket 6004 (prev 8855 Bangkok) - front cover.pdf",
+    "title": "6004 ADV350 2024.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
-     "x0": 0.03,
-     "y0": 0.28,
-     "x1": 0.975,
-     "y1": 0.72
-    }
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.995,
+     "y1": 0.985
+    },
+    "plates": [
+     "7ขฮ 8855 | กรุงเทพมหานคร",
+     "2กง 6004 | ภูเก็ต"
+    ]
    },
-   "status": "ok"
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 2582, message 12874",
+    "date": "2026-10-16",
+    "plate_seen": "2กง 6004 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 37,
@@ -570,25 +1440,83 @@
    "reg_no_book": "2กก 372 ภูเก็ต (Phuket)",
    "make_model": "HONDA ADV350",
    "vin": "MLHNF1471R5208757",
+   "status": "ok",
    "reg_src": {
-    "drive_id": "1nTycjItnF9PG445AEzUX-cXIJNmQ0LvU",
-    "page": 1,
-    "title": "ADV 350 — Phuket 372 — green book.pdf",
+    "drive_id": "1kliiyKpKsK6t2JnT1KpO2qe8MdEoXwpK",
+    "page": 2,
+    "title": "372 ADV350 2025.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
     "bbox": {
      "x0": 0,
      "y0": 0,
-     "x1": 0.985,
+     "x1": 0.955,
      "y1": 1
     }
    },
-   "status": "ok"
+   "cover_src": {
+    "drive_id": "1kliiyKpKsK6t2JnT1KpO2qe8MdEoXwpK",
+    "page": 1,
+    "title": "372 ADV350 2025.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.975,
+     "y1": 0.985
+    },
+    "plates": [
+     "2กก 372 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 2583, message 2594",
+    "date": "2025-11-11",
+    "plate_seen": "2กก 372 ภูเก็ต",
+    "plate_status": "current"
+   }
   },
   {
    "no": 38,
    "name": "XMAX 300CC NEW BLUE-3 PHUKET 4724",
-   "status": "file04"
+   "status": "ok",
+   "reg_no_book": "1กร 4724 ภูเก็ต (Phuket)",
+   "make_model": "YAMAHA XMAX",
+   "vin": "MH3SH222111010181",
+   "reg_src": {
+    "drive_id": "1-1-HVKRC3i0ZnE7lAXZGEjb8Jzj2lkUz",
+    "page": 2,
+    "title": "4724 XMAX 2023.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 0.97,
+     "y1": 1
+    }
+   },
+   "cover_src": {
+    "drive_id": "1-1-HVKRC3i0ZnE7lAXZGEjb8Jzj2lkUz",
+    "page": 1,
+    "title": "4724 XMAX 2023.pdf",
+    "folder": "Для Филипа (vasilenko0505, 10.10.2026)",
+    "bbox": {
+     "x0": 0,
+     "y0": 0,
+     "x1": 1,
+     "y1": 0.985
+    },
+    "plates": [
+     "1กร 4724 | ภูเก็ต"
+    ]
+   },
+   "photo": {
+    "source": "Telegram, การบำรุงรักษา (servicing forum), topic 308, message 310",
+    "date": "2025-07-03",
+    "plate_seen": "1กร 4724 ภูเก็ต",
+    "plate_status": "current"
+   }
   }
  ],
- "_about": "Annex 4 to the Long-Term Motorcycle Rental Agreement of 20.10.2026: what is attached for each of the 38 bikes of Annex 1. reg_src/cover_src = Drive PDF + page (1-based) verified on 20.10.2026 by a blind second reading; status: ok / file04 (page only in the >10 MB summary scan 04) / owner_will_provide (no book page with Philipp yet: #23 no book, #28 and #31 not re-registered).",
+ "_about": "Annex 4 to the Long-Term Motorcycle Rental Agreement of 20.10.2026: what is attached for each of the 38 bikes of Annex 1. cover_src/reg_src = Drive PDF + page (1-based): book scans of 10.10.2026 from the shared folder \"Для Филипа\" (p1 cover, p2 current registration page); #22 from the 21.09.2026 accounting set (no cover scan). photo = servicing-forum photo, plate checked against the book. status: ok / owner_will_provide (#28, #31 — still registered to the previous Thai owners).",
  "_names": "Names follow Annex 1 of the contract; typos normalised: Cyrillic С → Latin C (#7, #8, #24), #24 overlapping glyph read as CC, #7 plate printed over two lines."
 }

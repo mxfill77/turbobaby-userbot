@@ -236,6 +236,26 @@ def build(amap, img_dir, font_dir, draft):
     return "\n".join(out)
 
 
+def render_page(pdf, page, stem):
+    """Page → RGB image through a cached PNG, 2200 px on the long side (scans embedded at 72 ppi would
+    otherwise render to ~4500 px at a fixed dpi). The render goes to `<stem>.tmp.png` and is
+    renamed only when complete: a run killed mid-render (timeout) must not leave a truncated PNG
+    that the next run reuses as finished. A cached PNG that does not load is rendered again."""
+    from PIL import Image
+    png = stem + ".png"
+    if os.path.exists(png):
+        try:
+            im = Image.open(png)
+            im.load()
+            return im.convert("RGB")
+        except OSError:
+            pass
+    subprocess.run(["pdftoppm", "-scale-to", "2200", "-f", str(page), "-l", str(page),
+                    "-png", "-singlefile", pdf, stem + ".tmp"], check=True)
+    os.replace(stem + ".tmp.png", png)
+    return Image.open(png).convert("RGB")
+
+
 def prepare(amap, src_dir, img_dir, work_dir, pad=0.015, fuzz=18, margin=12, long_side=(1500, 1900)):
     """Book pages from the Drive PDFs → cropped JPEGs named <NN>_cover.jpg / <NN>_reg.jpg.
 
@@ -255,10 +275,7 @@ def prepare(amap, src_dir, img_dir, work_dir, pad=0.015, fuzz=18, margin=12, lon
                 print("no source for #%d %s: %s" % (b["no"], kind, pdf))
                 continue
             stem = os.path.join(work_dir, "%s_p%d" % (s["drive_id"], s["page"]))
-            if not os.path.exists(stem + ".png"):
-                subprocess.run(["pdftoppm", "-r", "200", "-f", str(s["page"]), "-l", str(s["page"]),
-                                "-png", "-singlefile", pdf, stem], check=True)
-            im = Image.open(stem + ".png").convert("RGB")
+            im = render_page(pdf, s["page"], stem)
             w, h = im.size
             bb = s.get("bbox") or {"x0": 0, "y0": 0, "x1": 1, "y1": 1}
             px, py = pad * (bb["x1"] - bb["x0"]), pad * (bb["y1"] - bb["y0"])
