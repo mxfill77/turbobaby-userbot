@@ -31,6 +31,12 @@ import unittest
 
 import srv_delivery as sd
 
+# 22.10.2026: по умолчанию доставка не трогает `main` (его везёт сам сервер через гейт — sd.SKIP). Наборы ниже
+# писались под прежнюю форму «main тоже доставляется» и проверяют механику доставки, поэтому идут с пустым SKIP;
+# новое умолчание держит класс SkipServerOwnBranches в конце файла.
+DEFAULT_SKIP = sd.SKIP
+sd.SKIP = frozenset()
+
 REPO = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(REPO, "srv_delivery.py")
 
@@ -758,6 +764,53 @@ class TestWiredIntoTheDaemon(unittest.TestCase):
     def test_test_flag_keeps_the_cli_off_the_wire(self):
         src = _read(SRC)
         self.assertIn("TURBOBABY_TEST_LOGS", src)
+
+
+class SkipServerOwnBranches(unittest.TestCase):
+    """22.10.2026: `main` сервер пушит сам через pre-push гейт; доставка, попавшая между его перемоткой и гейтом,
+    вывозила непроверенный коммит (1ce7df9 — 01:32:24Z, 21d16ef — 05:44:13Z). Умолчание — `main` не трогаем."""
+
+    def setUp(self):
+        self.prev = sd.SKIP
+        sd.SKIP = DEFAULT_SKIP
+
+    def tearDown(self):
+        sd.SKIP = self.prev
+
+    def test_default_skips_main(self):
+        self.assertEqual(frozenset({"main"}), DEFAULT_SKIP)
+
+    def test_main_ahead_is_not_delivered_other_branches_are(self):
+        facts = {"branches": {
+            "main": {"srv_head": SRV_HEADS["main"], "hub_head": HUB_HEADS["main"],
+                     "hub_in_srv": True, "srv_in_hub": False, "count": 3},
+            "rebuild-main": {"srv_head": SRV_HEADS["rebuild-main"], "hub_head": HUB_HEADS["rebuild-main"],
+                             "hub_in_srv": True, "srv_in_hub": False, "count": 1},
+        }}
+        self.assertEqual(["rebuild-main"], [n for n, _s, _h in sd.plan_pushes(facts)])
+        kind, words = sd.decide_all(facts)
+        self.assertEqual(sd.DELIVER, kind)
+        self.assertNotIn("main,", words)
+
+    def test_only_main_means_nothing_to_deliver(self):
+        facts = {"branches": {"main": {"srv_head": SRV_HEADS["main"], "hub_head": HUB_HEADS["main"],
+                                       "hub_in_srv": True, "srv_in_hub": False}}}
+        self.assertEqual([], sd.plan_pushes(facts))
+        self.assertEqual(sd.NOTHING, sd.decide_all(facts)[0])
+
+    def test_conflict_on_main_does_not_stop_other_branches(self):
+        facts = {"branches": {
+            "main": {"srv_head": SRV_HEADS["main"], "hub_head": HUB_HEADS["main"],
+                     "hub_in_srv": False, "srv_in_hub": False},
+            "rebuild-main": {"srv_head": SRV_HEADS["rebuild-main"], "hub_head": HUB_HEADS["rebuild-main"],
+                             "hub_in_srv": True, "srv_in_hub": False},
+        }}
+        self.assertEqual(sd.DELIVER, sd.decide_all(facts)[0])
+
+    def test_single_form_main_is_skipped(self):
+        facts = {"srv_head": SRV, "hub_head": HUB, "hub_in_srv": True, "srv_in_hub": False}
+        self.assertEqual([], sd.plan_pushes(facts))
+        self.assertEqual(sd.NOTHING, sd.decide_all(facts)[0])
 
 
 if __name__ == "__main__":

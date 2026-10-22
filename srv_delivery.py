@@ -105,6 +105,14 @@ STATE_FILE = os.path.join(WORK, "state.json")
 ART_DIR = os.environ.get("SRV_DELIVERY_ART_DIR", os.path.join(REPO, "docs", "artifacts", "srv"))
 TMP_ART_DIR = os.path.join(WORK, "artifacts")   # где их держала выкладка 03.09 — оттуда добираем
 
+# ВЕТКИ, КОТОРЫЕ СЕРВЕР ВЕЗЁТ САМ (22.10.2026, слово владельца «делай» на находку К3). С 14.10 сервер пушит `main`
+# сам — через pre-push гейт (deploy/hooks/pre-push → gate.py). Выкладка сервера сначала перематывает живое `main`,
+# потом ~18 мин гоняет гейт и только потом пушит; доставка, попавшая в это окно, вывозила НЕПРОВЕРЕННЫЙ коммит в
+# общий репозиторий в обход гейта (замер 22.10: 1ce7df9 — push 01:32:24Z при гейте, позже красном 1/406; 21d16ef —
+# 05:44:13Z, за 5 мин до своего зелёного push; оба видны в /var/log/ssh_commands.log как пара git-upload-pack с ПК).
+# Такие ветки доставка не судит и не трогает. Пусто (`SRV_DELIVERY_SKIP=`) — прежнее поведение.
+SKIP = frozenset(b.strip() for b in os.environ.get("SRV_DELIVERY_SKIP", "main").split(",") if b.strip())
+
 EVERY_MIN = int(os.environ.get("SRV_DELIVERY_EVERY_MIN", "30"))
 REPEAT_H = int(os.environ.get("SRV_DELIVERY_REPEAT_H", "6"))
 GIT_TIMEOUT = int(os.environ.get("SRV_DELIVERY_TIMEOUT", "180"))
@@ -173,9 +181,14 @@ def decide_all(facts):
     запрета которого в задании стои́т слово «остановиться». Ветки, которая есть в общем
     репозитории и которой нет на сервере, здесь нет ни в одном разрезе: доставка её не судит и
     не трогает."""
-    branches = facts.get("branches")
-    if not branches:
+    raw = facts.get("branches")
+    if not raw:
+        if BRANCH in SKIP:
+            return NOTHING, u"ветку %s сервер везёт сам (через свой гейт) — доставка её не трогает" % BRANCH
         return decide(facts)        # одиночная форма — ровно как была до этапа 3
+    branches = {n: b for n, b in raw.items() if n not in SKIP}
+    if not branches:
+        return NOTHING, u"на сервере только ветки, которые он везёт сам (%s) — доставке нечего" % u", ".join(sorted(raw))
 
     per = {}
     for name in sorted(branches):
@@ -215,9 +228,9 @@ def plan_pushes(facts):
     иначе «мы не трогаем чужие ветки» проверялось бы рассказом, а не разбором плана."""
     branches = facts.get("branches")
     if not branches:
-        return [(BRANCH, facts.get("srv_head"), facts.get("hub_head"))]
+        return [] if BRANCH in SKIP else [(BRANCH, facts.get("srv_head"), facts.get("hub_head"))]
     out = []
-    for name in sorted(branches):
+    for name in sorted(n for n in branches if n not in SKIP):
         b = branches[name]
         if decide(b)[0] == DELIVER:
             out.append((name, b.get("srv_head"), b.get("hub_head")))
