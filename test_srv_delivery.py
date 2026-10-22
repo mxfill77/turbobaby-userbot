@@ -31,11 +31,11 @@ import unittest
 
 import srv_delivery as sd
 
-# 22.10.2026: по умолчанию доставка не трогает `main` (его везёт сам сервер через гейт — sd.SKIP). Наборы ниже
+# 22.10.2026: доставка БЕЗУСЛОВНО не трогает `main` (его везёт сам сервер через гейт — sd.SERVER_OWN). Наборы ниже
 # писались под прежнюю форму «main тоже доставляется» и проверяют механику доставки, поэтому идут с пустым SKIP;
 # новое умолчание держит класс SkipServerOwnBranches в конце файла.
-DEFAULT_SKIP = sd.SKIP
-sd.SKIP = frozenset()
+DEFAULT_OWN = sd.SERVER_OWN
+sd.SERVER_OWN, sd.SKIP = frozenset(), frozenset()   # шов теста механики; в коде SERVER_OWN не настраивается
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(REPO, "srv_delivery.py")
@@ -771,14 +771,15 @@ class SkipServerOwnBranches(unittest.TestCase):
     вывозила непроверенный коммит (1ce7df9 — 01:32:24Z, 21d16ef — 05:44:13Z). Умолчание — `main` не трогаем."""
 
     def setUp(self):
-        self.prev = sd.SKIP
-        sd.SKIP = DEFAULT_SKIP
+        self.prev = (sd.SERVER_OWN, sd.SKIP)
+        sd.SERVER_OWN, sd.SKIP = DEFAULT_OWN, frozenset()
 
     def tearDown(self):
-        sd.SKIP = self.prev
+        sd.SERVER_OWN, sd.SKIP = self.prev
 
     def test_default_skips_main(self):
-        self.assertEqual(frozenset({"main"}), DEFAULT_SKIP)
+        self.assertEqual(frozenset({"main"}), DEFAULT_OWN)
+        self.assertIn("main", sd.skipped())
 
     def test_main_ahead_is_not_delivered_other_branches_are(self):
         facts = {"branches": {
@@ -811,6 +812,28 @@ class SkipServerOwnBranches(unittest.TestCase):
         facts = {"srv_head": SRV, "hub_head": HUB, "hub_in_srv": True, "srv_in_hub": False}
         self.assertEqual([], sd.plan_pushes(facts))
         self.assertEqual(sd.NOTHING, sd.decide_all(facts)[0])
+
+    def _ahead(self):
+        return {"branches": {
+            "main": {"srv_head": SRV_HEADS["main"], "hub_head": HUB_HEADS["main"],
+                     "hub_in_srv": True, "srv_in_hub": False},
+            "rebuild-main": {"srv_head": SRV_HEADS["rebuild-main"], "hub_head": HUB_HEADS["rebuild-main"],
+                             "hub_in_srv": True, "srv_in_hub": False},
+            "wip-x": {"srv_head": OLD, "hub_head": HUB, "hub_in_srv": True, "srv_in_hub": False},
+        }}
+
+    def test_empty_override_cannot_bring_main_back(self):
+        """Явный пустой SRV_DELIVERY_SKIP — main всё равно не едет, другая ветка — обычный FF."""
+        sd.SKIP = frozenset()
+        self.assertEqual(["rebuild-main", "wip-x"], [n for n, _s, _h in sd.plan_pushes(self._ahead())])
+
+    def test_override_without_main_only_adds(self):
+        """Список без main (`SRV_DELIVERY_SKIP=wip-x`) только ДОБАВЛЯЕТ исключение: main и wip-x не едут."""
+        sd.SKIP = frozenset({"wip-x"})
+        self.assertEqual(["rebuild-main"], [n for n, _s, _h in sd.plan_pushes(self._ahead())])
+        kind, words = sd.decide_all(self._ahead())
+        self.assertEqual(sd.DELIVER, kind)
+        self.assertIn("rebuild-main", words)
 
 
 if __name__ == "__main__":

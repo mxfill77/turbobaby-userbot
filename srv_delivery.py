@@ -110,8 +110,15 @@ TMP_ART_DIR = os.path.join(WORK, "artifacts")   # где их держала в�
 # потом ~18 мин гоняет гейт и только потом пушит; доставка, попавшая в это окно, вывозила НЕПРОВЕРЕННЫЙ коммит в
 # общий репозиторий в обход гейта (замер 22.10: 1ce7df9 — push 01:32:24Z при гейте, позже красном 1/406; 21d16ef —
 # 05:44:13Z, за 5 мин до своего зелёного push; оба видны в /var/log/ssh_commands.log как пара git-upload-pack с ПК).
-# Такие ветки доставка не судит и не трогает. Пусто (`SRV_DELIVERY_SKIP=`) — прежнее поведение.
-SKIP = frozenset(b.strip() for b in os.environ.get("SRV_DELIVERY_SKIP", "main").split(",") if b.strip())
+# Такие ветки доставка не судит и не трогает. `main` исключён БЕЗУСЛОВНО (SERVER_OWN, Codex TB-AGENTCTX-2210-POSTREADBACK-
+# VERDICT): `SRV_DELIVERY_SKIP` лишь ДОБАВЛЯЕТ исключения и вернуть `main` не может — пустой или список без main тоже.
+SERVER_OWN = frozenset({"main"})
+SKIP = frozenset(b.strip() for b in os.environ.get("SRV_DELIVERY_SKIP", "").split(",") if b.strip())
+
+
+def skipped():
+    """Ветки вне доставки: всегда SERVER_OWN плюс добавленные окружением."""
+    return SERVER_OWN | SKIP
 
 EVERY_MIN = int(os.environ.get("SRV_DELIVERY_EVERY_MIN", "30"))
 REPEAT_H = int(os.environ.get("SRV_DELIVERY_REPEAT_H", "6"))
@@ -183,10 +190,10 @@ def decide_all(facts):
     не трогает."""
     raw = facts.get("branches")
     if not raw:
-        if BRANCH in SKIP:
+        if BRANCH in skipped():
             return NOTHING, u"ветку %s сервер везёт сам (через свой гейт) — доставка её не трогает" % BRANCH
         return decide(facts)        # одиночная форма — ровно как была до этапа 3
-    branches = {n: b for n, b in raw.items() if n not in SKIP}
+    branches = {n: b for n, b in raw.items() if n not in skipped()}
     if not branches:
         return NOTHING, u"на сервере только ветки, которые он везёт сам (%s) — доставке нечего" % u", ".join(sorted(raw))
 
@@ -228,9 +235,9 @@ def plan_pushes(facts):
     иначе «мы не трогаем чужие ветки» проверялось бы рассказом, а не разбором плана."""
     branches = facts.get("branches")
     if not branches:
-        return [] if BRANCH in SKIP else [(BRANCH, facts.get("srv_head"), facts.get("hub_head"))]
+        return [] if BRANCH in skipped() else [(BRANCH, facts.get("srv_head"), facts.get("hub_head"))]
     out = []
-    for name in sorted(n for n in branches if n not in SKIP):
+    for name in sorted(n for n in branches if n not in skipped()):
         b = branches[name]
         if decide(b)[0] == DELIVER:
             out.append((name, b.get("srv_head"), b.get("hub_head")))
