@@ -825,5 +825,272 @@ class TestReceiptIsNotTheFact(unittest.TestCase):
         self.assertIn(first_doc.splitlines()[0].strip(), self.doc)
 
 
+# ─────────── ДЕРЕВО-СПУТНИК ПИШЕТ ЧЕРЕЗ ГЛАВНОЕ ДЕРЕВО (класс 25.10.2026) ───────────
+# Живой случай: сессия в `.claude/worktrees/<имя>` (linked worktree, `.env` туда не попадает)
+# писала журнал, писатель клал строку в спул СПУТНИКА со словами «строка не потеряна», а досылает
+# он только спул рядом с собой — 4 строки в 2 спутниках из 7, среди них ASK владельцу 24.10.
+# Деревья здесь временные, раскладка — ровно живая: `.git` спутника — ФАЙЛ «gitdir: <прямые
+# слэши>», в том каталоге `commondir` = «../..» (сняты с этого же репо 25.10).
+
+def _mk_main(root, writer=True):
+    """Главное дерево: КАТАЛОГ .git и писатель в корне."""
+    os.makedirs(os.path.join(root, ".git", "worktrees"))
+    if writer:
+        open(os.path.join(root, "cowork_log_append.py"), "w").close()
+    return root
+
+
+def _mk_satellite(main, name, rel_gitdir=False, commondir="../.."):
+    """Спутник под .claude/worktrees: ФАЙЛ .git → <main>/.git/worktrees/<name>/commondir."""
+    wt = os.path.join(main, ".claude", "worktrees", name)
+    gd = os.path.join(main, ".git", "worktrees", name)
+    os.makedirs(wt)
+    os.makedirs(gd)
+    with open(os.path.join(gd, "commondir"), "w", encoding="utf-8") as f:
+        f.write(commondir + "\n")
+    target = os.path.relpath(gd, wt) if rel_gitdir else gd
+    with open(os.path.join(wt, ".git"), "w", encoding="utf-8") as f:
+        f.write("gitdir: " + target.replace(os.sep, "/") + "\n")
+    return wt
+
+
+def _same(a, b):
+    return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
+class TestMainTreeRoot(unittest.TestCase):
+    """Откуда писатель берёт конфиг и спул: главное дерево — ответ git, а не догадка по пути."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.main = _mk_main(os.path.join(self._tmp.name, "repo"))
+
+    def test_main_tree_is_its_own_root(self):
+        self.assertEqual(cla.main_tree_root(self.main), (self.main, None))
+
+    def test_satellite_resolves_to_main_tree(self):
+        wt = _mk_satellite(self.main, "telegram-whatsapp-access-check-a2d3e2")
+        root, why = cla.main_tree_root(wt)
+        self.assertIsNone(why)
+        self.assertTrue(_same(root, self.main))           # ← НЕ сам спутник
+
+    def test_relative_gitdir_also_resolves(self):
+        # git ≥ 2.48 умеет писать путь gitdir относительным (worktree.useRelativePaths)
+        wt = _mk_satellite(self.main, "rel", rel_gitdir=True)
+        root, why = cla.main_tree_root(wt)
+        self.assertIsNone(why)
+        self.assertTrue(_same(root, self.main))
+
+    def test_live_format_matches_git_rev_parse(self):
+        """ЖИВОЙ ФОРМАТ: ответ функции для ЭТОГО дерева равен ответу git. Тест идёт и из главного
+        дерева (корень = оно само), и из спутника (корень = главное)."""
+        import shutil
+        import subprocess
+        if not shutil.which("git") or not os.path.exists(os.path.join(cla.HERE, ".git")):
+            self.skipTest("git недоступен или дерево вне git")
+        out = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=cla.HERE,
+                             capture_output=True, text=True, timeout=30)
+        if out.returncode != 0:
+            self.skipTest("git rev-parse не ответил: " + out.stderr.strip()[:200])
+        common = out.stdout.strip()
+        if not os.path.isabs(common):
+            common = os.path.join(cla.HERE, common)
+        root, why = cla.main_tree_root(cla.HERE)
+        self.assertIsNone(why)
+        self.assertTrue(_same(root, os.path.dirname(os.path.normpath(common))), (root, common))
+
+    def test_copy_outside_git_keeps_old_behavior(self):
+        plain = os.path.join(self._tmp.name, "копия")
+        os.makedirs(plain)
+        self.assertEqual(cla.main_tree_root(plain), (plain, None))
+
+    def test_broken_satellite_under_worktrees_refuses(self):
+        wt = os.path.join(self.main, ".claude", "worktrees", "без-git")
+        os.makedirs(wt)
+        root, why = cla.main_tree_root(wt)
+        self.assertIsNone(root)
+        self.assertIn(".claude/worktrees", why)
+
+    def test_git_file_without_gitdir_refuses(self):
+        wt = _mk_satellite(self.main, "кривой")
+        with open(os.path.join(wt, ".git"), "w", encoding="utf-8") as f:
+            f.write("не то\n")
+        self.assertIsNone(cla.main_tree_root(wt)[0])
+
+    def test_missing_commondir_refuses(self):
+        wt = _mk_satellite(self.main, "без-commondir")
+        os.remove(os.path.join(self.main, ".git", "worktrees", "без-commondir", "commondir"))
+        root, why = cla.main_tree_root(wt)
+        self.assertIsNone(root)
+        self.assertIn("не прочитан", why)
+
+    def test_common_dir_not_dot_git_refuses(self):
+        # общий каталог — голый репозиторий: «главного дерева» с .env рядом у него нет
+        wt = _mk_satellite(self.main, "голый", commondir="../../../bare")
+        root, why = cla.main_tree_root(wt)
+        self.assertIsNone(root)
+        self.assertIn("не «.git»", why)
+
+    def test_main_without_writer_refuses(self):
+        other = _mk_main(os.path.join(self._tmp.name, "чужой"), writer=False)
+        wt = _mk_satellite(other, "x")
+        root, why = cla.main_tree_root(wt)
+        self.assertIsNone(root)
+        self.assertIn("нет писателя", why)
+
+    def test_under_test_writer_stays_in_own_tree(self):
+        """Под тестом писатель к главному дереву НЕ тянется: гейт в спутнике до 25.10 не видел ни
+        боевого конфига, ни боевого спула, и правка не смеет это расширить."""
+        self.assertTrue(_same(cla.ROOT, cla.HERE))
+        self.assertFalse(cla.SATELLITE)
+        self.assertTrue(_same(os.path.dirname(cla.ENV_PATH), cla.HERE))
+        self.assertTrue(_same(os.path.dirname(cla.SPOOL_PATH), cla.HERE))
+
+
+class TestSatelliteInMain(unittest.TestCase):
+    """main() спутника: строка уходит в мозг по конфигу ГЛАВНОГО дерева, сбой — в спул ГЛАВНОГО,
+    а не найденное главное дерево — громкий отказ без спула. Сети нет, мост — живой мок."""
+
+    LINE = "ASK Dispatch 24.10: черновик в Delivery не отправлен — отправить?"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.main = _mk_main(os.path.join(self._tmp.name, "repo"))
+        self.wt = _mk_satellite(self.main, "telegram-whatsapp-access-check-a2d3e2")
+        names = ("ROOT", "ROOT_REFUSAL", "SATELLITE", "ENV_PATH", "SPOOL_PATH",
+                 "LOCAL_SPOOL_PATH", "LEDGER_PATH", "SPILL_DIR", "get", "post", "load_env")
+        saved = {n: getattr(cla, n) for n in names}
+        saved_argv = sys.argv
+        self.addCleanup(lambda: [setattr(cla, n, v) for n, v in saved.items()])
+        self.addCleanup(lambda: setattr(sys, "argv", saved_argv))
+        main_env = os.path.join(self.main, ".env")
+        cla.ROOT, cla.ROOT_REFUSAL, cla.SATELLITE = self.main, None, True
+        cla.ENV_PATH = main_env
+        cla.SPOOL_PATH = os.path.join(self.main, "cowork_log.spool")
+        cla.LOCAL_SPOOL_PATH = os.path.join(self.wt, "cowork_log.spool")
+        cla.LEDGER_PATH = os.path.join(self._tmp.name, "ledger.jsonl")
+        cla.SPILL_DIR = os.path.join(self.main, "docs", "artifacts", "journal")
+        # Конфиг есть ТОЛЬКО у главного дерева: спроси писатель файл спутника — получит пусто.
+        cla.load_env = lambda p: ({"BRIDGE_URL": "https://bridge.test/exec", "BRIDGE_TOKEN": "TOK"}
+                                  if _same(p, main_env) else {})
+        self.doc = "A" * 3000
+        self.writes = []
+        cla.get = lambda url, params: {"ok": True, "name": "cowork_log", "text": self.doc}
+
+        def fake_post(url, payload):
+            self.writes.append(dict(payload))
+            self.doc = payload["text"]                    # живой мост: запись меняет док
+            return {"ok": True, "chars": len(payload["text"])}
+
+        cla.post = fake_post
+        sys.argv = ["cowork_log_append.py", self.LINE]
+
+    def _run(self):
+        err, out = io.StringIO(), io.StringIO()
+        exc = None
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            try:
+                cla.main()
+            except SystemExit as e:
+                exc = e
+        return exc, out.getvalue(), err.getvalue()
+
+    def test_line_reaches_doc_through_main_tree(self):
+        exc, out, _ = self._run()
+        self.assertIsNone(exc)
+        self.assertEqual(len(self.writes), 1)
+        self.assertIn("черновик в Delivery не отправлен", self.writes[0]["text"].split("  \n")[0])
+        self.assertIn("через главное дерево", out)        # путь назван вслух
+        self.assertFalse(os.path.exists(cla.LOCAL_SPOOL_PATH))
+
+    def test_bridge_failure_spools_into_main_tree(self):
+        cla.get = lambda url, params: (_ for _ in ()).throw(_http(500))
+        exc, _, err = self._run()
+        self.assertEqual(exc.code, 1)
+        self.assertEqual(len(cla.spool_read(cla.SPOOL_PATH)), 1)   # ← главный спул: его дошлют
+        self.assertFalse(os.path.exists(cla.LOCAL_SPOOL_PATH))      # ← спутник чист
+        self.assertIn(cla.SPOOL_PATH, err)
+
+    def test_stray_satellite_spool_is_named_not_sent_not_moved(self):
+        """Спул, оставленный в спутнике до 25.10, досылает или переносит ВЛАДЕЛЕЦ. Писатель его
+        только называет — и не трогает ни строкой."""
+        stray = ["DONE 2026-10-24 16:52 UTC: старая строка спутника",
+                 "ASK 2026-10-24 21:26 UTC: старый вопрос спутника"]
+        with open(cla.LOCAL_SPOOL_PATH, "w", encoding="utf-8") as f:
+            f.write("\n".join(stray) + "\n")
+        exc, _, err = self._run()
+        self.assertIsNone(exc)
+        self.assertIn("ВНИМАНИЕ", err)
+        self.assertIn("2 стр.", err)
+        self.assertNotIn("старая строка спутника", self.doc)        # не дослано
+        self.assertEqual(cla.spool_read(cla.LOCAL_SPOOL_PATH), stray)  # не тронуто
+
+    def test_unresolved_satellite_refuses_loudly_without_spool(self):
+        cla.ROOT, cla.ROOT_REFUSAL, cla.SATELLITE = None, "каталог git спутника не прочитан", False
+        sys.argv = ["cowork_log_append.py", LIVE_LONG]               # и тело не выносим
+        exc, _, err = self._run()
+        self.assertEqual(exc.code, 2)                                # ≠ 1 «отложено»
+        self.assertIn("НЕ ЗАПИСАНО И НЕ ОТЛОЖЕНО", err)
+        self.assertIn("главного дерева", err)
+        self.assertIn("greeting-guard-notes", err)                   # строка видна целиком
+        self.assertEqual(self.writes, [])
+        self.assertFalse(os.path.exists(cla.SPOOL_PATH))
+        self.assertFalse(os.path.exists(cla.LOCAL_SPOOL_PATH))
+        self.assertFalse(os.path.exists(cla.SPILL_DIR))
+
+
+class TestSatelliteWiring(unittest.TestCase):
+    """ПРОВОДКА ЦЕЛИКОМ — живым способом запуска: `python <спутник>/cowork_log_append.py "…"`
+    отдельным процессом БЕЗ тест-признака, на временных деревьях. Моста нет вовсе: у главного
+    дерева конфиг без BRIDGE_*, поэтому писатель идёт веткой «нет конфига» и кладёт строку в
+    спул — вопрос теста ровно в том, ЧЕЙ это спул и ЧЕЙ конфиг он спросил."""
+
+    DEPS = ("cowork_log_append.py", "io_utf8.py", "bridge_http.py", "log_setup.py")
+    # Ребёнку — МИНИМУМ окружения, а не копия нашего: ни тест-признака (иначе писатель не пойдёт
+    # к главному дереву), ни чужих переменных, которым незачем доходить до писателя журнала.
+    KEEP = ("SYSTEMROOT", "WINDIR", "PATH", "TEMP", "TMP")
+
+    def setUp(self):
+        import shutil
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.main = _mk_main(os.path.join(self._tmp.name, "repo"), writer=False)
+        self.wt = _mk_satellite(self.main, "affectionate-cray-c81af0")
+        src = os.path.dirname(os.path.abspath(cla.__file__))
+        for tree in (self.main, self.wt):
+            for name in self.DEPS:
+                shutil.copy(os.path.join(src, name), os.path.join(tree, name))
+        with open(os.path.join(self.main, ".env"), "w", encoding="utf-8") as f:
+            f.write("SOME_FLAG=1\n")                                  # конфиг есть, моста нет
+
+    def _child(self, tree, text):
+        import subprocess
+        env = {k: os.environ[k] for k in self.KEEP if k in os.environ}
+        env["PYTHONIOENCODING"] = "utf-8"
+        return subprocess.run([sys.executable, os.path.join(tree, "cowork_log_append.py"), text],
+                              cwd=tree, env=env, capture_output=True, timeout=60,
+                              encoding="utf-8", errors="replace")
+
+    def test_satellite_line_lands_in_main_spool(self):
+        r = self._child(self.wt, "DONE проверка спутника 25.10")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        main_spool = os.path.join(self.main, "cowork_log.spool")
+        got = cla.spool_read(main_spool)
+        self.assertEqual(len(got), 1, r.stderr)
+        self.assertIn("проверка спутника 25.10", got[0])
+        self.assertFalse(os.path.exists(os.path.join(self.wt, "cowork_log.spool")))
+        self.assertIn(os.path.join(self.main, ".env"), r.stderr)    # спросил конфиг ГЛАВНОГО
+
+    def test_broken_satellite_child_exits_2_and_spools_nothing(self):
+        os.remove(os.path.join(self.wt, ".git"))
+        r = self._child(self.wt, "DONE проверка сломанного спутника")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("НЕ ЗАПИСАНО И НЕ ОТЛОЖЕНО", r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.main, "cowork_log.spool")))
+        self.assertFalse(os.path.exists(os.path.join(self.wt, "cowork_log.spool")))
+
+
 if __name__ == "__main__":
     unittest.main()
