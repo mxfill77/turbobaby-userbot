@@ -17,9 +17,100 @@ import io_utf8   # переключатель stdout/stderr в UTF-8 (класс
 import bridge_http   # durable-транспорт: ручной обход редиректа моста (класс 02.08.2026)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ENV_PATH = os.path.join(HERE, ".env")
+
+
+# ─────────── ДЕРЕВО-СПУТНИК ПИШЕТ ЧЕРЕЗ ГЛАВНОЕ ДЕРЕВО (класс 25.10.2026) ───────────
+# Сессии Claude Desktop работают в `.claude/worktrees/<имя>` — linked worktree того же репо. Туда
+# попадают только файлы из git, а `.env` под `.gitignore`, поэтому писатель спутника не находил
+# конфига и клал строку в СВОЙ спул. Досылает же писатель только спул рядом с собой, а боевые
+# вызовы (демон, хук SessionEnd) идут из главного дерева — строку спутника не дошлёт НИКТО. Живой
+# замер 25.10: 2 спутника из 7 со спулом, 4 строки (среди них ASK владельцу 24.10), плюс одно
+# осиротевшее тело в `docs/artifacts/journal` спутника — и сообщение «строка не потеряна» при
+# каждой. Поэтому конфиг, спул, реестр и тела берём у ГЛАВНОГО дерева.
+#
+# Главное дерево узнаём ФАЙЛАМИ git, а не вызовом `git rev-parse --git-common-dir`: это ровно его
+# ответ (`.git` спутника — файл «gitdir: …», в том каталоге `commondir` ведёт к общему `.git`),
+# но без процесса — писатель живёт и detached-ребёнком хука, где git в PATH никто не обещал.
+# Тест сверяет ответ с живым `git rev-parse` (правило: проверка повторяет живой формат).
+# Не узнали, а дерево ЯВНО спутник — ГРОМКИЙ отказ без спула (main): спул, который никто не
+# досылает, — та самая тихая потеря с честным лицом.
+_WT_MARK = os.sep + os.path.join(".claude", "worktrees") + os.sep
+
+
+def main_tree_root(here):
+    """Корень ГЛАВНОГО дерева для писателя, лежащего в here. → (корень, None) | (None, почему).
+
+    • here — главное дерево (`.git` — каталог)        → (here, None);
+    • here — linked worktree (`.git` — файл gitdir:) → (корень главного, None);
+    • `.git` нет вовсе (копия вне git)                → (here, None), как было до 25.10 —
+      кроме пути под `.claude/worktrees/`: там это сломанный спутник, а не копия → отказ."""
+    dot_git = os.path.join(here, ".git")
+    if os.path.isdir(dot_git):
+        return here, None
+    if not os.path.isfile(dot_git):
+        if os.path.normcase(_WT_MARK) in os.path.normcase(os.path.abspath(here)) + os.sep:
+            return None, "дерево лежит под .claude/worktrees, но файла .git в нём нет"
+        return here, None
+    try:
+        with open(dot_git, encoding="utf-8") as f:
+            first = f.readline().strip()
+        if not first.lower().startswith("gitdir:"):
+            return None, "файл .git без строки «gitdir:»"
+        gitdir = first[len("gitdir:"):].strip()
+        if not os.path.isabs(gitdir):
+            gitdir = os.path.join(here, gitdir)
+        with open(os.path.join(gitdir, "commondir"), encoding="utf-8") as f:
+            common = f.readline().strip()
+    except Exception as e:
+        return None, "каталог git спутника не прочитан (%s: %s)" % (type(e).__name__, e)
+    if not os.path.isabs(common):
+        common = os.path.join(gitdir, common)
+    common = os.path.normpath(common)
+    if os.path.basename(common).lower() != ".git":
+        return None, "общий каталог git «%s» — не «.git» главного дерева" % common
+    root = os.path.dirname(common)
+    if not os.path.isfile(os.path.join(root, os.path.basename(__file__))):
+        return None, "в главном дереве «%s» нет писателя журнала" % root
+    return root, None
+
+
+def satellite_note(local_spool=None):
+    """Строка-предупреждение о спуле, оставленном В САМОМ спутнике писателем до 25.10. → str | "".
+
+    Такой спул не досылает никто, а досылать или переносить его отсюда нельзя — это решает
+    владелец. Поэтому только НАЗЫВАЕМ вслух при каждом вызове из этого дерева: лежащая строка
+    неотличима от доставленной, пока о ней молчат."""
+    if not SATELLITE:
+        return ""
+    p = local_spool or LOCAL_SPOOL_PATH
+    stray = spool_read(p)
+    if not stray:
+        return ""
+    return ("ВНИМАНИЕ: в этом дереве лежит прежний спул (%d стр., %s) — его НЕ досылает никто, "
+            "писатель досылает только спул главного дерева. Досылку или перенос решает владелец.\n"
+            % (len(stray), p))
+
+
+def _under_test():
+    """Идёт тест-прогон? Точка правды репо — log_setup.is_test_context (как у реестра ниже)."""
+    try:
+        import log_setup
+        return bool(log_setup.is_test_context())
+    except Exception:
+        return False
+
+
+# ПОД ТЕСТОМ К ГЛАВНОМУ ДЕРЕВУ НЕ ТЯНЕМСЯ. До 25.10 гейт, запущенный в спутнике, не видел ни
+# боевого конфига, ни боевого спула (их там нет), и правка не смеет это расширить: тест, позвавший
+# main() без подмены load_env, писал бы в живой мост. Проводку спутника проверяет тест ОТДЕЛЬНЫМ
+# процессом вне тест-признака, на временных деревьях (TestSatelliteWiring).
+ROOT, ROOT_REFUSAL = (HERE, None) if _under_test() else main_tree_root(HERE)
+BASE = ROOT or HERE           # при отказе main() не дойдёт ни до конфига, ни до спула
+SATELLITE = ROOT is not None and os.path.normcase(ROOT) != os.path.normcase(HERE)
+ENV_PATH = os.path.join(BASE, ".env")
 DOC_NAME = "cowork_log"
-SPOOL_PATH = os.path.join(HERE, "cowork_log.spool")   # имя по образцу trainer_log.spool
+SPOOL_PATH = os.path.join(BASE, "cowork_log.spool")   # имя по образцу trainer_log.spool
+LOCAL_SPOOL_PATH = os.path.join(HERE, "cowork_log.spool")   # спул спутника до 25.10: только ЧИТАЕМ
 
 # Мост — веб-приложение Apps Script: /exec отвечает 302 на второе плечо, и цель редиректа
 # ИНОГДА отдаёт 404. 28.07 строка журнала потерялась именно так, хотя живые пробы тем же адресом
@@ -157,9 +248,9 @@ def spool_clear(path=None):
 # Реестр закрывает именно эту дыру: одна строка JSON на каждую УСПЕШНО ушедшую запись.
 try:                       # реестр — КОЛЬЦО на 500 строк, поэтому запись теста не «сорит», а
     import log_setup       # ВЫТЕСНЯЕТ настоящие записи с головы: замер полного гейта 05.08.2026 —
-    LEDGER_PATH = log_setup.state_path(os.path.join(HERE, "cowork_log.ledger"))   # 13 живых строк
+    LEDGER_PATH = log_setup.state_path(os.path.join(BASE, "cowork_log.ledger"))   # 13 живых строк
 except Exception:          # журнала за 01.08 (задачи #173–#176) ушли из реестра за один прогон.
-    LEDGER_PATH = os.path.join(HERE, "cowork_log.ledger")
+    LEDGER_PATH = os.path.join(BASE, "cowork_log.ledger")
 LEDGER_KEEP = 500          # кап: окно следов у демона — часы, а не месяцы
 LEDGER_LINE_MAX = 300      # в реестре нужен опознавательный кусок, а не весь текст записи
 
@@ -236,7 +327,7 @@ LINE_MAX = 600
 # docs/artifacts 94 штуки, а вынос по замеру даёт ~140 файлов в неделю — смешать значит утопить
 # решения в теле переписки.
 SPILL_REL_DIR = "docs/artifacts/journal"
-SPILL_DIR = os.path.join(HERE, *SPILL_REL_DIR.split("/"))
+SPILL_DIR = os.path.join(BASE, *SPILL_REL_DIR.split("/"))   # у спутника тело ушло бы с его уборкой
 # Границы фразы для реза головы. Порядок не важен — берём самую ПОЗДНЮЮ подходящую.
 _CUT_MARKS = (". ", "! ", "? ", "; ", " — ", " · ", ", ")
 
@@ -416,13 +507,23 @@ def main():
     now = datetime.datetime.now(datetime.timezone.utc)
     stamp = now.strftime(STAMP_FMT)
     new_line = stamp_line(msg, stamp)
+    # СПУТНИК БЕЗ ГЛАВНОГО ДЕРЕВА — громкий отказ ДО спула и до выноса тела: и то и другое легло
+    # бы в спутник, где его не дошлёт и не найдёт никто. Код 2 отличает «не записано и НЕ
+    # отложено» от кода 1 («отложено, уйдёт следующим успешным вызовом»).
+    if ROOT is None:
+        sys.stderr.write("ОШИБКА: НЕ ЗАПИСАНО И НЕ ОТЛОЖЕНО — писатель лежит в дереве-спутнике "
+                         + HERE + ", а главное дерево не найдено (" + ROOT_REFUSAL + "). Спул "
+                         "спутника не досылает никто, поэтому строку не кладу и туда.\nЗапиши "
+                         "её из главного дерева: " + new_line + "\n")
+        sys.exit(2)
+    sys.stderr.write(satellite_note())
     # ЖУРНАЛ — ИНДЕКС: тело длиннее LINE_MAX уезжает файлом, в мозг идёт итог и путь. Стоит
     # ДО развилки «нет конфига»: в спул тоже должна лечь короткая строка, иначе отложенная
     # простыня доедет до журнала следующим успешным вызовом и порог обойдёт себя сам.
     new_line, spilled = spill(new_line, raw, now=now)
     if not url or not token:
         spool_add(new_line)
-        sys.stderr.write("ОШИБКА: нет BRIDGE_URL/BRIDGE_TOKEN в .env\nОТЛОЖЕНО в "
+        sys.stderr.write("ОШИБКА: нет BRIDGE_URL/BRIDGE_TOKEN в " + ENV_PATH + "\nОТЛОЖЕНО в "
                          + SPOOL_PATH + " (строка не потеряна): " + new_line
                          + (("\nТело записи УЖЕ сохранено: " + spilled) if spilled else "") + "\n")
         sys.exit(1)
@@ -479,6 +580,7 @@ def main():
         extra += (f" (отброшено дублями, уже в доке: {dup_dropped})") if dup_dropped else ""
         # Вынос тела называем В ОТЧЁТЕ: молчаливое усечение неотличимо от «столько и написали».
         extra += f" | тело вынесено в {spilled}" if spilled else ""
+        extra += f" | из дерева-спутника через главное дерево {ROOT}" if SATELLITE else ""
         # w["chars"] — это text.length НА СТОРОНЕ МОСТА, то есть UTF-16 code units: каждый эмодзи
         # вне BMP (📦 🔴 …) считается ЗА ДВА. Python len() того же текста будет МЕНЬШЕ. Живой замер
         # 28.07: мост отрапортовал 759635, кодовых точек в доке 759548, не-BMP символов ровно 87 —
